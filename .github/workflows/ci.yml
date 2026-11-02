@@ -37,6 +37,8 @@ jobs:
     container: devkitpro/devkitarm:latest
     steps:
       - uses: actions/checkout@v4
+      - name: Clang for libctru binding generation
+        run: apt-get update && apt-get install -y --no-install-recommends clang libclang-dev
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
