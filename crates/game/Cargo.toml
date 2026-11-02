@@ -1,0 +1,17 @@
+[package]
+name = "game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure game logic for kingdom-3ds (no platform imports)"
+
+[dependencies]
+libm = { version = "0.2.16", default-features = false }
+serde = { version = "1.0.229", default-features = false, features = ["derive", "alloc"], optional = true }
+postcard = { version = "1.1.3", default-features = false, features = ["alloc"], optional = true }
+
+[features]
+serde = ["dep:serde"]
+# Saving and loading runs (`game::save`).
+save = ["serde", "dep:postcard"]
+profile = []

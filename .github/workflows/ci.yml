@@ -1,0 +1,53 @@
+# Builds and tests everything that doesn't need the game's files (CI has
+# no copy of the game, so nothing here extracts assets or runs the game).
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: Desktop, game logic and tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Libraries for macroquad and cpal
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libx11-dev libxi-dev libgl1-mesa-dev shellcheck
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 tools/check_public_files.py
+      - run: cargo build --workspace --all-targets --locked
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: setup.sh lints
+        run: shellcheck tools/setup.sh tools/cia/build.sh
+
+  n3ds:
+    name: 3DS build
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/n3ds
+      - run: cargo install --locked cargo-3ds
+      # The romfs is made from your own game files, so CI builds with an
+      # empty one: this checks the code compiles and links.
+      - name: cargo 3ds build
+        working-directory: crates/n3ds
+        run: |
+          mkdir -p romfs
+          cargo +nightly 3ds build --release

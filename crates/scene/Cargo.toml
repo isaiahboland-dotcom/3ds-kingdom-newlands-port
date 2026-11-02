@@ -1,0 +1,19 @@
+[package]
+name = "scene"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "What's on both screens, drawn through a backend's Renderer (desktop and 3DS share it)"
+
+[dependencies]
+game = { path = "../game", features = ["serde", "save"] }
+platform = { path = "../platform" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", optional = true }
+lewton = { version = "0.10.2", optional = true }
+
+[features]
+# Reading `sprites.json` / `clips.json` straight from `tools/extract` (desktop, packers).
+json = ["dep:serde_json"]
+# Reading sound files (`clipfile`): the asset extractor.
+clipfile = ["dep:lewton"]

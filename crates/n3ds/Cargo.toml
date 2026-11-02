@@ -1,0 +1,32 @@
+[package]
+name = "n3ds"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Nintendo 3DS backend (build with cargo 3ds)"
+
+[[bin]]
+name = "kingdom"
+path = "src/main.rs"
+
+[dependencies]
+game = { path = "../game", features = ["serde", "save", "profile"] }
+platform = { path = "../platform" }
+scene = { path = "../scene" }
+citro3d-macros = { git = "https://github.com/rust3ds/citro3d-rs.git" }
+postcard = { version = "1.1.3", features = ["alloc"] }
+ctru-rs = { git = "https://github.com/rust3ds/ctru-rs.git" }
+ctru-sys = { git = "https://github.com/rust3ds/ctru-rs.git" }
+citro3d-sys = { git = "https://github.com/rust3ds/citro3d-rs.git" }
+
+[package.metadata.cargo-3ds]
+# Built by `tools/pack3ds` from your own extracted assets (never committed).
+romfs_dir = "romfs"
+
+[profile.release]
+opt-level = 3
+lto = true
+debug = false
+
+[profile.dev]
+opt-level = 1

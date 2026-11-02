@@ -1,0 +1,48 @@
+# Proprietary game material: never commit (see README). Everything
+# made from your own copy of the game stays local.
+/gamefiles/
+/reference/
+/assets/
+/modkit/
+
+# Local files from older mod experiments
+/mods/
+
+# Packed 3DS assets and builds
+/crates/n3ds/romfs/
+/crates/n3ds/sdcard/
+/crates/n3ds/target/
+
+# Rust build output
+/target/
+
+# Tools fetched or built by the scripts
+/tools/assetripper/
+/tools/cia/bin/
+/tools/cia/src/
+
+# 3DS build products anywhere else
+*.3dsx
+*.cia
+*.smdh
+*.elf
+
+# Editors and OS clutter
+*.kate-swp
+*.swp
+*~
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local save files and credentials
+/saves/
+*.sav
+.env
+.env.*
+!.env.example
+/.aws/
+/.codex/
+/.agents/
+__pycache__/

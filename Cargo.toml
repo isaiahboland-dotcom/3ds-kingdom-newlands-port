@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/game", "crates/platform", "crates/scene", "crates/desktop", "tools/extract"]
+# crates/n3ds targets armv6k-nintendo-3ds and is built separately with `cargo 3ds`.
+exclude = ["crates/n3ds"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
