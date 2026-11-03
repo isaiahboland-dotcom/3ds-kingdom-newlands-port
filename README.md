@@ -12,6 +12,8 @@ The project implements the core simulation, island progression, saves, shared sc
 
 The 3DS backend enables the faster CPU mode where supported. There is currently no user-facing performance tier option. Mod support is not included.
 
+Experimental Stereoscopic 3D
+
 ## Desktop setup
 
 Run the commands below from the repository root. The asset pipeline was developed against the Steam **Linux Mono build** of Kingdom: New Lands. Other game builds and Windows/macOS hosts have not been fully validated; WSL with a Linux game installation is the recommended starting point on Windows.
