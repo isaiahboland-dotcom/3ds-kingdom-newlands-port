@@ -53,6 +53,7 @@ fn load() -> Result<(WorldData, u32, Sheet), String> {
         std::fs::read(format!("{ROMFS}/sheet.bin")).map_err(|e| format!("sheet.bin: {e}"))?;
     let mut sheet: Sheet =
         postcard::from_bytes(&sheet_bytes).map_err(|e| format!("sheet.bin: {e}"))?;
+    sheet.validate()?;
     sheet.link(&world.sprites);
     Ok((world, world_id, sheet))
 }
@@ -62,6 +63,7 @@ fn main() {
     // (it does nothing on an Old 3DS).
     unsafe { ctru_sys::osSetSpeedupEnable(true) };
     let gfx = Gfx::new().expect("gfx");
+    ctru::set_panic_hook(false);
     let mut hid = Hid::new().expect("hid");
     let apt = Apt::new().expect("apt");
     let _romfs = match ctru::services::romfs::RomFS::new() {
@@ -96,7 +98,7 @@ fn main() {
     let slot = Session::last_slot(&files);
     let saved = files
         .read(&save::game_slot(slot))
-        .and_then(|b| save::load_game(&b, world_id).ok());
+        .and_then(|b| save::load_game(&b, world_id, &world).ok());
     let mut s = Session::new(world, 0, seed(), progress);
     s.storage = Some(Box::new(files));
     s.slot = slot;

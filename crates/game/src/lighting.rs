@@ -170,6 +170,11 @@ pub struct Blender {
 }
 
 impl Blender {
+    pub(crate) fn presets_valid(&self, world: &WorldData) -> bool {
+        self.stack
+            .iter()
+            .all(|f| (f.preset as usize) < world.lights.len())
+    }
     /// orig: `Blender.Init()`.
     pub fn new(world: &WorldData) -> Self {
         let mut b = Blender::default();

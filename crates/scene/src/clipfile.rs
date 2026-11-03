@@ -48,7 +48,11 @@ pub fn prepare(path: &Path, stereo: bool) -> Result<Pcm, String> {
     // Stored at full scale (the 3DS can't amplify a voice past 1), played
     // back at `gain`.
     let peak = chans.iter().flatten().fold(0.0f32, |m, v| m.max(v.abs()));
-    let norm = if peak > 0.0 { (NORMALIZED / peak).clamp(1.0, MAX_NORMALIZE) } else { 1.0 };
+    let norm = if peak > 0.0 {
+        (NORMALIZED / peak).clamp(1.0, MAX_NORMALIZE)
+    } else {
+        1.0
+    };
     limit(&mut chans, norm * DRIVE, RATE);
     Ok(Pcm {
         rate: RATE,
@@ -95,14 +99,24 @@ fn wav(b: &[u8]) -> Option<(u32, Vec<Vec<f32>>)> {
         let body = at + 8..(at + 8 + len).min(b.len());
         let end = body.end;
         match &b[at..at + 4] {
-            b"fmt " => fmt = Some(body.start),
+            b"fmt " => {
+                if body.len() < 16 {
+                    return None;
+                }
+                fmt = Some(body.start);
+            }
             b"data" => data = Some(body),
             _ => {}
         }
         at = end + (len & 1);
     }
     let (fmt, data) = (fmt?, data?);
-    let (tag, n, rate, bits) = (u16_(fmt), u16_(fmt + 2) as usize, u32_(fmt + 4), u16_(fmt + 14));
+    let (tag, n, rate, bits) = (
+        u16_(fmt),
+        u16_(fmt + 2) as usize,
+        u32_(fmt + 4),
+        u16_(fmt + 14),
+    );
     let bytes = (bits / 8) as usize;
     if n == 0 || bytes == 0 {
         return None;
@@ -116,8 +130,12 @@ fn wav(b: &[u8]) -> Option<(u32, Vec<Vec<f32>>)> {
                 (3, 32) => f32::from_le_bytes(b[p..p + 4].try_into().unwrap()),
                 (_, 8) => (b[p] as f32 - 128.0) / 128.0,
                 (_, 16) => i16::from_le_bytes([b[p], b[p + 1]]) as f32 / 32768.0,
-                (_, 24) => (i32::from_le_bytes([0, b[p], b[p + 1], b[p + 2]]) >> 8) as f32 / 8388608.0,
-                (_, 32) => i32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as f32 / 2147483648.0,
+                (_, 24) => {
+                    (i32::from_le_bytes([0, b[p], b[p + 1], b[p + 2]]) >> 8) as f32 / 8388608.0
+                }
+                (_, 32) => {
+                    i32::from_le_bytes(b[p..p + 4].try_into().unwrap()) as f32 / 2147483648.0
+                }
                 _ => return None,
             };
             out.push(v);
@@ -187,7 +205,11 @@ fn limit(chans: &mut [Vec<f32>], drive: f32, rate: u32) {
     let need: Vec<f32> = (0..n)
         .map(|k| {
             let peak = chans.iter().fold(0.0f32, |m, c| m.max(c[k].abs())) * drive;
-            if peak > NORMALIZED { NORMALIZED / peak } else { 1.0 }
+            if peak > NORMALIZED {
+                NORMALIZED / peak
+            } else {
+                1.0
+            }
         })
         .collect();
     let mut window = std::collections::VecDeque::new();
@@ -208,7 +230,11 @@ fn limit(chans: &mut [Vec<f32>], drive: f32, rate: u32) {
     let attack = 1.0 / ahead as f32;
     for k in 0..n {
         let target = ahead_min[k];
-        g = if target < g { (g - attack).max(target) } else { g + (target - g) * release };
+        g = if target < g {
+            (g - attack).max(target)
+        } else {
+            g + (target - g) * release
+        };
         let g = g.min(need[k]);
         for c in chans.iter_mut() {
             c[k] *= drive * g;
@@ -217,9 +243,10 @@ fn limit(chans: &mut [Vec<f32>], drive: f32, rate: u32) {
 }
 
 fn to_i16(x: &[f32]) -> Vec<i16> {
-    x.iter().map(|v| (v * 32767.0).round().clamp(-32768.0, 32767.0) as i16).collect()
+    x.iter()
+        .map(|v| (v * 32767.0).round().clamp(-32768.0, 32767.0) as i16)
+        .collect()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -266,7 +293,12 @@ mod tests {
         assert!((effect.channels[0].len() as i64 - RATE as i64 / 4).abs() <= 1);
         // Stored hot, with the gain that leaves it `DRIVE` under the source's
         // ~0.24 peak, as the game's own clips are.
-        let peak = effect.channels[0].iter().map(|v| v.unsigned_abs()).max().unwrap() as f32 / 32768.0;
+        let peak = effect.channels[0]
+            .iter()
+            .map(|v| v.unsigned_abs())
+            .max()
+            .unwrap() as f32
+            / 32768.0;
         assert!(peak > 0.8 && peak <= 0.91, "{peak}");
         let level = peak * effect.gain * DRIVE;
         assert!((level - 8000.0 / 32768.0).abs() < 0.01, "{level}");

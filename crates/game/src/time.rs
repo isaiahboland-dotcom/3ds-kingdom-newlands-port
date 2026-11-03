@@ -97,13 +97,16 @@ impl Clock {
     /// Advances by `dt` real seconds. Returns true if the clock rolled over midnight.
     pub fn advance(&mut self, dt: f32) -> bool {
         self.time += dt * self.speed / SECONDS_PER_HOUR;
-        if self.time >= 24.0 {
-            self.day += 1;
-            self.time -= 24.0;
-            true
-        } else {
-            false
+        if !self.time.is_finite() {
+            self.time = 0.0;
+            return false;
         }
+        let days = (self.time / 24.0).max(0.0) as u32;
+        if days > 0 {
+            self.day = self.day.saturating_add(days);
+            self.time %= 24.0;
+        }
+        days > 0
     }
 
     /// Hours since day 0, 00:00. Director events are ordered by this.

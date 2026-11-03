@@ -134,6 +134,21 @@ pub fn write_pages(sheet: &Sheet, dir: &Path, json_path: &Path) -> Result<(), St
         w.write_image_data(&p.px).map_err(|e| e.to_string())?;
         out.pages.push(format!("sprites/{name}"));
     }
+    // Remove atlas pages left by an earlier, larger conversion.
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(n) = name
+            .strip_prefix("page_")
+            .and_then(|s| s.strip_suffix(".png"))
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if n >= pages.len() {
+                std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+            }
+        }
+    }
     println!("packed into {} pages", pages.len());
 
     let json = serde_json::to_string(&out).map_err(|e| e.to_string())?;

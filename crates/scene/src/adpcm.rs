@@ -74,6 +74,9 @@ impl Adp {
             return None;
         }
         let (rate, samples, n, gain) = (u(8), u(12), u(16) as usize, f32::from_bits(u(20)));
+        if rate == 0 || !gain.is_finite() {
+            return None;
+        }
         if n == 0 || n > 2 || bytes.len() < header_len(n) {
             return None;
         }
@@ -136,7 +139,11 @@ pub fn decode_frame(coefs: &[i16; 16], frame: &[u8], h: &mut History, out: &mut 
 pub fn decode(c: &Channel, samples: usize) -> Vec<i16> {
     let mut out = vec![0i16; data_len(samples) / FRAME_BYTES * FRAME_SAMPLES];
     let mut h = History::default();
-    for (frame, o) in c.data.chunks(FRAME_BYTES).zip(out.chunks_mut(FRAME_SAMPLES)) {
+    for (frame, o) in c
+        .data
+        .chunks(FRAME_BYTES)
+        .zip(out.chunks_mut(FRAME_SAMPLES))
+    {
         decode_frame(&c.coefs, frame, &mut h, o);
     }
     out.truncate(samples);
@@ -288,11 +295,31 @@ fn stable(a1: f64, a2: f64) -> (f64, f64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rejects_invalid_rate_and_gain() {
+        let mut bytes = vec![0u8; super::header_len(1)];
+        bytes[..4].copy_from_slice(super::MAGIC);
+        bytes[4..8].copy_from_slice(&super::VERSION.to_le_bytes());
+        bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1.0f32.to_le_bytes());
+        assert!(super::Adp::header(&bytes).is_none());
+        bytes[8..12].copy_from_slice(&44100u32.to_le_bytes());
+        assert!(super::Adp::header(&bytes).is_some());
+        for gain in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            bytes[20..24].copy_from_slice(&gain.to_le_bytes());
+            assert!(super::Adp::header(&bytes).is_none());
+        }
+    }
+
     use super::*;
 
     fn snr(a: &[i16], b: &[i16]) -> f64 {
         let s: f64 = a.iter().map(|&v| (v as f64).powi(2)).sum();
-        let n: f64 = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum();
+        let n: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| (x as f64 - y as f64).powi(2))
+            .sum();
         10.0 * (s / n.max(1.0)).log10()
     }
 

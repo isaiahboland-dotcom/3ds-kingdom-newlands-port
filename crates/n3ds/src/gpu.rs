@@ -159,6 +159,7 @@ impl Screen {
                 __e: ctru::GPU_RB_DEPTH24,
             },
         );
+        assert!(!target.is_null(), "3DS render target allocation failed");
         let flags = c3d::GX_TRANSFER_FLIP_VERT(false)
             | c3d::GX_TRANSFER_OUT_TILED(false)
             | c3d::GX_TRANSFER_RAW_COPY(false)
@@ -201,14 +202,19 @@ impl Gpu {
                 return Err("bad shader".into());
             }
             let mut program: Box<ctru::shaderProgram_s> = Box::new(std::mem::zeroed());
-            let _ = ctru::shaderProgramInit(program.as_mut());
-            let _ = ctru::shaderProgramSetVsh(program.as_mut(), (*dvlb).DVLE);
+            if ctru::shaderProgramInit(program.as_mut()) < 0 {
+                return Err("shader program initialization failed".into());
+            }
+            if ctru::shaderProgramSetVsh(program.as_mut(), (*dvlb).DVLE) < 0 {
+                return Err("vertex shader setup failed".into());
+            }
             let projection_loc = ctru::shaderInstanceGetUniformLocation(
                 program.vertexShader,
                 c"projection".as_ptr(),
             ) as i32;
             let eye_loc =
-                ctru::shaderInstanceGetUniformLocation(program.vertexShader, c"eye".as_ptr()) as i32;
+                ctru::shaderInstanceGetUniformLocation(program.vertexShader, c"eye".as_ptr())
+                    as i32;
 
             let mut pages = Vec::new();
             let mut page_size = Vec::new();
@@ -242,7 +248,11 @@ impl Gpu {
             let mut tex: Box<c3d::C3D_Tex> = Box::new(std::mem::zeroed());
             let reflection = if c3d::C3D_TexInitVRAM(tex.as_mut(), 256, 512, ctru::GPU_RGBA8) {
                 c3d::C3D_TexSetFilter(tex.as_mut(), ctru::GPU_NEAREST, ctru::GPU_NEAREST);
-                c3d::C3D_TexSetWrap(tex.as_mut(), ctru::GPU_CLAMP_TO_EDGE, ctru::GPU_CLAMP_TO_EDGE);
+                c3d::C3D_TexSetWrap(
+                    tex.as_mut(),
+                    ctru::GPU_CLAMP_TO_EDGE,
+                    ctru::GPU_CLAMP_TO_EDGE,
+                );
                 pages.push(tex);
                 page_size.push((256.0, 512.0));
                 page_hard.push(true);
@@ -363,10 +373,26 @@ impl Gpu {
     fn draw_right_eye(&mut self) {
         let calls = std::mem::take(&mut self.calls);
         unsafe {
-            c3d::C3D_RenderTargetClear(self.right.target, c3d::C3D_CLEAR_ALL, clear_color(Color::BLACK), 0);
+            c3d::C3D_RenderTargetClear(
+                self.right.target,
+                c3d::C3D_CLEAR_ALL,
+                clear_color(Color::BLACK),
+                0,
+            );
             c3d::C3D_FrameDrawOn(self.right.target);
-            c3d::C3D_FVUnifMtx4x4(ctru::GPU_VERTEX_SHADER, self.projection_loc, &self.right.projection);
-            c3d::C3D_FVUnifSet(ctru::GPU_VERTEX_SHADER, self.eye_loc, self.stereo / 2.0, 0.0, 0.0, 0.0);
+            c3d::C3D_FVUnifMtx4x4(
+                ctru::GPU_VERTEX_SHADER,
+                self.projection_loc,
+                &self.right.projection,
+            );
+            c3d::C3D_FVUnifSet(
+                ctru::GPU_VERTEX_SHADER,
+                self.eye_loc,
+                self.stereo / 2.0,
+                0.0,
+                0.0,
+                0.0,
+            );
         }
         self.unbind();
         for &c in &calls {
@@ -404,6 +430,11 @@ impl Gpu {
     fn capture_top(&mut self) {
         let Some(p) = self.reflection else { return };
         unsafe {
+            // Publish vertices before the split submits their draw commands.
+            let _ = ctru::GSPGPU_FlushDataCache(
+                self.verts as *const _,
+                (self.quads * 4 * std::mem::size_of::<Vertex>()) as u32,
+            );
             // Submit the top screen's commands so the copy runs after them.
             c3d::C3D_FrameSplit(GX_CMDLIST_FLUSH);
             let dim = |line: u32, gap: u32| ((gap / 16) << 16) | (line / 16);
@@ -547,7 +578,7 @@ impl Gpu {
             State {
                 page: None,
                 additive: false,
-            smooth: false,
+                smooth: false,
             },
             &solid,
         );
@@ -559,7 +590,7 @@ impl Gpu {
                 State {
                     page: Some(p as u16),
                     additive: false,
-            smooth: false,
+                    smooth: false,
                 },
                 &quads,
             );
@@ -594,7 +625,13 @@ impl Gpu {
     }
 
     /// Queues a quad (corners clockwise from top-left) in its pass.
-    fn quad(&mut self, state: State, corners: [(f32, f32); 4], uv: [(f32, f32); 4], colors: [Color; 4]) {
+    fn quad(
+        &mut self,
+        state: State,
+        corners: [(f32, f32); 4],
+        uv: [(f32, f32); 4],
+        colors: [Color; 4],
+    ) {
         let z = -0.999 + self.order as f32 * Z_STEP;
         self.order += 1;
         let q: Quad = [0, 1, 2, 3].map(|i| Vertex {
@@ -652,7 +689,12 @@ impl Gpu {
     }
 
     fn solid_rect(&mut self, r: Rect, top: Color, bottom: Color, additive: bool) {
-        let corners = [(r.x, r.y), (r.x + r.w, r.y), (r.x + r.w, r.y + r.h), (r.x, r.y + r.h)];
+        let corners = [
+            (r.x, r.y),
+            (r.x + r.w, r.y),
+            (r.x + r.w, r.y + r.h),
+            (r.x, r.y + r.h),
+        ];
         let state = State {
             page: None,
             additive,
@@ -686,8 +728,16 @@ impl Renderer for Gpu {
         let (pw, ph) = self.page_size[s.page as usize];
         let (l, b, r, t) = border;
         let (sw, sh) = (s.w as f32, s.h as f32);
-        let cols = [(0.0, l, 0.0, l), (l, sw - l - r, l, dest.w - l - r), (sw - r, r, dest.w - r, r)];
-        let rows = [(0.0, t, 0.0, t), (t, sh - t - b, t, dest.h - t - b), (sh - b, b, dest.h - b, b)];
+        let cols = [
+            (0.0, l, 0.0, l),
+            (l, sw - l - r, l, dest.w - l - r),
+            (sw - r, r, dest.w - r, r),
+        ];
+        let rows = [
+            (0.0, t, 0.0, t),
+            (t, sh - t - b, t, dest.h - t - b),
+            (sh - b, b, dest.h - b, b),
+        ];
         let state = State {
             page: Some(s.page),
             additive: false,
@@ -701,8 +751,16 @@ impl Renderer for Gpu {
                 let (x, y) = (dest.x + dx, dest.y + dy);
                 let corners = [(x, y), (x + dw, y), (x + dw, y + dh), (x, y + dh)];
                 let (u0, u1) = ((s.x as f32 + cx) / pw, (s.x as f32 + cx + cw) / pw);
-                let (v0, v1) = (1.0 - (s.y as f32 + ry) / ph, 1.0 - (s.y as f32 + ry + rh) / ph);
-                self.quad(state, corners, [(u0, v0), (u1, v0), (u1, v1), (u0, v1)], [tint; 4]);
+                let (v0, v1) = (
+                    1.0 - (s.y as f32 + ry) / ph,
+                    1.0 - (s.y as f32 + ry + rh) / ph,
+                );
+                self.quad(
+                    state,
+                    corners,
+                    [(u0, v0), (u1, v0), (u1, v1), (u0, v1)],
+                    [tint; 4],
+                );
             }
         }
     }
@@ -756,7 +814,12 @@ impl Renderer for Gpu {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
             let a1 = (i + 1) as f32 / N as f32 * std::f32::consts::TAU;
             let p = |r: f32, a: f32| (x + r * a.cos(), y + r * a.sin());
-            self.quad(state, [p(r0, a0), p(r1, a0), p(r1, a1), p(r0, a1)], [(0.0, 0.0); 4], [c; 4]);
+            self.quad(
+                state,
+                [p(r0, a0), p(r1, a0), p(r1, a1), p(r0, a1)],
+                [(0.0, 0.0); 4],
+                [c; 4],
+            );
         }
     }
 
@@ -790,6 +853,11 @@ impl Renderer for Gpu {
             additive: false,
             smooth: false,
         };
-        self.quad(state, corners, [uv(x0, y0), uv(x1, y0), uv(x1, y1), uv(x0, y1)], [tint; 4]);
+        self.quad(
+            state,
+            corners,
+            [uv(x0, y0), uv(x1, y0), uv(x1, y1), uv(x0, y1)],
+            [tint; 4],
+        );
     }
 }

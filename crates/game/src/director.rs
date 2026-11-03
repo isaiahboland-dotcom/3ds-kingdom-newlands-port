@@ -81,6 +81,12 @@ pub struct Director {
 }
 
 impl Director {
+    pub(crate) fn lights_valid(&self, world: &WorldData) -> bool {
+        self.events.iter().all(|e| match e.kind {
+            EventKind::Light { preset, .. } => (preset as usize) < world.lights.len(),
+            _ => true,
+        })
+    }
     /// orig: `Director.Init()` + `OnLevelLoaded()`.
     pub fn new(world: &WorldData, level_index: usize, rng: &mut Rng) -> Self {
         let cfg = &world.levels[level_index];

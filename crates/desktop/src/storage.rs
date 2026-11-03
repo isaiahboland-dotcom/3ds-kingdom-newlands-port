@@ -12,8 +12,12 @@ impl Files {
         let dir = std::env::var_os("KINGDOM_SAVES")
             .map(PathBuf::from)
             .or_else(|| {
-                std::env::var_os("XDG_DATA_HOME").map(|d| PathBuf::from(d).join("kingdom-3ds"))
+                std::env::var_os("XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .filter(|d| d.is_absolute())
+                    .map(|d| d.join("kingdom-3ds"))
             })
+            .or_else(|| std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("kingdom-3ds")))
             .or_else(|| {
                 std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/kingdom-3ds"))
             })
@@ -37,6 +41,7 @@ impl platform::Storage for Files {
         let tmp = path.with_extension("tmp");
         std::fs::create_dir_all(&self.dir).is_ok()
             && std::fs::write(&tmp, data).is_ok()
+            && std::fs::File::open(&tmp).and_then(|f| f.sync_all()).is_ok()
             && std::fs::rename(&tmp, &path).is_ok()
     }
 

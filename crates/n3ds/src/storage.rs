@@ -25,8 +25,8 @@ impl platform::Storage for SdCard {
         let path = Self::path(slot);
         let tmp = format!("{path}.tmp");
         std::fs::write(&tmp, data).is_ok()
-            && (std::fs::rename(&tmp, &path).is_ok()
-                || (std::fs::remove_file(&path).is_ok() && std::fs::rename(&tmp, &path).is_ok()))
+            && std::fs::File::open(&tmp).and_then(|f| f.sync_all()).is_ok()
+            && std::fs::rename(&tmp, &path).is_ok()
     }
 
     fn delete(&mut self, slot: &str) {

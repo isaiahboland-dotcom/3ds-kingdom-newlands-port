@@ -92,6 +92,9 @@ impl Clip {
         let Some(keys) = self.offsets.iter().find(|k| k.0 == path).map(|k| &k.1) else {
             return (0.0, 0.0);
         };
+        if keys.is_empty() {
+            return (0.0, 0.0);
+        }
         let t = self.wrap(t);
         let i = keys.iter().rposition(|k| k.0 <= t).unwrap_or(0);
         let a = keys[i];
@@ -150,6 +153,30 @@ pub struct Sheet {
 }
 
 impl Sheet {
+    /// Checks references in JSON and packed sheets before rendering.
+    pub fn validate(&self) -> Result<(), String> {
+        let valid = |id: u32| (id as usize) < self.sprites.len();
+        if self.names.len() != self.sprites.len()
+            || self.sprites.iter().any(|s| {
+                s.page as usize >= self.pages.len()
+                    || s.masks.iter().flatten().any(|&id| !valid(id))
+            })
+            || self.clips.iter().any(|(_, c)| {
+                c.sprites
+                    .iter()
+                    .any(|(_, keys)| keys.iter().any(|&(_, id)| !valid(id)))
+            })
+            || self
+                .font
+                .glyphs
+                .iter()
+                .any(|g| g.1.is_some_and(|id| !valid(id)))
+        {
+            return Err("sprite sheet contains invalid references; regenerate assets".into());
+        }
+        Ok(())
+    }
+
     /// Builds the name lookups (after loading) and maps the world's sprites.
     pub fn link(&mut self, world_sprites: &[String]) {
         self.index = self
@@ -257,6 +284,9 @@ mod json {
             let mut names: Vec<(String, SpriteJson)> = s.sprites.into_iter().collect();
             names.sort_by(|a, b| a.0.cmp(&b.0));
             for (name, sp) in names {
+                if sp.page as usize >= sheet.pages.len() {
+                    return Err(format!("sprite {name} references missing page {}", sp.page));
+                }
                 sheet.names.push(name);
                 sheet.sprites.push(Sprite {
                     page: sp.page,
@@ -308,5 +338,18 @@ mod json {
             }
             Ok(sheet)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn empty_offset_track_is_stationary() {
+        let c = Clip {
+            offsets: vec![("X".into(), vec![])],
+            ..Default::default()
+        };
+        assert_eq!(c.offset("X", 1.0), (0.0, 0.0));
     }
 }

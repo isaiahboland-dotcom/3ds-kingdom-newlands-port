@@ -16,7 +16,7 @@ PRIVATE = (
     'tools/cia/src/',
 )
 GAME_EXTENSIONS = {
-    '.cs', '.dll', '.exe', '.assets', '.ress', '.resource', '.unity',
+    '.asset', '.anim', '.mat', '.meta', '.json', '.cs', '.dll', '.exe', '.assets', '.ress', '.resource', '.unity',
     '.prefab', '.bundle', '.png', '.jpg', '.jpeg', '.ogg', '.wav',
     '.mp3', '.adp', '.t3x', '.bin', '.ttf', '.otf', '.3dsx', '.cia',
     '.smdh', '.elf', '.cdc',

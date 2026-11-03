@@ -100,7 +100,9 @@ fn parse(text: &str, sprites_by_guid: &HashMap<String, String>) -> Clip {
                 }
             }
         }
-        clip.offsets.insert(path, keys);
+        if !keys.is_empty() {
+            clip.offsets.insert(path, keys);
+        }
     }
     clip
 }
@@ -122,7 +124,8 @@ pub fn extract_all(
     for p in paths {
         let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         let name = field(&text, "m_Name").unwrap_or_default().to_owned();
-        out.entry(name).or_insert_with(|| parse(&text, sprites_by_guid));
+        out.entry(name)
+            .or_insert_with(|| parse(&text, sprites_by_guid));
     }
     Ok(out)
 }

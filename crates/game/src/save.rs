@@ -12,7 +12,7 @@ use crate::progress::Progress;
 use crate::state::GameState;
 
 /// Bumped whenever the saved state's layout changes.
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 const MAGIC: [u8; 4] = *b"KNL1";
 
 /// The slot names the backends store under. orig: `"AUTO"`, `"unlocks"`.
@@ -62,33 +62,40 @@ fn header(world: u32) -> Vec<u8> {
     out
 }
 
-fn body(bytes: &[u8], world: Option<u32>) -> Result<&[u8], LoadError> {
+fn body(bytes: &[u8], world: Option<u32>) -> Result<(u16, &[u8]), LoadError> {
     if bytes.len() < 10 || bytes[..4] != MAGIC {
         return Err(LoadError::Format);
     }
-    if u16::from_le_bytes([bytes[4], bytes[5]]) != VERSION {
+    let stored = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if stored == 0 || stored > VERSION {
         return Err(LoadError::Format);
     }
     let w = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
     if world.is_some_and(|x| x != w) {
         return Err(LoadError::World);
     }
-    Ok(&bytes[10..])
+    Ok((stored, &bytes[10..]))
 }
 
 /// orig: `PersistentManager.Save()`.
 pub fn save_game(g: &GameState, world: u32) -> Vec<u8> {
     let mut out = header(world);
     // Serializing plain data into a Vec can't fail.
-    out.extend(postcard::to_allocvec(g).unwrap_or_default());
+    out.extend(postcard::to_allocvec(g).expect("plain-data serialization cannot fail"));
     out
 }
 
 /// orig: `PersistentManager.Load()`.
-pub fn load_game(bytes: &[u8], world: u32) -> Result<GameState, LoadError> {
-    let body = body(bytes, Some(world))?;
-    let look = postcard::to_allocvec(&crate::kingdom::Look::default()).unwrap_or_default();
-    let tutorial = postcard::to_allocvec(&crate::tutorial::Tutorial::default()).unwrap_or_default();
+pub fn load_game(
+    bytes: &[u8],
+    world_id: u32,
+    world: &crate::data::WorldData,
+) -> Result<GameState, LoadError> {
+    let (stored, body) = body(bytes, Some(world_id))?;
+    let look = postcard::to_allocvec(&crate::kingdom::Look::default())
+        .expect("plain-data serialization cannot fail");
+    let tutorial = postcard::to_allocvec(&crate::tutorial::Tutorial::default())
+        .expect("plain-data serialization cannot fail");
     // Saved before the last fields were added: the look (a king with the
     // first pattern and emblem), and before that the tutorial (it sets
     // itself up on the first tick).
@@ -99,22 +106,30 @@ pub fn load_game(bytes: &[u8], world: u32) -> Result<GameState, LoadError> {
         }
         postcard::from_bytes(&old)
     };
-    postcard::from_bytes(body)
-        .or_else(|_| with(&[&look]))
-        .or_else(|_| with(&[&tutorial, &look]))
-        .map_err(|_| LoadError::Corrupt)
+    let g: GameState = if stored == VERSION {
+        postcard::from_bytes(body)
+    } else {
+        postcard::from_bytes(body)
+            .or_else(|_| with(&[&look]))
+            .or_else(|_| with(&[&tutorial, &look]))
+    }
+    .map_err(|_| LoadError::Corrupt)?;
+    if !g.ids_valid(world) {
+        return Err(LoadError::Corrupt);
+    }
+    Ok(g)
 }
 
 /// orig: `UnlockManager.SaveUnlocks()` (unlocks don't depend on the game data).
 pub fn save_progress(p: &Progress) -> Vec<u8> {
     let mut out = header(0);
-    out.extend(postcard::to_allocvec(p).unwrap_or_default());
+    out.extend(postcard::to_allocvec(p).expect("plain-data serialization cannot fail"));
     out
 }
 
 /// orig: `UnlockManager.LoadUnlocks()`: a damaged file starts over.
 pub fn load_progress(bytes: &[u8]) -> Result<Progress, LoadError> {
-    let body = body(bytes, None)?;
+    let (stored, body) = body(bytes, None)?;
     // Saved before `chosen` (None, a 0 byte), and before that
     // `tutorial_done` (false, another 0).
     let with = |zeros: usize| {
@@ -122,8 +137,12 @@ pub fn load_progress(bytes: &[u8]) -> Result<Progress, LoadError> {
         old.resize(old.len() + zeros, 0);
         postcard::from_bytes(&old)
     };
-    postcard::from_bytes(body)
-        .or_else(|_| with(1))
-        .or_else(|_| with(2))
-        .map_err(|_| LoadError::Corrupt)
+    if stored == VERSION {
+        postcard::from_bytes(body)
+    } else {
+        postcard::from_bytes(body)
+            .or_else(|_| with(1))
+            .or_else(|_| with(2))
+    }
+    .map_err(|_| LoadError::Corrupt)
 }

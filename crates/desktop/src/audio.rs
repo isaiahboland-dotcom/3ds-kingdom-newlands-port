@@ -125,7 +125,7 @@ impl Audio {
                         for frame in out.chunks_mut(channels) {
                             if v.pos >= len as f64 {
                                 if v.looping && len > 0 {
-                                    v.pos -= len as f64;
+                                    v.pos %= len as f64;
                                 } else {
                                     ended.push(v.id);
                                     break;
@@ -151,6 +151,9 @@ impl Audio {
                             }
                             v.pos += step;
                         }
+                    }
+                    for sample in out.iter_mut() {
+                        *sample = sample.clamp(-1.0, 1.0);
                     }
                     s.voices.retain(|v| !ended.contains(&v.id));
                     let live: Vec<Voice> = s.voices.iter().map(|v| v.id).collect();

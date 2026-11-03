@@ -2,6 +2,7 @@
 name = "scene"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 description = "What's on both screens, drawn through a backend's Renderer (desktop and 3DS share it)"
 

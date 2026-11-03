@@ -570,10 +570,9 @@ fn scatter_run(
     campfire_x: f32,
     rng: &mut Rng,
 ) {
-    let s = world.protos[proto as usize]
-        .scatter
-        .as_ref()
-        .expect("scatterable");
+    let Some(s) = world.protos[proto as usize].scatter.as_ref() else {
+        return;
+    };
     let dir = if end > start { 1.0 } else { -1.0 };
     let mut step = s.spacing;
     if s.adjacent {
@@ -582,9 +581,16 @@ fn scatter_run(
             step /= ratio;
         }
     }
+    if !step.is_finite() || step <= 0.0 {
+        return;
+    }
     let mut x = start;
     while dir * x < dir * end {
-        x += step * dir;
+        let next = x + step * dir;
+        if next == x {
+            break;
+        }
+        x = next;
         scatter_around(world, objects, proto, region, &mut x, campfire_x, rng);
     }
 }

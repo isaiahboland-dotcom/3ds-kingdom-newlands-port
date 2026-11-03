@@ -36,7 +36,7 @@ pub fn parse_float(s: &str) -> Option<f32> {
 pub fn guid_of(s: &str) -> Option<&str> {
     let start = s.find("guid: ")? + 6;
     let rest = &s[start..];
-    Some(rest[..rest.find(',')?].trim())
+    Some(rest.split([',', '}']).next()?.trim())
 }
 
 pub fn hex_bytes(s: &str) -> Option<Vec<u8>> {

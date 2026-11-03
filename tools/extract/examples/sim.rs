@@ -141,8 +141,10 @@ fn main() {
     );
     let mut mapper = ControlMapper::default();
     let mut events = Vec::new();
-    let mut turns: std::collections::HashMap<u32, (f32, f32, u32)> = std::collections::HashMap::new();
-    let mut states: std::collections::HashMap<u32, (String, u32)> = std::collections::HashMap::new();
+    let mut turns: std::collections::HashMap<u32, (f32, f32, u32)> =
+        std::collections::HashMap::new();
+    let mut states: std::collections::HashMap<u32, (String, u32)> =
+        std::collections::HashMap::new();
     let mut anims: std::collections::HashMap<u32, (String, u32)> = std::collections::HashMap::new();
     let frames = (days * 240.0 / TICK) as u32;
     let mut harvests = 0;
@@ -190,10 +192,18 @@ fn main() {
                     e.1 = dx.signum();
                 }
                 e.0 = u.x;
-                if std::env::var("TRACE_UNIT").ok().and_then(|v| v.parse().ok()) == Some(u.id) {
+                if std::env::var("TRACE_UNIT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    == Some(u.id)
+                {
                     println!(
                         "  t{frame} {:?} x={:.3} vx={:.3} y={:.2} {:?}",
-                        u.anim(), u.x, u.mover.vx, u.y, u.ai
+                        u.anim(),
+                        u.x,
+                        u.mover.vx,
+                        u.y,
+                        u.ai
                     );
                 }
                 let anim = format!("{:?}", u.anim());
@@ -206,13 +216,20 @@ fn main() {
                 let state = format!(
                     "{}{}{}",
                     state.split([' ', '{', '(']).next().unwrap_or(""),
-                    if state.contains("working: true") { "+" } else { "" },
+                    if state.contains("working: true") {
+                        "+"
+                    } else {
+                        ""
+                    },
                     if u.y > 0.05 { "^" } else { "" }
                 );
                 let last = states.entry(u.id).or_insert((state.clone(), 0u32));
                 if last.0 != state {
                     if std::env::var("TRACE").is_ok() && last.1 >= 2 {
-                        println!("  {} {:?}@{:.2} {} -> {:?} goal", u.id, u.role, u.x, last.0, u.ai);
+                        println!(
+                            "  {} {:?}@{:.2} {} -> {:?} goal",
+                            u.id, u.role, u.x, last.0, u.ai
+                        );
                     }
                     last.0 = state;
                     last.1 += 1;
@@ -426,7 +443,7 @@ fn main() {
     // --save-check: save, load, and check both copies stay identical for a day.
     if std::env::args().any(|a| a == "--save-check") {
         let bytes = game::save::save_game(&g, 1);
-        let mut h = game::save::load_game(&bytes, 1).expect("load");
+        let mut h = game::save::load_game(&bytes, 1, &world).expect("load");
         println!("save: {} bytes", bytes.len());
         let (mut ea, mut eb) = (Vec::new(), Vec::new());
         let (mut ma, mut mb) = (ControlMapper::default(), ControlMapper::default());

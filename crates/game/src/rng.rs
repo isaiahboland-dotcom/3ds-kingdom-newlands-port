@@ -30,12 +30,20 @@ impl Rng {
         min + (max - min) * self.value()
     }
 
-    /// Uniform integer in `[min, max)`. orig: `Random.Range(int, int)`.
+    /// Uniform integer in `[min, max)`; returns `min` when `max <= min`. orig: `Random.Range(int, int)`.
     pub fn range_i32(&mut self, min: i32, max: i32) -> i32 {
         if max <= min {
             return min;
         }
-        min + (self.next_u32() % (max - min) as u32) as i32
+        let n = (max as i64 - min as i64) as u64;
+        // xorshift32 visits every nonzero u32: sample that domain evenly.
+        let limit = u32::MAX as u64 / n * n;
+        loop {
+            let v = self.next_u32() as u64 - 1;
+            if v < limit {
+                return (min as i64 + (v % n) as i64) as i32;
+            }
+        }
     }
 }
 

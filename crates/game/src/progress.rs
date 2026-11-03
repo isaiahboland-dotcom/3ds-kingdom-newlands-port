@@ -196,9 +196,15 @@ mod tests {
     #[cfg(feature = "save")]
     #[test]
     fn unlocks_from_before_tutorial_done_and_chosen_still_load() {
-        let p = Progress { land: 2, tutorial_done: true, ..Default::default() };
+        let p = Progress {
+            land: 2,
+            tutorial_done: true,
+            ..Default::default()
+        };
         let bytes = crate::save::save_progress(&p);
         // `chosen` is None (1 byte), `tutorial_done` true (1 byte).
+        let mut bytes = bytes;
+        bytes[4..6].copy_from_slice(&4u16.to_le_bytes());
         let before_chosen = crate::save::load_progress(&bytes[..bytes.len() - 1]).unwrap();
         assert_eq!(before_chosen, p);
         let before_both = crate::save::load_progress(&bytes[..bytes.len() - 2]).unwrap();

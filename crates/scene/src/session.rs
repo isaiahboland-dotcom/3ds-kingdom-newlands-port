@@ -240,9 +240,14 @@ impl Session {
     fn read_slots(&mut self) {
         for i in 0..save::SLOTS {
             self.slots[i] = self.storage.as_ref().and_then(|st| {
-                let g = save::load_game(&st.read(&save::game_slot(i))?, self.world_id).ok()?;
+                let g = save::load_game(&st.read(&save::game_slot(i))?, self.world_id, &self.world)
+                    .ok()?;
                 Some(SlotInfo {
-                    island: self.world.levels.get(g.level_index).map_or(String::new(), |l| l.name.clone()),
+                    island: self
+                        .world
+                        .levels
+                        .get(g.level_index)
+                        .map_or(String::new(), |l| l.name.clone()),
                     day: g.days.day,
                     coins: g.wallet.coins(),
                 })
@@ -265,7 +270,7 @@ impl Session {
             .storage
             .as_ref()
             .and_then(|st| st.read(&save::game_slot(i)))
-            .and_then(|b| save::load_game(&b, self.world_id).ok());
+            .and_then(|b| save::load_game(&b, self.world_id, &self.world).ok());
         self.slot = i;
         self.map = None;
         self.ended = None;
@@ -377,7 +382,13 @@ impl Session {
             self.events.clear();
             self.game.tick(&self.world, &controls, &mut self.events);
             for e in &self.events {
-                crate::sound::on_event(&self.world, &self.game, e, &mut self.cues, &mut self.music_cues);
+                crate::sound::on_event(
+                    &self.world,
+                    &self.game,
+                    e,
+                    &mut self.cues,
+                    &mut self.music_cues,
+                );
                 match *e {
                     GameEvent::Day(time::DayEvent::Started {
                         day,

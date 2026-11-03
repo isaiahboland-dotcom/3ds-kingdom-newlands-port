@@ -1364,7 +1364,7 @@ impl Greed {
                 .position(|t| !t.is_dead() && point_in(&t.box_at(), a.x, a.y))
             {
                 hits.push((i, a.damage));
-                a.stuck = 10.0;
+                a.stuck = 2.0;
                 continue;
             }
             // orig: the portal's trigger takes arrows too (Damageable, Arrow).
@@ -1380,7 +1380,7 @@ impl Greed {
                     .iter()
                     .any(|q| q.object == p.object && q.can_spawn())
                 {
-                    a.stuck = 10.0;
+                    a.stuck = 2.0;
                     events(GreedEvent::PortalHit {
                         object: p.object,
                         damage: a.damage,

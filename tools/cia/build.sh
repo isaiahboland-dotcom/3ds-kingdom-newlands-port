@@ -26,16 +26,17 @@ WORK="$OUT/cia"
 
 # Pinned sources for the packaging tools.
 MAKEROM_REPO=https://github.com/3DSGuy/Project_CTR.git
-MAKEROM_TAG=makerom-v0.19.0
+MAKEROM_REV=e8f5f529c54ff9b22a2491a480ffa69206bf7b19
 BANNERTOOL_REPO=https://github.com/diasurgical/bannertool.git
-BANNERTOOL_REV=master
+BANNERTOOL_REV=16d8c5a0ce02a5e06e64ab42275132fca57c04a2
 
 build_makerom() {
-    echo "building makerom ($MAKEROM_TAG)..."
+    echo "building makerom ($MAKEROM_REV)..."
     rm -rf "$HERE/src/Project_CTR"
-    git clone --quiet --depth 1 --branch "$MAKEROM_TAG" "$MAKEROM_REPO" "$HERE/src/Project_CTR"
+    git clone --quiet "$MAKEROM_REPO" "$HERE/src/Project_CTR"
+    git -C "$HERE/src/Project_CTR" checkout --quiet "$MAKEROM_REV"
     # The dependencies first: a parallel build can link before they exist.
-    make -C "$HERE/src/Project_CTR/makerom" deps >/dev/null
+    make -C "$HERE/src/Project_CTR/makerom" deps
     make -C "$HERE/src/Project_CTR/makerom" program >/dev/null
     cp "$HERE/src/Project_CTR/makerom/bin/makerom" "$HERE/bin/"
 }
@@ -43,10 +44,17 @@ build_makerom() {
 build_bannertool() {
     echo "building bannertool..."
     rm -rf "$HERE/src/bannertool"
-    git clone --quiet --depth 1 --branch "$BANNERTOOL_REV" "$BANNERTOOL_REPO" "$HERE/src/bannertool"
+    git clone --quiet "$BANNERTOOL_REPO" "$HERE/src/bannertool"
+    git -C "$HERE/src/bannertool" checkout --quiet "$BANNERTOOL_REV"
     git -C "$HERE/src/bannertool" submodule update --quiet --init --depth 1
     make -C "$HERE/src/bannertool" >/dev/null
-    cp "$(find "$HERE/src/bannertool/output" -type f -name bannertool | head -n 1)" "$HERE/bin/"
+    local bt
+    bt="$(find "$HERE/src/bannertool/output" -type f -name bannertool | head -n 1)"
+    if [ -z "$bt" ]; then
+        echo "bannertool build produced no binary" >&2
+        return 1
+    fi
+    cp "$bt" "$HERE/bin/"
 }
 
 mkdir -p "$HERE/bin" "$HERE/src" "$WORK"

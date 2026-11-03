@@ -209,7 +209,7 @@ rip() {
     "$AR" --headless --port "$port" --log-path "$ROOT/reference/assetripper.log" >"$ROOT/reference/assetripper.out" 2>&1 &
     AR_PID=$!
     tries=0
-    until curl -fs -o /dev/null "$url/"; do
+    until curl --noproxy '*' -fs -o /dev/null "$url/"; do
         kill -0 "$AR_PID" 2>/dev/null || die "AssetRipper didn't start (see reference/assetripper.out)"
         tries=$((tries + 1))
         [ "$tries" -lt 120 ] || die "AssetRipper didn't answer on $url"
@@ -217,7 +217,7 @@ rip() {
     done
     # The settings the extract tool expects (AssetRipper's defaults, set in
     # case a saved configuration says otherwise). An unchecked box is left out.
-    curl -fs -o /dev/null "$url/Settings/Update" \
+    curl --noproxy '*' -fs -o /dev/null "$url/Settings/Update" \
         -d BundledAssetsExportMode=DirectExport -d ScriptContentLevel=Level2 \
         -d DefaultVersion=0.0.0a0 -d TargetVersion=0.0.0a0 \
         -d AudioExportFormat=Default -d ImageExportFormat=Png \
@@ -226,11 +226,11 @@ rip() {
         -d ScriptLanguageVersion=AutoSafe -d ScriptExportMode=Hybrid \
         -d PreferOriginalTextureExtension= ||
         die "AssetRipper refused its settings"
-    curl -fs -o /dev/null "$url/LoadFolder" --data-urlencode "Path=$DATA" ||
+    curl --noproxy '*' -fs -o /dev/null "$url/LoadFolder" --data-urlencode "Path=$DATA" ||
         die "AssetRipper couldn't load $DATA"
     local tmp="$ROOT/reference/ripped.partial"
     rm -rf "$tmp"
-    curl -fs -o /dev/null --max-time 3600 "$url/Export/UnityProject" --data-urlencode "Path=$tmp" ||
+    curl --noproxy '*' -fs -o /dev/null --max-time 3600 "$url/Export/UnityProject" --data-urlencode "Path=$tmp" ||
         die "AssetRipper's export failed (see reference/assetripper.log)"
     stop_assetripper
     [ -d "$tmp/ExportedProject/Assets" ] || die "AssetRipper exported nothing (see reference/assetripper.log)"

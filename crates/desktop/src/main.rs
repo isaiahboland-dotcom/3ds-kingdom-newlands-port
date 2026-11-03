@@ -91,10 +91,13 @@ async fn main() {
     // Last frame's top screen, which the water reflects.
     let previous_rt = target(TOP_W, TOP_H);
     let dir = std::env::var("KINGDOM_ASSETS").unwrap_or_else(|_| "assets".to_owned());
+    let mut world_id = 0;
     let world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))
         .map_err(|e| e.to_string())
-        .and_then(|b| postcard::from_bytes(&b).map_err(|e| e.to_string()))
-    {
+        .and_then(|b| {
+            world_id = save::fingerprint(&b);
+            postcard::from_bytes(&b).map_err(|e| e.to_string())
+        }) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("could not load {dir}/world.bin: {e} (re-run the extract tool)");
@@ -119,13 +122,12 @@ async fn main() {
         .skip_while(|a| a != "--greed-at")
         .nth(1)
         .and_then(|s| s.parse().ok());
-    let island: usize = arg("--island").unwrap_or(0);
+    let island: usize = arg("--island")
+        .unwrap_or(0)
+        .min(world.levels.len().saturating_sub(1));
     let boat_at: Option<u32> = arg("--boat-at");
     // Saves: off for screenshot runs and with --no-save. A saved run resumes
     // unless --new or --island is given.
-    let world_id = std::fs::read(std::path::Path::new(&dir).join("world.bin"))
-        .map(|b| save::fingerprint(&b))
-        .unwrap_or(0);
     let storage = (screenshot.is_none() && !std::env::args().any(|a| a == "--no-save"))
         .then(storage::Files::new);
     let progress = if std::env::args().any(|a| a == "--unlocked") {
@@ -153,7 +155,7 @@ async fn main() {
             )
         })
         .flatten()
-        .and_then(|b| match save::load_game(&b, world_id) {
+        .and_then(|b| match save::load_game(&b, world_id, &world) {
             Ok(g) => Some(g),
             Err(e) => {
                 eprintln!("ignoring the saved game ({e:?})");
@@ -161,7 +163,7 @@ async fn main() {
             }
         });
     let mut app = Session::new(world, island, seed, progress);
-    app.debug = true;
+    app.debug = std::env::args().any(|a| a == "--debug");
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
     app.slot = slot;

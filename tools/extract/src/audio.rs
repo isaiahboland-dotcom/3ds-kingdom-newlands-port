@@ -13,7 +13,6 @@ use serde_json::{Map, Value};
 
 use crate::world::Inputs;
 
-
 fn comp<'v>(node: &'v Value, ty: &str) -> Option<&'v Map<String, Value>> {
     node["components"]
         .as_array()?
@@ -77,7 +76,11 @@ impl Builder {
                 .flatten()
                 .filter_map(|c| self.clip(c))
                 .collect(),
-            None => src.get("m_audioClip").and_then(|c| self.clip(c)).into_iter().collect(),
+            None => src
+                .get("m_audioClip")
+                .and_then(|c| self.clip(c))
+                .into_iter()
+                .collect(),
         };
         if clips.is_empty() {
             return None;
@@ -106,7 +109,12 @@ impl Builder {
                 .and_then(|c| c["m_Curve"].as_array())
                 .into_iter()
                 .flatten()
-                .map(|k| (f(k.as_object().unwrap(), "time", 0.0), f(k.as_object().unwrap(), "value", 0.0)))
+                .map(|k| {
+                    (
+                        f(k.as_object().unwrap(), "time", 0.0),
+                        f(k.as_object().unwrap(), "value", 0.0),
+                    )
+                })
                 .collect()
         };
         // orig: spatialBlend is the first key of `panLevelCustomCurve`.
@@ -117,7 +125,9 @@ impl Builder {
             _ => Rolloff::Linear,
         };
         let int = |m: Option<&Map<String, Value>>, k: &str, d: i64| {
-            m.and_then(|m| m.get(k)).and_then(Value::as_i64).unwrap_or(d)
+            m.and_then(|m| m.get(k))
+                .and_then(Value::as_i64)
+                .unwrap_or(d)
         };
         let id = self.found.audio.sounds.len() as SoundId;
         self.found.audio.sounds.push(SoundDef {
@@ -135,7 +145,11 @@ impl Builder {
             rolloff,
             group,
             schedule: comp(node, "TimeBasedAudio").map(|t| {
-                (f(t, "startTime", 0.0), f(t, "endTime", 0.0), int(Some(t), "season", 7) as u8)
+                (
+                    f(t, "startTime", 0.0),
+                    f(t, "endTime", 0.0),
+                    int(Some(t), "season", 7) as u8,
+                )
             }),
         });
         Some(id)
@@ -167,7 +181,11 @@ impl Builder {
             };
             for (field, v) in fields {
                 let mut add = |key: String, v: &Value| {
-                    if let Some(&id) = v.get("asset").and_then(Value::as_str).and_then(|p| emitters.get(p)) {
+                    if let Some(&id) = v
+                        .get("asset")
+                        .and_then(Value::as_str)
+                        .and_then(|p| emitters.get(p))
+                    {
                         self.add_ref(format!("{owner}:{key}"), id);
                         self.add_ref(key, id);
                     }
@@ -227,7 +245,12 @@ pub fn find(inp: &Inputs) -> Found {
 
 /// Converts every clip into `out/audio/<name>.adp` (kept when newer than
 /// its source), filling in lengths and channel counts.
-pub fn convert(assets: &Path, out: &Path, audio: &mut AudioDef, clip_paths: &[String]) -> Result<(), String> {
+pub fn convert(
+    assets: &Path,
+    out: &Path,
+    audio: &mut AudioDef,
+    clip_paths: &[String],
+) -> Result<(), String> {
     let dir = out.join("audio");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     // Clips any music sound plays are streamed, in stereo.
@@ -252,13 +275,14 @@ pub fn convert(assets: &Path, out: &Path, audio: &mut AudioDef, clip_paths: &[St
                         .map(|&i| {
                             let src = assets.join(&clip_paths[i]);
                             let dst = dir.join(format!("{}.adp", clips[i].name));
-                            let fresh = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                            let fresh =
+                                |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
                             if let (Some(d), Some(s)) = (fresh(&dst), fresh(&src)) {
                                 if d >= s {
                                     let head = std::fs::read(&dst).map_err(|e| e.to_string())?;
                                     if let Some(a) = Adp::header(&head) {
                                         let n = a.channels.len() as u8;
-                                        if (n == 2) == music[i] || n == 1 {
+                                        if (n == 2) == music[i] {
                                             return Ok((i, a.samples as f32 / a.rate as f32, n));
                                         }
                                     }
@@ -274,7 +298,10 @@ pub fn convert(assets: &Path, out: &Path, audio: &mut AudioDef, clip_paths: &[St
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
     });
     for r in results {
         let (i, seconds, channels) = r?;

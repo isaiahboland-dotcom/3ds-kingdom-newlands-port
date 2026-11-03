@@ -2,6 +2,7 @@
 name = "n3ds"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.88"
 license = "MIT"
 description = "Nintendo 3DS backend (build with cargo 3ds)"
 
@@ -27,6 +28,7 @@ romfs_dir = "romfs"
 opt-level = 3
 lto = true
 debug = false
+panic = "abort"
 
 [profile.dev]
 opt-level = 1

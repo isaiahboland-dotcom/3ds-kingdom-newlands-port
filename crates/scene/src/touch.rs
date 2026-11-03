@@ -62,7 +62,12 @@ const DONE: Rect = Rect::new(228.0, 140.0, 84.0, 22.0);
 const PALETTE: Rect = Rect::new(8.0, 172.0, 304.0, 60.0);
 
 fn slot_row(i: usize) -> Rect {
-    Rect::new(SLOT_ROW.x, SLOT_ROW.y + i as f32 * SLOT_GAP, SLOT_ROW.w, SLOT_ROW.h)
+    Rect::new(
+        SLOT_ROW.x,
+        SLOT_ROW.y + i as f32 * SLOT_GAP,
+        SLOT_ROW.w,
+        SLOT_ROW.h,
+    )
 }
 
 fn slot_save(i: usize) -> Rect {
@@ -126,7 +131,12 @@ fn palette_cell(i: usize) -> Rect {
         PALETTE.h / heraldry::PALETTE_ROWS as f32,
     );
     let (row, col) = (i / heraldry::PALETTE_COLS, i % heraldry::PALETTE_COLS);
-    Rect::new(PALETTE.x + col as f32 * cw, PALETTE.y + row as f32 * ch, cw - 1.0, ch - 1.0)
+    Rect::new(
+        PALETTE.x + col as f32 * cw,
+        PALETTE.y + row as f32 * ch,
+        cw - 1.0,
+        ch - 1.0,
+    )
 }
 
 fn coat_color(coat: &mut CoatOfArms, i: usize) -> &mut [f32; 3] {
@@ -220,7 +230,7 @@ pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
             let sp = sheet.get(sp);
             let c = map_pos(land.at);
             let (w, h) = (sp.w as f32, sp.h as f32);
-            let r = Rect::new(c.0 - w / 2.0, c.1 - h / 2.0, w, h);
+            let r = Rect::new(c.0 - sp.px, c.1 - sp.py, w, h);
             if r.contains(p) && m.options.contains(&l) {
                 if m.selected == l {
                     return Tap::Go;
@@ -278,13 +288,29 @@ pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
     if s.god {
         let l = "GOD MODE";
         let (w, _) = text::measure(sheet, l, 12.0);
-        text::draw(r, sheet, l, ((W - w) / 2.0).round(), 6.0, 12.0, Color::new(1.0, 0.85, 0.3, 1.0));
+        text::draw(
+            r,
+            sheet,
+            l,
+            ((W - w) / 2.0).round(),
+            6.0,
+            12.0,
+            Color::new(1.0, 0.85, 0.3, 1.0),
+        );
     }
     let lines = s.warning.lines().count() as f32;
     for (i, l) in s.warning.lines().enumerate() {
         let (w, _) = text::measure(sheet, l, 12.0);
         let y = H - 11.0 * (lines - i as f32);
-        text::draw(r, sheet, l, ((W - w) / 2.0).round(), y, 12.0, Color::new(1.0, 0.6, 0.4, 1.0));
+        text::draw(
+            r,
+            sheet,
+            l,
+            ((W - w) / 2.0).round(),
+            y,
+            12.0,
+            Color::new(1.0, 0.6, 0.4, 1.0),
+        );
     }
     // Pause button.
     r.rect_lines(PAUSE, 2.0, Color::WHITE);
@@ -310,22 +336,51 @@ fn outline(r: &mut impl Renderer, b: Rect, t: f32, c: Color) {
 fn button(r: &mut impl Renderer, sheet: &Sheet, b: Rect, label: &str, color: Color) {
     outline(r, b, 1.0, color);
     let (w, _) = text::measure(sheet, label, 16.0);
-    text::draw(r, sheet, label, (b.x + (b.w - w) / 2.0).round(), b.y + b.h / 2.0 + 5.0, 16.0, color);
+    text::draw(
+        r,
+        sheet,
+        label,
+        (b.x + (b.w - w) / 2.0).round(),
+        b.y + b.h / 2.0 + 5.0,
+        16.0,
+        color,
+    );
 }
 
 /// The pause menu: three save slots (the current one in gold) and Resume.
 fn draw_pause(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
     let title = "PAUSED";
     let (w, _) = text::measure(sheet, title, 24.0);
-    text::draw(r, sheet, title, ((W - w) / 2.0).round(), 30.0, 24.0, Color::WHITE);
+    text::draw(
+        r,
+        sheet,
+        title,
+        ((W - w) / 2.0).round(),
+        30.0,
+        24.0,
+        Color::WHITE,
+    );
     let dim = Color::bytes([150, 140, 130, 255]);
     for i in 0..game::save::SLOTS {
         let row = slot_row(i);
         let color = if i == s.slot { GOLD } else { Color::WHITE };
         outline(r, row, if i == s.slot { 2.0 } else { 1.0 }, color);
-        text::draw(r, sheet, &format!("SLOT {}", i + 1), row.x + 8.0, row.y + 17.0, 16.0, color);
+        text::draw(
+            r,
+            sheet,
+            &format!("SLOT {}", i + 1),
+            row.x + 8.0,
+            row.y + 17.0,
+            16.0,
+            color,
+        );
         let info = match &s.slots[i] {
-            Some(info) => format!("{} - DAY {} - {} COINS", info.island.to_uppercase(), info.day, info.coins),
+            Some(info) => format!(
+                "{} - DAY {} - {} COINS",
+                info.island.to_uppercase(),
+                info.day,
+                info.coins
+            ),
             None => "EMPTY".to_owned(),
         };
         text::draw(r, sheet, &info, row.x + 8.0, row.y + 34.0, 14.0, dim);
@@ -345,35 +400,58 @@ fn draw_editor(s: &Session, ed: Editor, sheet: &Sheet, r: &mut impl Renderer) {
     // orig: Banner: the pattern in the main and trim colors, the emblem over it.
     let d = Draw::tint(Color::WHITE).scale(PREVIEW_BANNER_SCALE);
     if let Some(id) = heraldry::pattern(sheet, look) {
-        r.sprite(id, PREVIEW_BANNER, d.recolor(rgb(coat.primary), rgb(coat.secondary)));
+        r.sprite(
+            id,
+            PREVIEW_BANNER,
+            d.recolor(rgb(coat.primary), rgb(coat.secondary)),
+        );
     }
     if let Some(id) = heraldry::emblem(sheet, look) {
-        r.sprite(id, PREVIEW_BANNER, Draw::tint(rgb(coat.emblem)).scale(PREVIEW_BANNER_SCALE));
+        r.sprite(
+            id,
+            PREVIEW_BANNER,
+            Draw::tint(rgb(coat.emblem)).scale(PREVIEW_BANNER_SCALE),
+        );
     }
     // The monarch standing on the steed, as on the island.
     let scale = PREVIEW_RIDER_SCALE;
     let steed = s.game.steed;
     let clip = &s.world.steeds[steed as usize].clips;
-    if let Some(id) = sheet.clip(&top::clip_name(clip, Action::Stand)).and_then(|c| c.sprite("", 0.0)) {
+    if let Some(id) = sheet
+        .clip(&top::clip_name(clip, Action::Stand))
+        .and_then(|c| c.sprite("", 0.0))
+    {
         let (mane, hide) = top::steed_colors(s, steed, true);
-        r.sprite(id, PREVIEW_RIDER, Draw::tint(Color::WHITE).scale(scale).recolor(mane, hide));
+        r.sprite(
+            id,
+            PREVIEW_RIDER,
+            Draw::tint(Color::WHITE).scale(scale).recolor(mane, hide),
+        );
     }
     let who = heraldry::rider(look);
     if let Some(id) = sheet.id(who.default) {
-        let d = Draw::tint(Color::WHITE).scale(scale).recolor(rgb(coat.primary), top::SKIN);
+        let d = Draw::tint(Color::WHITE)
+            .scale(scale)
+            .recolor(rgb(coat.primary), top::SKIN);
         r.sprite(id, PREVIEW_RIDER, d);
     }
     if let Some(id) = sheet.id(who.crown) {
         let (cx, cy) = top::CROWN_DEFAULT_POS;
         let px = 32.0 * scale;
-        let at = ((PREVIEW_RIDER.0 + cx * px).round(), (PREVIEW_RIDER.1 - cy * px).round());
+        let at = (
+            (PREVIEW_RIDER.0 + cx * px).round(),
+            (PREVIEW_RIDER.1 - cy * px).round(),
+        );
         r.sprite(id, at, Draw::tint(Color::WHITE).scale(scale));
     }
 
     let pick = |on: bool| if on { GOLD } else { Color::WHITE };
     button(r, sheet, KING, "KING", pick(!look.queen));
     button(r, sheet, QUEEN, "QUEEN", pick(look.queen));
-    for (i, (label, v)) in [("PATTERN", look.pattern), ("EMBLEM", look.emblem)].into_iter().enumerate() {
+    for (i, (label, v)) in [("PATTERN", look.pattern), ("EMBLEM", look.emblem)]
+        .into_iter()
+        .enumerate()
+    {
         let y = STEP_ROWS[i] + STEP_SIZE / 2.0 + 5.0;
         text::draw(r, sheet, label, KING.x, y, 16.0, Color::WHITE);
         button(r, sheet, step_prev(i), "<", Color::WHITE);
@@ -381,7 +459,15 @@ fn draw_editor(s: &Session, ed: Editor, sheet: &Sheet, r: &mut impl Renderer) {
         let num = format!("{}", v + 1);
         let (w, _) = text::measure(sheet, &num, 16.0);
         let mid = (STEP_PREV_X + STEP_SIZE + STEP_NEXT_X) / 2.0;
-        text::draw(r, sheet, &num, (mid - w / 2.0).round(), y, 16.0, Color::WHITE);
+        text::draw(
+            r,
+            sheet,
+            &num,
+            (mid - w / 2.0).round(),
+            y,
+            16.0,
+            Color::WHITE,
+        );
     }
     let mut coat = coat;
     for (i, label) in ["MAIN", "TRIM", "EMBLEM"].into_iter().enumerate() {
@@ -390,7 +476,15 @@ fn draw_editor(s: &Session, ed: Editor, sheet: &Sheet, r: &mut impl Renderer) {
         let on = ed.target == i;
         outline(r, b, if on { 2.0 } else { 1.0 }, pick(on));
         let (w, _) = text::measure(sheet, label, 12.0);
-        text::draw(r, sheet, label, (b.x + (b.w - w) / 2.0).round(), b.y + b.h + 12.0, 12.0, pick(on));
+        text::draw(
+            r,
+            sheet,
+            label,
+            (b.x + (b.w - w) / 2.0).round(),
+            b.y + b.h + 12.0,
+            12.0,
+            pick(on),
+        );
     }
     button(r, sheet, RANDOM, "RANDOM", Color::WHITE);
     button(r, sheet, DONE, "DONE", GOLD);
@@ -434,7 +528,12 @@ fn draw_day(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
     r.rect(Rect::new(bx - 14.0, by + 1.0, 8.0, bh - 2.0), fill);
     r.rect_lines(Rect::new(bx, by, bw, bh), 1.0, Color::WHITE);
     r.rect(
-        Rect::new(bx + 1.0, by + 1.0, (bw - 2.0) * m.stamina.clamp(0.0, 1.0), bh - 2.0),
+        Rect::new(
+            bx + 1.0,
+            by + 1.0,
+            (bw - 2.0) * m.stamina.clamp(0.0, 1.0),
+            bh - 2.0,
+        ),
         fill,
     );
 
@@ -459,14 +558,23 @@ fn draw_compass(s: &Session, sheet: &Sheet, r: &mut impl Renderer, at: (f32, f32
     let dir = dx.signum();
     // A pixel arrow pointing at a flame: a shaft and a head of narrowing columns.
     let aw = 20.0;
-    let (ax, fire) = if dir > 0.0 { (x, x + 28.0) } else { (x + 12.0, x + 4.0) };
+    let (ax, fire) = if dir > 0.0 {
+        (x, x + 28.0)
+    } else {
+        (x + 12.0, x + 4.0)
+    };
     let tip = if dir > 0.0 { ax + aw } else { ax };
     for i in 0..6 {
         let h = 2.0 * (i + 1) as f32;
         let cx = tip - dir * (i as f32 + 1.0);
         r.rect(Rect::new(cx.min(cx + 1.0), mid - h / 2.0, 1.0, h), GOLD);
     }
-    let shaft = Rect::new(if dir > 0.0 { ax } else { ax + 6.0 }, mid - 1.5, aw - 6.0, 3.0);
+    let shaft = Rect::new(
+        if dir > 0.0 { ax } else { ax + 6.0 },
+        mid - 1.5,
+        aw - 6.0,
+        3.0,
+    );
     r.rect(shaft, GOLD);
     r.circle(fire, mid, 4.0, flame);
     let far = format!("{}", dx.abs().round() as i32);

@@ -198,7 +198,10 @@ impl Audio {
     fn evict(&mut self) -> bool {
         let busy = |c: usize, a: &Audio| {
             (0..MUSIC[0]).any(|ch| {
-                a.on[ch] == Some(c as AudioClipId) && unsafe { ctru::ndspChnIsPlaying(ch as i32) }
+                a.on[ch] == Some(c as AudioClipId)
+                    && (a.bufs[ch].status == ctru::NDSP_WBUF_QUEUED as u8
+                        || a.bufs[ch].status == ctru::NDSP_WBUF_PLAYING as u8
+                        || unsafe { ctru::ndspChnIsPlaying(ch as i32) })
             })
         };
         let victim = (0..self.clips.len())
@@ -278,14 +281,6 @@ impl Audio {
         let len = adpcm::data_len(a.samples as usize) as u64;
         let base = adpcm::header_len(a.channels.len()) as u64;
         let stereo = a.channels.len() == 2;
-        let alloc = || unsafe { ctru::linearAlloc(CHUNK_BYTES) } as *mut u8;
-        let data = [[alloc(), alloc(), alloc()], [alloc(), alloc(), alloc()]];
-        if data.iter().flatten().any(|p| p.is_null()) {
-            for p in data.iter().flatten().filter(|p| !p.is_null()) {
-                unsafe { ctru::linearFree(*p as *mut _) };
-            }
-            return None;
-        }
         // First frame headers: the decoder state each channel starts from.
         let mut starts = [0u16; 2];
         for (c, s) in starts.iter_mut().enumerate().take(a.channels.len()) {
@@ -293,6 +288,17 @@ impl Audio {
             file.seek(SeekFrom::Start(base + c as u64 * len)).ok()?;
             file.read_exact(&mut b).ok()?;
             *s = b[0] as u16;
+        }
+        if !stereo {
+            starts[1] = starts[0];
+        }
+        let alloc = || unsafe { ctru::linearAlloc(CHUNK_BYTES) } as *mut u8;
+        let data = [[alloc(), alloc(), alloc()], [alloc(), alloc(), alloc()]];
+        if data.iter().flatten().any(|p| p.is_null()) {
+            for p in data.iter().flatten().filter(|p| !p.is_null()) {
+                unsafe { ctru::linearFree(*p as *mut _) };
+            }
+            return None;
         }
         for (c, &ch) in MUSIC.iter().enumerate() {
             let src = &a.channels[c.min(a.channels.len() - 1)];
@@ -412,7 +418,13 @@ impl Mixer for Audio {
         }
         self.used[clip as usize] = self.frame;
         // A free effect channel (else the quietest-to-lose: the oldest).
-        let free = (0..MUSIC[0]).find(|&ch| unsafe { !ctru::ndspChnIsPlaying(ch as i32) });
+        // WaveBufAdd publishes QUEUED synchronously; service playing state lags.
+        let free = (0..MUSIC[0]).find(|&ch| {
+            let st = self.bufs[ch].status;
+            st != ctru::NDSP_WBUF_QUEUED as u8
+                && st != ctru::NDSP_WBUF_PLAYING as u8
+                && unsafe { !ctru::ndspChnIsPlaying(ch as i32) }
+        });
         let ch = match free {
             Some(ch) => ch,
             None => (0..MUSIC[0]).min_by_key(|&ch| self.voice[ch])?,

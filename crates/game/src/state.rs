@@ -178,6 +178,22 @@ pub struct GameState {
 }
 
 impl GameState {
+    /// Reject saved world indices before they can reach indexed access.
+    pub(crate) fn ids_valid(&self, world: &WorldData) -> bool {
+        self.level_index < world.levels.len()
+            && (self.steed as usize) < world.steeds.len()
+            && self
+                .mounts
+                .free
+                .iter()
+                .all(|f| (f.steed as usize) < world.steeds.len())
+            && self
+                .level
+                .all()
+                .all(|o| (o.proto as usize) < world.protos.len())
+            && self.blender.presets_valid(world)
+            && self.director.lights_valid(world)
+    }
     /// Starts a fresh run on island `level_index` (0 = Land One).
     pub fn new(world: &WorldData, level_index: usize, seed: u32) -> Self {
         Self::start(
@@ -236,7 +252,7 @@ impl GameState {
             let dx = self.rng.range(-2.0, 2.0);
             self.population.spawn_knight(x + dx, &mut self.rng);
         }
-        if let Some(h) = v.hermit {
+        if let Some(h) = v.hermit.filter(|h| (*h as usize) < world.protos.len()) {
             let dx = self.rng.range(-2.0, 2.0);
             self.hermits
                 .spawn(world, &mut self.level, h, x + dx, &mut self.rng);
@@ -505,8 +521,7 @@ impl GameState {
             let far = (border - self.campfire) * side as f32 > def.min_campfire_distance;
             let existing = self
                 .level
-                .objects
-                .iter()
+                .all()
                 .position(|o| o.proto == proto && (o.x < self.campfire) == (side < 0));
             if castle_built && far {
                 let x = border + side as f32 * def.distance_from_wall;
@@ -1247,6 +1262,7 @@ impl GameState {
         let mut pay_events: [Option<PayEvent>; 6] = [None; 6];
         let mut n = 0;
         self.pay.update(&input, |e| {
+            assert!(n < pay_events.len(), "pay machine emitted too many events");
             pay_events[n] = Some(e);
             n += 1;
         });
@@ -1421,8 +1437,9 @@ impl GameState {
             &mut self.rng,
         );
         let portal_infos = self.portal_infos(world);
+        let intact = self.intact_walls(world);
         let knights = crate::units::KnightCtx {
-            intact_wall: self.intact_walls(world),
+            intact_wall: intact,
             banner: [-1i8, 1].map(|side| {
                 world.border.and_then(|b| {
                     self.level
@@ -1434,7 +1451,6 @@ impl GameState {
             }),
         };
         // Night shelter: inside the outermost built, intact walls.
-        let intact = self.intact_walls(world);
         // With no such wall on a side (only scaffolding, or nothing), the
         // camp's minimum extent.
         let near = kingdom::MIN_KINGDOM_EXTENTS;
@@ -2637,7 +2653,9 @@ mod tests {
         g.days = crate::time::DayCounter::new(&g.clock);
         g.monarch.x = 0.0;
         let x = g.campfire + crate::kingdom::MIN_KINGDOM_EXTENTS + 4.0;
-        let wall = g.level.add(level::instantiate(&w, 0, Layer::Game, x, 0.0, 0.1, 1.0));
+        let wall = g
+            .level
+            .add(level::instantiate(&w, 0, Layer::Game, x, 0.0, 0.1, 1.0));
         g.level.objects.last_mut().unwrap().build = Some(0.0);
         g.payables_dirty = true;
         let id = g.population.spawn(Role::Worker, g.campfire, &mut g.rng);
@@ -3275,6 +3293,7 @@ mod tests {
     #[test]
     fn a_saved_run_resumes_exactly() {
         let mut w = fight_world();
+        w.steeds.push(Default::default());
         let mut shop = wall_proto("ShopHammer", 3, None, 0);
         shop.upgrade = None;
         shop.shop = Some(ShopDef {
@@ -3300,10 +3319,10 @@ mod tests {
         run(&mut g, &w, 7.0, walk);
         let bytes = crate::save::save_game(&g, 42);
         assert_eq!(
-            crate::save::load_game(&bytes, 41).err(),
+            crate::save::load_game(&bytes, 41, &w).err(),
             Some(crate::save::LoadError::World)
         );
-        let mut h = crate::save::load_game(&bytes, 42).unwrap();
+        let mut h = crate::save::load_game(&bytes, 42, &w).unwrap();
         for _ in 0..3 {
             run(&mut g, &w, 5.0, walk);
             run(&mut h, &w, 5.0, walk);
@@ -3536,7 +3555,9 @@ mod tests {
         w.protos = vec![wall, ghost];
         w.layers = vec![crate::data::LayerDef { ratio: 1.0, z: 0.0 }; 7];
         let mut g = GameState::new(&w, 0, 4);
-        let id = g.level.add(level::instantiate(&w, 1, Layer::Game, 10.0, 0.0, 0.1, 1.0));
+        let id = g
+            .level
+            .add(level::instantiate(&w, 1, Layer::Game, 10.0, 0.0, 0.1, 1.0));
         g.level.split_scenery(&w);
         g.tutorial = crate::tutorial::Tutorial::new(&w, &mut g.level, true);
         g.campfire = 30.0;
@@ -3549,13 +3570,17 @@ mod tests {
         for _ in 0..2 {
             g.population.spawn(Role::Peasant, 8.0, &mut g.rng);
         }
-        g.level.add(level::instantiate(&w, 0, Layer::Game, -3.0, 0.0, 0.1, 1.0));
+        g.level
+            .add(level::instantiate(&w, 0, Layer::Game, -3.0, 0.0, 0.1, 1.0));
         let mut ev = Vec::new();
         let mut done = 0;
         for _ in 0..60 * 6 {
             ev.clear();
             g.tick(&w, &Controls::default(), &mut ev);
-            done += ev.iter().filter(|e| matches!(e, GameEvent::TutorialDone)).count();
+            done += ev
+                .iter()
+                .filter(|e| matches!(e, GameEvent::TutorialDone))
+                .count();
         }
         assert_eq!(done, 1);
         assert!(g.tutorial.ghost.is_none());
@@ -3565,16 +3590,18 @@ mod tests {
     #[cfg(feature = "save")]
     #[test]
     fn saves_from_before_the_tutorial_and_the_look_still_load() {
-        let w = empty_world(5);
+        let mut w = empty_world(5);
+        w.steeds.push(Default::default());
         let mut g = GameState::new(&w, 0, 4);
         g.look.queen = true;
         let bytes = crate::save::save_game(&g, 1);
-        assert!(crate::save::load_game(&bytes, 1).unwrap().look.queen);
+        assert!(crate::save::load_game(&bytes, 1, &w).unwrap().look.queen);
         let look = postcard::to_allocvec(&g.look).unwrap().len();
         let tutorial = postcard::to_allocvec(&g.tutorial).unwrap().len();
         for cut in [look, look + tutorial] {
-            let old = &bytes[..bytes.len() - cut];
-            let loaded = crate::save::load_game(old, 1).unwrap();
+            let mut old = bytes[..bytes.len() - cut].to_vec();
+            old[4..6].copy_from_slice(&4u16.to_le_bytes());
+            let loaded = crate::save::load_game(&old, 1, &w).unwrap();
             assert_eq!(loaded.look, Default::default());
         }
     }
@@ -3582,12 +3609,53 @@ mod tests {
     #[test]
     fn a_chosen_look_is_kept_for_new_runs() {
         let w = empty_world(5);
-        let look = kingdom::Look { queen: true, pattern: 3, emblem: 7 };
-        let coat = CoatOfArms { primary: [1.0, 0.0, 0.0], secondary: [0.0; 3], emblem: [1.0; 3] };
-        let progress = crate::progress::Progress { chosen: Some((coat, look)), ..Default::default() };
+        let look = kingdom::Look {
+            queen: true,
+            pattern: 3,
+            emblem: 7,
+        };
+        let coat = CoatOfArms {
+            primary: [1.0, 0.0, 0.0],
+            secondary: [0.0; 3],
+            emblem: [1.0; 3],
+        };
+        let progress = crate::progress::Progress {
+            chosen: Some((coat, look)),
+            ..Default::default()
+        };
         let g = GameState::start(&w, 0, 9, &progress, None);
         assert_eq!((g.coat, g.look), (coat, look));
         let random = GameState::start(&w, 0, 9, &Default::default(), None);
         assert!(random.look.pattern < kingdom::PATTERNS && random.look.emblem < kingdom::EMBLEMS);
+    }
+    #[cfg(feature = "save")]
+    #[test]
+    fn damaged_saves_are_rejected_without_panicking() {
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        let mut g = GameState::new(&w, 0, 7);
+        let bytes = crate::save::save_game(&g, 42);
+        assert!(crate::save::load_game(&bytes, 42, &w).is_ok());
+        for i in 10..bytes.len() {
+            let mut damaged = bytes.clone();
+            damaged[i] = damaged[i].wrapping_add(1);
+            let _ = crate::save::load_game(&damaged, 42, &w);
+        }
+        for cut in 1..=3 {
+            assert_eq!(
+                crate::save::load_game(&bytes[..bytes.len() - cut], 42, &w).err(),
+                Some(crate::save::LoadError::Corrupt)
+            );
+        }
+        g.level_index = w.levels.len();
+        assert_eq!(
+            crate::save::load_game(&crate::save::save_game(&g, 42), 42, &w).err(),
+            Some(crate::save::LoadError::Corrupt)
+        );
+        let p = crate::save::save_progress(&Default::default());
+        assert_eq!(
+            crate::save::load_progress(&p[..p.len() - 1]).err(),
+            Some(crate::save::LoadError::Corrupt)
+        );
     }
 }
