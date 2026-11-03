@@ -17,19 +17,17 @@ impl SdCard {
 
 impl platform::Storage for SdCard {
     fn read(&self, slot: &str) -> Option<Vec<u8>> {
-        std::fs::read(Self::path(slot)).ok()
+        crate::savefile::read(std::path::Path::new(&Self::path(slot))).ok()
     }
 
     fn write(&mut self, slot: &str, data: &[u8]) -> bool {
-        // Write beside it and rename, so pulling the power never leaves half a save.
-        let path = Self::path(slot);
-        let tmp = format!("{path}.tmp");
-        std::fs::write(&tmp, data).is_ok()
-            && std::fs::File::open(&tmp).and_then(|f| f.sync_all()).is_ok()
-            && std::fs::rename(&tmp, &path).is_ok()
+        crate::savefile::write(std::path::Path::new(&Self::path(slot)), data).is_ok()
     }
 
     fn delete(&mut self, slot: &str) {
-        let _ = std::fs::remove_file(Self::path(slot));
+        let path = Self::path(slot);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}.bak"));
+        let _ = std::fs::remove_file(format!("{path}.tmp"));
     }
 }

@@ -164,10 +164,10 @@ pub fn on_event(w: &WorldData, g: &GameState, e: &GameEvent, cues: &mut Vec<Cue>
                 };
                 cue(on(w, owner, "Character.spawnSound"), unit_x(g, unit));
             }
-            UnitEvent::BuildPoint(unit) | UnitEvent::Repaired(unit) => {
-                cue(w.audio.sound("Worker.buildingSound"), unit_x(g, unit))
-            }
-            UnitEvent::TreeChopped(unit) => cue(w.audio.sound("WorkableTree.chopSound"), unit_x(g, unit)),
+            UnitEvent::WorkSound { x, tree } => cue(
+                w.audio.sound(if tree { "WorkableTree.chopSound" } else { "Worker.buildingSound" }),
+                Some(x),
+            ),
             UnitEvent::PaidTaxes(unit) => cue(w.audio.sound("Wallet.payTaxesSound"), unit_x(g, unit)),
             UnitEvent::Farmed(unit) => cue(w.audio.sound("Farmer.farmSound"), unit_x(g, unit)),
             UnitEvent::Strike { from_x, .. } => cue(w.audio.sound("Knight.slashSound"), Some(from_x)),
@@ -616,4 +616,24 @@ fn forest_weight(g: &GameState, x: f32) -> f32 {
         .filter(|(a, b)| *a < x && x < *b)
         .map(|(a, b)| ((b - x).min(x - a) / 8.0).min(1.0))
         .fold(0.0, f32::max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn positioned_worker_strokes_fade_out_at_the_emitters_range() {
+        let player = Player::new(&WorldData::default());
+        let def = SoundDef {
+            volume: 0.351,
+            spatial: 1.0,
+            min_distance: 7.0,
+            max_distance: 11.0,
+            rolloff: game::data::Rolloff::Custom(vec![(0.18, 1.0), (0.59, 0.5), (1.0, 0.0)]),
+            ..Default::default()
+        };
+        assert!(player.place(&def, Some(30.0), 30.0).0 > 0.0);
+        assert_eq!(player.place(&def, Some(30.0), -30.0).0, 0.0);
+        assert_eq!(player.place(&def, Some(-30.0), 30.0).0, 0.0);
+    }
 }

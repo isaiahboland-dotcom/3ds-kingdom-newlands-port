@@ -2905,6 +2905,10 @@ mod tests {
         assert!(ev
             .iter()
             .any(|e| matches!(e, GameEvent::Unit(UnitEvent::Repaired(_)))));
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            GameEvent::Unit(UnitEvent::WorkSound { x, tree: false }) if (*x - 5.0).abs() < 2.0
+        )));
         let o = &g.level.objects[g.level.index_of(wall).unwrap()];
         assert_eq!(o.hp, 3);
         assert!(!o.repair);

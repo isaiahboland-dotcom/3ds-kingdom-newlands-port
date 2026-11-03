@@ -527,6 +527,8 @@ pub enum UnitEvent {
     },
     Spawned(u32),
     BuildPoint(u32),
+    /// A completed worker stroke, positioned before its target can disappear.
+    WorkSound { x: f32, tree: bool },
     TreeChopped(u32),
     PaidTaxes(u32),
     /// A farmer worked a field. orig: `Farmland.ReceiveFarming()`.
@@ -788,6 +790,7 @@ impl Population {
         if self.reassign_timer <= 0.0 {
             self.reassign_timer = 1.0;
             self.reassign_work(ctx, level);
+            self.distribute_free_archers();
         }
         // Tools fall to the ground when not on a rack.
         for t in &mut self.tools {
@@ -1688,7 +1691,11 @@ impl Population {
     /// archer free. orig: `Kingdom.FetchArchersForJob(slot, 1)` (`minFreeArchers` 1).
     pub fn fetch_archer_for_slot(&mut self, slot: (u32, u8), x: f32) {
         let mut free: Vec<usize> = (0..self.units.len())
-            .filter(|&i| self.units[i].role == Role::Archer && self.units[i].slot.is_none())
+            .filter(|&i| {
+                self.units[i].role == Role::Archer
+                    && self.units[i].slot.is_none()
+                    && self.units[i].follows.is_none()
+            })
             .collect();
         if free.len() <= MIN_FREE_ARCHERS {
             return;
@@ -1701,11 +1708,16 @@ impl Population {
         self.units[free[0]].slot = Some(slot);
     }
 
-    /// Splits the free archers between the two walls by position.
+    /// Splits unposted hunters between the two walls by position.
+    /// Refreshed at dusk and on the one-second reassignment tick.
     /// orig: `Kingdom.DistributeFreeArchers()`.
     pub fn distribute_free_archers(&mut self) {
         let mut free: Vec<usize> = (0..self.units.len())
-            .filter(|&i| self.units[i].role == Role::Archer && self.units[i].slot.is_none())
+            .filter(|&i| {
+                self.units[i].role == Role::Archer
+                    && self.units[i].slot.is_none()
+                    && self.units[i].follows.is_none()
+            })
             .collect();
         free.sort_by(|&a, &b| self.units[a].x.total_cmp(&self.units[b].x));
         let half = free.len() / 2;
@@ -2408,6 +2420,7 @@ fn worker_work(
     }
     // A stroke finished. orig: Workable.FinishWork → OnWorkFinish.
     u.works_before_moving -= 1;
+    events(UnitEvent::WorkSound { x: u.x, tree: is_tree });
     if is_tree {
         let o = &mut level.objects[i];
         o.chops_left -= 1;
@@ -3029,6 +3042,34 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_archers_balance_after_recruitment_and_losses_without_taking_specialists() {
+        let mut rng = Rng::new(42);
+        let mut p = Population::default();
+        p.spawn(Role::Archer, -100.0, &mut rng);
+        p.units[0].follows = Some(99);
+        p.spawn(Role::Archer, 100.0, &mut rng);
+        p.units[1].slot = Some((99, 0));
+        for n in 0..33 {
+            p.distribute_free_archers();
+            let free = &p.units[2..];
+            let left = free.iter().filter(|u| u.guard_side == Some(-1)).count();
+            let right = free.iter().filter(|u| u.guard_side == Some(1)).count();
+            assert_eq!(left + right, n);
+            assert!(left.abs_diff(right) <= 1);
+            assert!(p.units[..2].iter().all(|u| u.guard_side.is_none()));
+            p.spawn(Role::Archer, 20.0 - n as f32, &mut rng);
+        }
+        p.units.drain(2..12);
+        p.distribute_free_archers();
+        let free = &p.units[2..];
+        let left = free.iter().filter(|u| u.guard_side == Some(-1)).count();
+        assert!(left.abs_diff(free.len() - left) <= 1);
+        p.fetch_archer_for_slot((88, 0), -100.0);
+        assert_eq!(p.units[0].slot, None);
+        assert_eq!(p.units[0].follows, Some(99));
+    }
 
     #[test]
     fn mover_slows_near_goal_and_stops() {
