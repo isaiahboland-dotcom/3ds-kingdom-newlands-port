@@ -29,6 +29,9 @@ const MOVE_SPEED: f32 = 5.0;
 const SPENT_FADE: f32 = 0.2;
 /// Fade time before an unclaimed coin disappears. orig: `Droppable.RunStateMachine()`.
 const DESPAWN_FADE: f32 = 1.0;
+/// Above this height no grabber's box reaches (they all stand on the ground),
+/// so a flying coin can skip the pickup checks.
+const COIN_REACH_Y: f32 = 1.8;
 
 /// Pickup cooldowns from the Coin prefab.
 mod cooldown {
@@ -128,7 +131,7 @@ impl Wallet {
 
 /// Who dropped, claimed or picked up a coin.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Who {
     Monarch,
     Unit(u32),
@@ -439,6 +442,15 @@ impl Coins {
     /// grabbers win ties. Each `PickedUp` event means one coin for that wallet.
     pub fn update(&mut self, dt: f32, grabbers: &[Grabber], mut emit: impl FnMut(CoinEvent)) {
         let mut room: Vec<u32> = grabbers.iter().map(|g| g.room).collect();
+        // `Who` → grabber index, for coins already being sucked in. A coin
+        // each tick otherwise re-scans every grabber (coins × units is the
+        // cost that spikes while a crowd is picking up a coin pile).
+        let mut index: Vec<(Who, usize)> = grabbers
+            .iter()
+            .enumerate()
+            .map(|(i, g)| (g.who, i))
+            .collect();
+        index.sort_unstable_by_key(|&(w, _)| w);
         for c in &mut self.list {
             match c.motion {
                 Motion::Free => {
@@ -450,22 +462,39 @@ impl Coins {
                         };
                         continue;
                     }
+                    // Nobody's box reaches this high (the ground folk's do).
+                    if c.y > COIN_REACH_Y {
+                        c.inside_dropper = false;
+                        continue;
+                    }
                     let me = COIN_BOX.at(c.x, c.y, false);
-                    let touches = |g: &Grabber| me.overlaps(&g.rect.at(g.x, g.y, g.flip));
+                    // One pass over the grabbers: leaving the dropper and
+                    // the first taker, instead of a scan for each.
+                    let mut inside = false;
+                    let mut taker = None;
+                    for (i, g) in grabbers.iter().enumerate() {
+                        if !me.overlaps(&g.rect.at(g.x, g.y, g.flip)) {
+                            continue;
+                        }
+                        if g.who == c.dropper {
+                            inside = true;
+                        }
+                        if taker.is_none()
+                            && room[i] > 0
+                            && c.can_be_picked_up_by(g.who)
+                            && (c.dropped_by_monarch() || !g.only_monarch_coins)
+                        {
+                            taker = Some(i);
+                        }
+                    }
                     // orig: Coin.OnTriggerExit2D: leaving the dropper frees the coin.
-                    let inside = grabbers.iter().any(|g| g.who == c.dropper && touches(g));
                     if c.inside_dropper && !inside && c.policy == Policy::AnybodyExceptDropper {
                         c.set_policy(Policy::Anybody);
                     }
                     c.inside_dropper = inside;
                     // orig: Wallet.OnTriggerStay2D → TryToGrabCoin → SuckCoin
-                    let taker = grabbers.iter().enumerate().find(|(i, g)| {
-                        room[*i] > 0
-                            && touches(g)
-                            && c.can_be_picked_up_by(g.who)
-                            && (c.dropped_by_monarch() || !g.only_monarch_coins)
-                    });
-                    if let Some((i, g)) = taker {
+                    if let Some(i) = taker {
+                        let g = &grabbers[i];
                         room[i] -= 1;
                         let from = (c.x, c.y);
                         c.motion = Motion::Grabbed {
@@ -514,7 +543,8 @@ impl Coins {
                     } else {
                         1.0
                     };
-                    if let Some(g) = grabbers.iter().find(|g| g.who == by) {
+                    if let Ok(i) = index.binary_search_by(|&(w, _)| w.cmp(&by)) {
+                        let g = &grabbers[index[i].1];
                         (c.x, c.y) = lerp(from, g.purse, ease(k));
                     }
                     c.alpha = 1.0 - 0.5 * ((k - 0.75) * 4.0).max(0.0);

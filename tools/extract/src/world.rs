@@ -2053,34 +2053,41 @@ pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
             continue;
         };
         let sprite = comp(body, "SpriteRenderer").and_then(|sr| b.sprite(sr.get("m_Sprite")));
-        let glows: Vec<&Value> = body["children"]
+        let z = heaven_z + vec3(&body["pos"])[2];
+        // Every SpriteRenderer child is a glow halo, each with its own
+        // sprite, scale, depth and tinting colour.
+        let glows: Vec<game::data::CelestialGlow> = body["children"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|g| comp(g, "SpriteRenderer").is_some())
+            .filter_map(|g| {
+                let sr = comp(g, "SpriteRenderer")?;
+                let sprite = b.sprite(sr.get("m_Sprite"))?;
+                let scale = vec3(&g["scale"])[0];
+                let col = &sr["m_Color"];
+                Some(game::data::CelestialGlow {
+                    sprite,
+                    z: z + vec3(&g["pos"])[2],
+                    scale: if scale > 0.0 { scale } else { 1.0 },
+                    color: ["r", "g", "b", "a"].map(|k| col[k].as_f64().unwrap_or(1.0) as f32),
+                })
+            })
             .collect();
-        let glow = glows
-            .first()
-            .and_then(|g| comp(g, "SpriteRenderer"))
-            .and_then(|sr| b.sprite(sr.get("m_Sprite")));
         let pair = |k: &str| {
             (
                 cb[k]["x"].as_f64().unwrap_or(0.0) as f32,
                 cb[k]["y"].as_f64().unwrap_or(0.0) as f32,
             )
         };
-        let z = heaven_z + vec3(&body["pos"])[2];
         b.world.celestials.push(game::data::CelestialDef {
             sprite,
-            glow,
+            glows,
             is_sun: body["name"] == "Sun",
             orbit_scale: pair("orbitScale"),
             orbit_center: pair("orbitCenter"),
             rises_at: num(cb, "risesAt"),
             sets_at: num(cb, "setsAt"),
             z,
-            glow_z: glows.iter().map(|g| z + vec3(&g["pos"])[2]).collect(),
-            glow_scale: glows.first().map_or(1.0, |g| vec3(&g["scale"])[0]),
         });
     }
 

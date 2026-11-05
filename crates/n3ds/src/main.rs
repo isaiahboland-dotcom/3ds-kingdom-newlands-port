@@ -205,6 +205,9 @@ fn main() {
         last = now;
         let ticks = if acc >= 2.0 { (acc as u32).min(4) } else { 1 };
         acc = (acc - ticks as f32).clamp(-1.0, 4.0);
+        // The tick profiler reads the clock at every mark: only while the
+        // overlay that shows it is up.
+        game::prof::set_enabled(s.debug);
         let t0 = std::time::Instant::now();
         s.step_ticks(raw, ticks);
         ticks_since += ticks;

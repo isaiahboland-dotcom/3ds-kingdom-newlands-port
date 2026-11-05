@@ -13,6 +13,7 @@
 //! `--greed-at N` spawns 3 greed at frame N; `--build` finishes construction every second;
 //! `--prefer Castle,Farmhouse` steers the autopilot's purchases; `--goto X@F` sends it to x = X from frame F;
 //! `--new` ignores the saved game, `--load` loads it even for a screenshot, `--no-save` turns saving off (screenshot runs never save);
+//! `--weather "Clear Summer"` holds the lighting to that weather's presets; `--hour H` starts the clock at hour H;
 //! `--boat-at N` does what H does at frame N; `--unlocked` starts with every unlock and island (otherwise a first playthrough); `--mute` turns sound off; `--paused` opens the pause menu, `--banner` the banner editor; `--tap X,Y` (repeatable) taps the touch screen at the start.
 
 mod assets;
@@ -126,6 +127,9 @@ async fn main() {
         .unwrap_or(0)
         .min(world.levels.len().saturating_sub(1));
     let boat_at: Option<u32> = arg("--boat-at");
+    let weather: Option<String> = arg("--weather");
+    // Dev: start the clock at this hour (`--hour 23`).
+    let start_hour: Option<f32> = arg("--hour");
     // Saves: off for screenshot runs and with --no-save. A saved run resumes
     // unless --new or --island is given.
     let storage = (screenshot.is_none() && !std::env::args().any(|a| a == "--no-save"))
@@ -164,6 +168,9 @@ async fn main() {
         });
     let mut app = Session::new(world, island, seed, progress);
     app.debug = std::env::args().any(|a| a == "--debug");
+    if let Some(h) = start_hour {
+        app.game.clock.time = h;
+    }
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
     app.slot = slot;
@@ -247,6 +254,20 @@ async fn main() {
         }
         if is_key_pressed(KeyCode::N) {
             app.game.clock.time += 1.0;
+        }
+        // Dev: hold the lighting to one weather (`--weather "Clear Summer"`),
+        // picking that weather's preset for the current part of the day.
+        if let Some(w) = &weather {
+            let part = match game::time::part_of_day(app.game.clock.time).0 {
+                game::time::PartOfDay::Dawn => "Dawn",
+                game::time::PartOfDay::Day => "Day",
+                game::time::PartOfDay::Evening => "Evening",
+                game::time::PartOfDay::Night => "Night",
+            };
+            let name = format!("{w} {part}");
+            if let Some(p) = app.world.lights.iter().position(|l| l.name == name) {
+                app.game.blender.add(&app.world, p as u16, 0.0);
+            }
         }
         // The touch screen: the map after a run, otherwise the bag and pause.
         let mut bag_tap = false;
@@ -409,6 +430,11 @@ async fn main() {
             }
             if frame == shot_frame {
                 get_screen_data().export_png(path);
+                if std::env::var_os("KINGDOM_LIGHTS").is_some() {
+                    for (p, w) in app.game.blender.presets() {
+                        eprintln!("light {:<40} {w:.2}", app.world.lights[p as usize].name);
+                    }
+                }
                 break;
             }
         }

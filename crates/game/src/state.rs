@@ -1220,6 +1220,7 @@ impl GameState {
         if self.payables_dirty {
             self.refresh_payables(world);
         }
+        crate::prof::mark("payables");
         let ground = self.ground();
 
         let mut steed_events = Vec::new();
@@ -1547,13 +1548,16 @@ impl GameState {
             match e {
                 UnitEvent::TreeChopped(_) => self.forest_changed(world),
                 UnitEvent::BuildPoint(id) => {
-                    self.payables_dirty = true;
-                    // A builder's last stroke finishes it. orig: WorkableBuilding.CompleteConstruction.
+                    // A stroke changes nothing a payable shows (price, can-pay);
+                    // refreshing on every stroke rebuilt the whole list at up to
+                    // 60 Hz while builders hammer. The refresh those need happens
+                    // when the site finishes or is paid for.
                     let done = self
                         .level
                         .index_of(id)
                         .is_some_and(|i| !build::under_construction(world, &self.level.objects[i]));
                     if done {
+                        self.payables_dirty = true;
                         self.started(world, id);
                         events.push(GameEvent::Built(id));
                     }

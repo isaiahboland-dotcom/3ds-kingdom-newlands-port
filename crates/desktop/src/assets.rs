@@ -24,6 +24,8 @@ pub struct Assets {
     recolor: Material,
     /// Additive blending (glows, PostFX add color).
     additive: Material,
+    /// Water reflections (see `REFLECT_FS`).
+    reflect: Material,
     /// The previous frame's top screen, for `reflect`.
     pub previous: Option<Texture2D>,
 }
@@ -58,6 +60,18 @@ varying vec4 color;
 uniform sampler2D Texture;
 void main() {
     gl_FragColor = texture2D(Texture, uv) * color;
+}
+"#;
+
+/// The water's reflection: the texture's colour only (the previous frame's
+/// alpha is whatever its blending left), added over the water.
+const REFLECT_FS: &str = r#"#version 100
+precision lowp float;
+varying vec2 uv;
+varying vec4 color;
+uniform sampler2D Texture;
+void main() {
+    gl_FragColor = vec4(texture2D(Texture, uv).rgb * color.rgb, color.a);
 }
 "#;
 
@@ -136,8 +150,20 @@ impl Assets {
             },
         )
         .map_err(|e| e.to_string())?;
+        let reflect = load_material(
+            ShaderSource::Glsl {
+                vertex: RECOLOR_VS,
+                fragment: REFLECT_FS,
+            },
+            MaterialParams {
+                pipeline_params: blend(BlendFactor::One),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Assets {
             pages,
+            reflect,
             smooth,
             sheet: Rc::new(sheet),
             recolor,
@@ -145,6 +171,21 @@ impl Assets {
             previous: None,
         })
     }
+}
+
+/// A rectangle shaded from `top` to `bottom`.
+fn gradient_mesh(r: Rect, top: Color, bottom: Color) {
+    let v = |x: f32, y: f32, c: Color| Vertex::new(x, y, 0.0, 0.0, 0.0, mc(c));
+    draw_mesh(&Mesh {
+        vertices: vec![
+            v(r.x, r.y, top),
+            v(r.x + r.w, r.y, top),
+            v(r.x + r.w, r.y + r.h, bottom),
+            v(r.x, r.y + r.h, bottom),
+        ],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        texture: None,
+    });
 }
 
 impl Renderer for Assets {
@@ -232,22 +273,18 @@ impl Renderer for Assets {
     }
 
     fn gradient(&mut self, r: Rect, top: Color, bottom: Color) {
-        let v = |x: f32, y: f32, c: Color| Vertex::new(x, y, 0.0, 0.0, 0.0, mc(c));
-        draw_mesh(&Mesh {
-            vertices: vec![
-                v(r.x, r.y, top),
-                v(r.x + r.w, r.y, top),
-                v(r.x + r.w, r.y + r.h, bottom),
-                v(r.x, r.y + r.h, bottom),
-            ],
-            indices: vec![0, 1, 2, 0, 2, 3],
-            texture: None,
-        });
+        gradient_mesh(r, top, bottom);
     }
 
     fn add(&mut self, r: Rect, c: Color) {
         gl_use_material(&self.additive);
         draw_rectangle(r.x, r.y, r.w, r.h, mc(c));
+        gl_use_default_material();
+    }
+
+    fn add_gradient(&mut self, r: Rect, top: Color, bottom: Color) {
+        gl_use_material(&self.additive);
+        gradient_mesh(r, top, bottom);
         gl_use_default_material();
     }
 
@@ -261,6 +298,7 @@ impl Renderer for Assets {
 
     fn reflect(&mut self, dest: Rect, src: Rect, tint: Color) {
         let Some(t) = &self.previous else { return };
+        gl_use_material(&self.reflect);
         draw_texture_ex(
             t,
             dest.x,
@@ -278,5 +316,6 @@ impl Renderer for Assets {
                 ..Default::default()
             },
         );
+        gl_use_default_material();
     }
 }

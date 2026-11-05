@@ -126,10 +126,20 @@ pub trait Renderer {
     fn gradient(&mut self, r: Rect, top: Color, bottom: Color);
     /// Adds `c` over `r`. orig: `PostFX` additive colour.
     fn add(&mut self, r: Rect, c: Color);
+    /// `add` with a vertical gradient from `top` to `bottom`. Backends
+    /// without one add the average colour.
+    fn add_gradient(&mut self, r: Rect, top: Color, bottom: Color) {
+        let mid = |a: f32, b: f32| (a + b) / 2.0;
+        self.add(
+            r,
+            Color::new(mid(top.r, bottom.r), mid(top.g, bottom.g), mid(top.b, bottom.b), mid(top.a, bottom.a)),
+        );
+    }
     fn circle(&mut self, x: f32, y: f32, radius: f32, c: Color);
     fn circle_lines(&mut self, x: f32, y: f32, radius: f32, thickness: f32, c: Color);
     /// Pixels `src` of the previous frame's top screen (a negative `h` flips
-    /// them) stretched into `dest` and multiplied by `tint`. orig: the
+    /// them) stretched into `dest`, multiplied by `tint` and *added* over
+    /// what's there (the source's own alpha is ignored). orig: the
     /// `MainCamera` reflection buffer the `Water` samples. Backends without
     /// one draw nothing.
     fn reflect(&mut self, _dest: Rect, _src: Rect, _tint: Color) {}

@@ -7,11 +7,13 @@
 
 # Local files from older mod experiments
 /mods/
-
+/screenshots/
 # Packed 3DS assets and builds
 /crates/n3ds/romfs/
 /crates/n3ds/sdcard/
 /crates/n3ds/target/
+# SD card layout made by build.sh
+/dist/
 
 # Rust build output
 /target/
@@ -46,3 +48,9 @@ Thumbs.db
 /.codex/
 /.agents/
 __pycache__/
+
+# screenshots
+/screenshots/
+
+# Local notes
+todo.md

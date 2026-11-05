@@ -106,10 +106,13 @@ pub struct Gpu {
     indices: *mut u16,
     /// Quads written to `verts` this frame.
     quads: usize,
-    /// This screen's items: opaque by page, opaque fills, the rest in order.
+    /// This screen's opaque items, by page and as fills, copied into
+    /// `verts` when the screen is flushed.
     opaque: Vec<Vec<Quad>>,
     solid: Vec<Quad>,
-    ordered: Vec<(State, Quad)>,
+    /// The rest, already written into `verts` in painter's order: runs of
+    /// (state, first quad, quads) drawn after the opaque pass.
+    runs: Vec<(State, usize, usize)>,
     /// Items so far on this screen (their depth).
     order: u32,
     /// Plain painter's order, no depth (X).
@@ -295,7 +298,7 @@ impl Gpu {
                 quads: 0,
                 opaque: vec![Vec::new(); n],
                 solid: Vec::new(),
-                ordered: Vec::new(),
+                runs: Vec::new(),
                 order: 0,
                 painter: false,
                 bound_page: None,
@@ -555,6 +558,14 @@ impl Gpu {
                 self.verts.add(first * 4),
                 n * 4,
             );
+        }
+        self.quads += n;
+        self.draw_range(state, first, n);
+    }
+
+    /// Draws quads `first..first + n` of the vertex buffer with `state`.
+    fn draw_range(&mut self, state: State, first: usize, n: usize) {
+        unsafe {
             self.bind(state);
             c3d::C3D_DrawElements(
                 ctru::GPU_TRIANGLES,
@@ -563,7 +574,6 @@ impl Gpu {
                 self.indices.add(first * 6) as *const _,
             );
         }
-        self.quads += n;
         self.draws += 1;
         self.calls.push(Call::Draw(state, first, n));
     }
@@ -600,24 +610,12 @@ impl Gpu {
         // The translucent rest: tested against the opaque pass, not written.
         self.depth_test(false);
         self.calls.push(Call::Pass(false));
-        let ordered = std::mem::take(&mut self.ordered);
-        let mut run: Vec<Quad> = Vec::new();
-        let mut run_state = None;
-        for (state, q) in &ordered {
-            if run_state != Some(*state) {
-                if let Some(s) = run_state {
-                    self.draw(s, &run);
-                }
-                run.clear();
-                run_state = Some(*state);
-            }
-            run.push(*q);
+        let runs = std::mem::take(&mut self.runs);
+        for &(state, first, n) in &runs {
+            self.draw_range(state, first, n);
         }
-        if let Some(s) = run_state {
-            self.draw(s, &run);
-        }
-        self.ordered = ordered;
-        self.ordered.clear();
+        self.runs = runs;
+        self.runs.clear();
         self.order = 0;
         if self.on_top && self.stereo > 0.0 {
             self.draw_right_eye();
@@ -648,8 +646,19 @@ impl Gpu {
                 Some(p) => self.opaque[p as usize].push(q),
                 None => self.solid.push(q),
             }
-        } else {
-            self.ordered.push((state, q));
+            return;
+        }
+        // In painter's order, so straight into the vertex buffer; a quad
+        // with the same state as the one before extends its run.
+        if self.quads >= MAX_QUADS {
+            return;
+        }
+        let i = self.quads;
+        unsafe { (self.verts.add(i * 4) as *mut Quad).write(q) };
+        self.quads += 1;
+        match self.runs.last_mut() {
+            Some((s, first, n)) if *s == state && *first + *n == i => *n += 1,
+            _ => self.runs.push((state, i, 1)),
         }
     }
 
@@ -784,6 +793,10 @@ impl Renderer for Gpu {
         self.solid_rect(r, c, c, true);
     }
 
+    fn add_gradient(&mut self, r: Rect, top: Color, bottom: Color) {
+        self.solid_rect(r, top, bottom, true);
+    }
+
     fn circle(&mut self, x: f32, y: f32, radius: f32, c: Color) {
         const N: usize = 16;
         let state = State {
@@ -850,7 +863,7 @@ impl Renderer for Gpu {
         ];
         let state = State {
             page: Some(page),
-            additive: false,
+            additive: true,
             smooth: false,
         };
         self.quad(

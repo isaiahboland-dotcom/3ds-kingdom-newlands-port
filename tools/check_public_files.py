@@ -13,7 +13,7 @@ PRIVATE = (
     'assets/', 'reference/', 'gamefiles/', 'mods/', 'modkit/',
     'target/', 'crates/n3ds/romfs/', 'crates/n3ds/sdcard/',
     'crates/n3ds/target/', 'tools/assetripper/', 'tools/cia/bin/',
-    'tools/cia/src/',
+    'tools/cia/src/', 'dist/',
 )
 GAME_EXTENSIONS = {
     '.asset', '.anim', '.mat', '.meta', '.json', '.cs', '.dll', '.exe', '.assets', '.ress', '.resource', '.unity',

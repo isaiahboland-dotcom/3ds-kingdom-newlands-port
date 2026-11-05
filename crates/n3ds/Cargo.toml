@@ -1,6 +1,6 @@
 [package]
 name = "n3ds"
-version = "1.0.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -27,6 +27,9 @@ romfs_dir = "romfs"
 [profile.release]
 opt-level = 3
 lto = true
+# One unit lets LLVM inline across the whole crate graph (slower builds,
+# faster ARM11 code).
+codegen-units = 1
 debug = false
 panic = "abort"
 

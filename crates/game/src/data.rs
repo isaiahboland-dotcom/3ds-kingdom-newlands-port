@@ -1345,22 +1345,34 @@ pub struct DirectorDef {
     pub initial_lights: Vec<u16>,
 }
 
+/// One glow child of a celestial body: a wide additive halo drawn over it.
+/// orig: a `SpriteRenderer` child of a `CelestialBody`.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CelestialGlow {
+    pub sprite: SpriteId,
+    /// Depth of the halo, next to the body's [`CelestialDef::z`].
+    pub z: f32,
+    /// orig: the child transform's scale (a wide halo, 8×).
+    pub scale: f32,
+    /// orig: the child's `SpriteRenderer.color`, tinting and fading the halo.
+    pub color: [f32; 4],
+}
+
 /// orig: `CelestialBody` (sun and moon in the main scene's Heaven layer).
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CelestialDef {
     pub sprite: Option<SpriteId>,
-    pub glow: Option<SpriteId>,
+    /// The body's glow children, farthest first as in the scene.
+    pub glows: Vec<CelestialGlow>,
     pub is_sun: bool,
     pub orbit_scale: (f32, f32),
     pub orbit_center: (f32, f32),
     pub rises_at: f32,
     pub sets_at: f32,
-    /// Depth of the body (Heaven layer) and of each glow child.
+    /// Depth of the body (Heaven layer).
     pub z: f32,
-    pub glow_z: Vec<f32>,
-    /// The glow children's scale (a wide halo). orig: their transforms (8×).
-    pub glow_scale: f32,
 }
 
 /// orig: `UnityEngine.AnimationCurve` (Hermite keys; clamped outside the keys).

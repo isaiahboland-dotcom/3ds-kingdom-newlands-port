@@ -5,7 +5,7 @@ use game::build::{scaffold_filled, under_construction};
 use game::coins::Motion;
 use game::data::{sample_keys, FireDef, Layer, Role};
 use game::greed::{TrollState, TROLL_Z};
-use game::lighting::{celestial_position, color, Light};
+use game::lighting::{celestial_position, celestial_up, color, float, Light};
 use game::monarch::Action;
 use game::units::{Anim, ShieldStatus};
 
@@ -48,6 +48,20 @@ struct Ctx<'a, R: Renderer> {
     s: &'a Session,
     sheet: &'a Sheet,
     r: &'a mut R,
+    /// This frame's fire lights (see `PointLight`).
+    lights: Vec<PointLight>,
+}
+
+/// A fire's point light on the screen. orig: the `Light` a `Fire` with
+/// `useRealLight` drives (`rangeCurve`, `intensityCurve`), which lights the
+/// lit sprites around it and nothing else: not the sky, haze or water.
+#[derive(Clone, Copy)]
+struct PointLight {
+    at: (f32, f32),
+    /// Range in pixels.
+    range: f32,
+    /// Light colour × intensity, faded in with the dark.
+    color: [f32; 3],
 }
 
 impl<R: Renderer> Ctx<'_, R> {
@@ -61,6 +75,56 @@ impl<R: Renderer> Ctx<'_, R> {
         if let Some(i) = self.sheet.world(id) {
             self.r.sprite(i, at, d);
         }
+    }
+
+    /// `sprite`, adding the fires' light to its (already ambient-lit) tint.
+    fn sprite_lit(&mut self, id: u32, at: (f32, f32), mut d: Draw) {
+        d.tint = self.point_lit(d.tint, at, id);
+        self.r.sprite(id, at, d);
+    }
+
+    /// `world`, adding the fires' light.
+    fn world_lit(&mut self, id: u16, at: (f32, f32), d: Draw) {
+        if let Some(i) = self.sheet.world(id) {
+            self.sprite_lit(i, at, d);
+        }
+    }
+
+    /// An ambient-lit tint with the fires' light added, as a lit material
+    /// does: albedo × (ambient + Σ light × falloff), measured at the
+    /// sprite's centre. Wide sprites (ground tiles, big buildings) are left
+    /// alone, since one tint across them would light them in blocks; the
+    /// ground gets `draw_ground_light` instead.
+    fn point_lit(&self, tint: Color, at: (f32, f32), id: u32) -> Color {
+        if self.lights.is_empty() {
+            return tint;
+        }
+        let g = self.sheet.get(id);
+        if g.w as f32 > POINT_LIT_MAX_W {
+            return tint;
+        }
+        let centre = (at.0 - g.px + g.w as f32 / 2.0, at.1 - g.py + g.h as f32 / 2.0);
+        let mut add = [0.0f32; 3];
+        for l in &self.lights {
+            let f = ((centre.0 - l.at.0).powi(2) + (centre.1 - l.at.1).powi(2)).sqrt() / l.range;
+            if f < 1.0 {
+                let att = (1.0 - f) * (1.0 - f);
+                for (a, c) in add.iter_mut().zip(l.color) {
+                    *a += c * att;
+                }
+            }
+        }
+        if add.iter().all(|&a| a < 0.004) {
+            return tint;
+        }
+        let amb = lifted_ambient(self.light());
+        let gain = |i: usize| ((amb[i] + add[i]).min(1.0) / amb[i].max(0.05)).max(1.0);
+        Color::new(
+            (tint.r * gain(0)).min(1.0),
+            (tint.g * gain(1)).min(1.0),
+            (tint.b * gain(2)).min(1.0),
+            tint.a,
+        )
     }
 
     fn clip(&self, name: &str) -> Option<&Clip> {
@@ -106,15 +170,29 @@ pub(crate) fn steed_colors(s: &Session, steed: u16, ridden: bool) -> (Color, Col
     (mane, Color::rgb(d.coat))
 }
 
-/// Multiplies a sprite tint by the ambient light. orig: lit `Pow-*` materials.
-/// Night is lifted a little (`NIGHT_LIFT` of the way to full light), since
-/// handheld screens show the original's darkest nights as near black.
+/// Multiplies a tint by the ambient light. orig: lit `Pow-*` materials (the
+/// sprites, and the fill and haze quads' `Haze Material`). Night is lifted a little (`NIGHT_LIFT` of
+/// the way to full light), since handheld screens show the original's
+/// darkest nights as near black.
 fn lit(tint: Color, light: &Light) -> Color {
-    let a = light.colors[color::AMBIENT].map(|v| v + (1.0 - v) * NIGHT_LIFT);
+    let a = lifted_ambient(light);
     Color::new(tint.r * a[0], tint.g * a[1], tint.b * a[2], tint.a)
 }
 
 const NIGHT_LIFT: f32 = 0.07;
+
+/// The ambient light lit sprites see (see `lit`).
+fn lifted_ambient(light: &Light) -> [f32; 4] {
+    light.colors[color::AMBIENT].map(|v| v + (1.0 - v) * NIGHT_LIFT)
+}
+
+/// Sprites wider than this (in pixels) don't take point light as a whole.
+const POINT_LIT_MAX_W: f32 = 72.0;
+/// Light added at the flame per unit of the fire's intensity.
+const POINT_LIGHT_K: f32 = 0.6;
+/// The ground's rough colour, for the light it throws back.
+const GROUND_ALBEDO: [f32; 3] = [0.22, 0.14, 0.09];
+
 
 /// Screen pixel of a world point in a layer with parallax `ratio`.
 pub fn layer_to_screen(s: &Session, x: f32, y: f32, ratio: f32) -> (f32, f32) {
@@ -153,6 +231,7 @@ fn gradient(r: &mut impl Renderer, bottom_y: f32, top_y: f32, bottom: Color, top
     r.gradient(Rect::new(0.0, yt, W, yb - yt), top, bottom);
 }
 
+#[derive(Clone, Copy)]
 pub enum DrawItem {
     Part(usize, usize),
     /// Part `p` of scenery object `o` (`Level::scenery`).
@@ -173,7 +252,10 @@ pub enum DrawItem {
     HazeNear,
     Water,
     Celestial(usize),
-    Glow(usize),
+    /// Glow child `j` of celestial `i`.
+    Glow(usize, usize),
+    /// The night star field (Heaven layer, behind the sun and moon).
+    Stars,
     /// A grass patch.
     Grass(usize),
     FreeSteed(usize),
@@ -205,7 +287,7 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
     let world = &s.world;
     let g = &s.game;
     let level = &g.level;
-    let mut items = Vec::new();
+    let mut items = Vec::with_capacity(256);
     let view = W / PPU / 2.0 + 12.0;
     let cam = s.camera_x;
     for (oi, o) in level.objects.iter().enumerate() {
@@ -383,19 +465,41 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
     items.push(((0, 0, -HAZE_FAR.0), DrawItem::HazeFar));
     items.push(((0, 0, -HAZE_NEAR.0), DrawItem::HazeNear));
     items.push(((0, 0, -world.water.z), DrawItem::Water));
+    // The stars sit just behind the backmost celestial and its glows.
+    let stars_z = world
+        .celestials
+        .iter()
+        .map(|c| c.glows.iter().fold(c.z, |z, g| z.max(g.z)))
+        .fold(SKY.0, f32::max)
+        + 1.0;
+    items.push(((0, 0, -stars_z), DrawItem::Stars));
     for (i, c) in world.celestials.iter().enumerate() {
         items.push(((0, 0, -c.z), DrawItem::Celestial(i)));
-        for z in &c.glow_z {
-            items.push(((0, 0, -z), DrawItem::Glow(i)));
+        for (j, g) in c.glows.iter().enumerate() {
+            items.push(((0, 0, -g.z), DrawItem::Glow(i, j)));
         }
     }
-    items.sort_by(|a, b| {
-        a.0 .0
-            .cmp(&b.0 .0)
-            .then(a.0 .1.cmp(&b.0 .1))
-            .then(a.0 .2.total_cmp(&b.0 .2))
-    });
-    items
+    // A stable sort on the tuple keys was over half of building the list.
+    // Each key packs into one integer instead, with the push order as the
+    // tie-break (so equal keys keep their order, as a stable sort would), and
+    // plain integers sort several times faster.
+    let mut order: Vec<u128> = items
+        .iter()
+        .enumerate()
+        .map(|(i, &(k, _))| (u128::from(sort_key(k)) << 32) | i as u128)
+        .collect();
+    order.sort_unstable();
+    order.into_iter().map(|o| items[o as u32 as usize]).collect()
+}
+
+/// `(sort layer, order, z)` as one integer in the same order: the sort
+/// layer, then the order, then `f32::total_cmp` of z.
+fn sort_key((layer, order, z): (i16, i16, f32)) -> u64 {
+    let flip = |v: i16| u64::from(v as u16 ^ 0x8000);
+    // total_cmp's order: negative floats reversed, below the positives.
+    let b = z.to_bits();
+    let z = if b >> 31 == 1 { !b } else { b | 0x8000_0000 };
+    (flip(layer) << 48) | (flip(order) << 32) | u64::from(z)
 }
 
 /// Whether fire `f` burns now. orig: `Fire.Start` / `HandleOnDayEnd`:
@@ -427,11 +531,10 @@ fn push_fires(items: &mut Vec<((i16, i16, f32), DrawItem)>, s: &Session, o: &gam
     }
 }
 
-/// A fire: its flame, and its glow (a wide warm pool for the real lights:
-/// the castle's campfire and the monarch's torch). orig: `Fire.SlowUpdate`
-/// (intensity from strength, flickering by up to ±0.3 in the dark).
-fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: u32) {
-    let s = c.s;
+/// A fire's strength, current intensity (flickering) and how far its light
+/// shows (1 in the dark, 0 by day). orig: `Fire.SlowUpdate`: intensity from
+/// strength, flickering by up to ±0.3 in the dark.
+fn fire_intensity(s: &Session, fire: &FireDef, seed: u32) -> (f32, f32, f32) {
     let st = &s.world.fire;
     let size = (fire.size.0 * fire.size.0 + fire.size.1 * fire.size.1).sqrt();
     let strength = sample_keys(&st.strength, size);
@@ -443,8 +546,54 @@ fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: 
         h as f32 / (1u32 << 23) as f32 * 2.0 - 1.0
     };
     let flicker = noise(k.floor()) + (noise(k.floor() + 1.0) - noise(k.floor())) * k.fract();
-    let intensity = sample_keys(&st.intensity, strength) + flicker * 0.3 * dark;
+    (strength, sample_keys(&st.intensity, strength) + flicker * 0.3 * dark, dark)
+}
 
+/// A fire's point light. Every fire gets one, as on the PC's high quality
+/// (`FirePlaceholder`: `useRealLight = forceRealLight || highQuality`); the
+/// low-quality glow sprite washed the night sky and water warm grey.
+fn fire_light(s: &Session, at: (f32, f32), fire: &FireDef, seed: u32) -> Option<PointLight> {
+    let st = &s.world.fire;
+    let (strength, intensity, dark) = fire_intensity(s, fire, seed);
+    let k = intensity * POINT_LIGHT_K * dark;
+    if k <= 0.01 {
+        return None;
+    }
+    let [r, g, b] = st.light_color;
+    Some(PointLight {
+        at,
+        range: sample_keys(&st.range, strength) * PPU,
+        color: [r * k, g * k, b * k],
+    })
+}
+
+/// Where fire item `item` burns on screen, its definition and flicker seed.
+fn fire_item(s: &Session, item: &DrawItem) -> Option<((f32, f32), FireDef, u32)> {
+    match *item {
+        DrawItem::Fire { o, f, scenery } => {
+            let objs = if scenery { &s.game.level.scenery } else { &s.game.level.objects };
+            let o = &objs[o];
+            let fire = s.world.protos[o.proto as usize].fires[f];
+            let dir = if o.flip { -1.0 } else { 1.0 };
+            let at = layer_to_screen(s, o.x + dir * fire.at.0, o.y + fire.at.1, s.world.layer(o.layer).ratio);
+            Some((at, fire, o.id.wrapping_mul(7) + f as u32))
+        }
+        DrawItem::Torch => {
+            let m = &s.game.monarch;
+            let mut fire = s.world.steeds[s.game.steed as usize].torch?;
+            fire.real_light = true;
+            let at = world_to_screen(s, m.x + fire.at.0 * m.facing as f32, fire.at.1);
+            Some((at, fire, 1))
+        }
+        _ => None,
+    }
+}
+
+/// A fire: its flame and its glint on the water. Its light is gathered up
+/// front (`fire_light`) and falls on the sprites around it.
+fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: u32) {
+    let s = c.s;
+    let st = &s.world.fire;
     // The flame: the prefab nearest in size that has a sprite animation.
     let flame = st
         .flames
@@ -459,29 +608,88 @@ fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: 
             c.r.sprite(sp, at, Draw::tint(WHITE).additive());
         }
     }
-    let Some(glow) = st.glow.and_then(|g| c.sheet.world(g)) else {
+    draw_fire_reflection(c, at, fire);
+}
+
+/// The fires' light on the ground: the ground is drawn in wide tiles, so
+/// instead of tinting them it gets thin additive columns, only over the
+/// strip between the grass and the water, never the sky. Every light is
+/// summed into one row of columns first, so the cost stays at one quad per
+/// lit column however many fires overlap.
+const GROUND_COL: f32 = 3.0;
+const GROUND_COLS: usize = (W / GROUND_COL) as usize + 1;
+/// Fraction of the light left at the water's edge (1 at the grass). Matches
+/// the earlier three stepped bands (1, 2/3, 1/3) at their middles.
+const GROUND_FADE: f32 = 1.0 / 6.0;
+
+fn draw_ground_light<R: Renderer>(c: &mut Ctx<R>) {
+    let s = c.s;
+    let top = (world_to_screen(s, 0.0, 0.0).1 - 2.0).round();
+    let bottom = screen_y(s.world.water.top).round();
+    if bottom <= top || c.lights.is_empty() {
         return;
-    };
-    if fire.real_light {
-        // orig: a point light of `rangeCurve` units; here a soft pool that
-        // brightens what it covers, strongest in the dark.
-        let range = sample_keys(&st.range, strength);
-        let w = c.sheet.get(glow).w.max(1) as f32;
-        let scale = range * 1.6 * PPU / w;
-        let [r, g, b] = st.light_color;
-        let a = (intensity / 4.0).clamp(0.0, 1.0) * 0.22 * dark;
-        if a > 0.01 {
-            c.r.sprite(glow, at, Draw::tint(Color::new(r * a, g * a, b * a, 1.0)).scale(scale).additive().smooth());
+    }
+    let mut cols = [[0.0f32; 3]; GROUND_COLS];
+    for l in &c.lights {
+        let dy = top - l.at.1;
+        let first = ((l.at.0 - l.range) / GROUND_COL).floor().max(0.0) as usize;
+        let last = (((l.at.0 + l.range) / GROUND_COL).ceil() as usize).min(GROUND_COLS);
+        for (i, col) in cols.iter_mut().enumerate().take(last).skip(first) {
+            let dx = i as f32 * GROUND_COL + GROUND_COL / 2.0 - l.at.0;
+            let f = (dx * dx + dy * dy).sqrt() / l.range;
+            if f < 1.0 {
+                let att = (1.0 - f) * (1.0 - f);
+                for j in 0..3 {
+                    col[j] += l.color[j] * att * GROUND_ALBEDO[j];
+                }
+            }
         }
     }
-    // orig: without a real light, the glow sprite: alpha 0.4 × intensity,
-    // scale 3 × intensity (on the child's own scale).
-    let cur = intensity * 0.5 + 0.5;
-    let [r, g, b, a] = st.glow_color;
-    let alpha = (cur * 0.4 * a).clamp(0.0, 1.0);
-    let tint = Color::new(r * alpha, g * alpha, b * alpha, 1.0);
-    c.r.sprite(glow, at, Draw::tint(tint).scale(cur * 3.0 * st.glow_scale).additive().smooth());
+    for (i, &[r, g, b]) in cols.iter().enumerate() {
+        if r + g + b <= 0.004 {
+            continue;
+        }
+        let x = i as f32 * GROUND_COL;
+        let k = GROUND_FADE;
+        // Strongest at the grass, fading toward the water.
+        c.r.add_gradient(
+            Rect::new(x, top, GROUND_COL.min(W - x), bottom - top),
+            Color::new(r, g, b, 1.0),
+            Color::new(r * k, g * k, b * k, 1.0),
+        );
+    }
 }
+
+/// A fire's glint on the water: a broken streak hanging below the bank,
+/// showing as the light fades. orig: `Fire`'s `Reflected Light Small`
+/// (`ReflectedLight`): `light_reflect_small` at the water's top edge, its
+/// width 0.75 + the fire's width, alpha × clamp(2.5 − 5 × ambient grey).
+fn draw_fire_reflection<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef) {
+    let s = c.s;
+    let fade = (2.5 - 5.0 * s.game.blender.state.ambient_grayscale()).clamp(0.0, 1.0);
+    if fade <= 0.01 {
+        return;
+    }
+    let Some(sp) = c.sheet.id("light_reflect_small") else {
+        return;
+    };
+    let w = &s.world.water;
+    // Scaled 0.75 + width across; the 8 px streak is repeated instead.
+    let copies = (0.75 + fire.size.0).round().max(1.0) as i32;
+    let [r, g, b] = REFLECTED_LIGHT;
+    let a = fade;
+    let tint = Color::new(r * a, g * a, b * a, 1.0);
+    // Mirrored from 0.25 units above the water's top, so it starts a few
+    // pixels into the water and hangs down.
+    let y = screen_y(w.top) + 0.25 * PPU * w.reflection_scale;
+    for i in 0..copies {
+        let x = (at.0 + (i as f32 - (copies - 1) as f32 / 2.0) * 8.0).round();
+        c.r.sprite(sp, (x, y), Draw::tint(tint).angle(core::f32::consts::PI).flip(i % 2 == 1).additive());
+    }
+}
+
+/// orig: `Reflected Light Small`'s `SpriteRenderer` colour.
+const REFLECTED_LIGHT: [f32; 3] = [0.797, 0.597, 0.24];
 
 /// The animation for flame sprite `name` (`fire_small_burn_4` →
 /// `fire_small_burn`, `fire_mid_burn_7` → `fire_mid`).
@@ -537,7 +745,7 @@ fn draw_hermit<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     let d = Draw::tint(c.lit(WHITE))
         .flip(flip)
         .recolor(Color::rgb(s.game.coat.primary), Color::rgb(h.skin));
-    c.r.sprite(sprite, at, d);
+    c.sprite_lit(sprite, at, d);
 }
 
 /// The merchant (recolorA left at SpriteFX's default yellow, skin random)
@@ -564,7 +772,7 @@ fn draw_merchant<R: Renderer>(c: &mut Ctx<R>, i: usize, mule: bool) {
         };
         if let Some(sp) = c.frame(clip, s.t) {
             let at = world_to_screen(s, m.mule_x, 0.0);
-            c.r.sprite(sp, at, Draw::tint(tint).flip(m.mule.facing < 0));
+            c.sprite_lit(sp, at, Draw::tint(tint).flip(m.mule.facing < 0));
         }
         return;
     }
@@ -600,7 +808,7 @@ fn draw_chest<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     };
     if let Some(sp) = c.frame(clip, ch.anim_t) {
         let at = layer_to_screen(s, o.x, o.y, s.world.layer(o.layer).ratio);
-        c.r.sprite(sp, at, Draw::tint(c.lit(WHITE)).flip(o.flip));
+        c.sprite_lit(sp, at, Draw::tint(c.lit(WHITE)).flip(o.flip));
     }
 }
 
@@ -622,7 +830,7 @@ fn draw_banker<R: Renderer>(c: &mut Ctx<R>) {
         let d = Draw::tint(c.lit(WHITE))
             .flip(b.mover.facing < 0)
             .recolor(Color::rgb(s.game.coat.primary), Color::rgb(b.skin));
-        c.r.sprite(sp, world_to_screen(s, b.x, 0.0), d);
+        c.sprite_lit(sp, world_to_screen(s, b.x, 0.0), d);
     }
 }
 
@@ -635,7 +843,7 @@ fn draw_bolt<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     // orig: Bolt.LateUpdate points it along its velocity.
     let angle = (-b.vy).atan2(b.vx);
     let tint = c.lit(WHITE);
-    c.world(
+    c.world_lit(
         sprite,
         world_to_screen(s, b.x, b.y),
         Draw::tint(tint).angle(angle),
@@ -665,7 +873,7 @@ fn draw_free_steed<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     };
     let (mane, coat) = steed_colors(s, f.steed, false);
     let d = Draw::tint(c.lit(WHITE)).flip(o.flip).recolor(mane, coat);
-    c.r.sprite(sprite, world_to_screen(s, o.x, 0.0), d);
+    c.sprite_lit(sprite, world_to_screen(s, o.x, 0.0), d);
 }
 
 fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
@@ -785,7 +993,13 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
         // SpriteFX is recoloured whatever its material).
         d = d.recolor(colors.0, colors.1);
     }
-    c.r.sprite(sprite, at, d);
+    // The fires' light reaches the game layer; the far and near layers sit
+    // too far behind or in front of it.
+    if part.lit && o.layer == Layer::Game {
+        c.sprite_lit(sprite, at, d);
+    } else {
+        c.r.sprite(sprite, at, d);
+    }
 }
 
 fn draw_scaffold<R: Renderer>(c: &mut Ctx<R>, oi: usize, mi: usize) {
@@ -803,7 +1017,7 @@ fn draw_scaffold<R: Renderer>(c: &mut Ctx<R>, oi: usize, mi: usize) {
     let ratio = s.world.layer(o.layer).ratio;
     let at = layer_to_screen(s, o.x + dir * m.x, o.y + m.y, ratio);
     let tint = c.lit(WHITE);
-    c.world(sprite, at, Draw::tint(tint).flip(o.flip));
+    c.world_lit(sprite, at, Draw::tint(tint).flip(o.flip));
 }
 
 /// orig: `Payable.Select()` shows one `coinIndicator` per coin of the price.
@@ -899,7 +1113,7 @@ fn draw_loose_part<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     let (rx, ry) = (cx * a.cos() - cy * a.sin(), cx * a.sin() + cy * a.cos());
     let at = layer_to_screen(s, x - rx, y - ry, 1.0);
     let tint = c.lit(WHITE);
-    c.world(sprite, at, Draw::tint(tint).angle(-a));
+    c.world_lit(sprite, at, Draw::tint(tint).angle(-a));
 }
 
 fn draw_unit_at<R: Renderer>(c: &mut Ctx<R>, u: &game::units::Unit, x: f32, y: f32) {
@@ -927,7 +1141,7 @@ fn draw_unit_at<R: Renderer>(c: &mut Ctx<R>, u: &game::units::Unit, x: f32, y: f
     let d = Draw::tint(c.lit(WHITE))
         .flip(u.mover.facing < 0)
         .recolor(Color::rgb(u.outfit), Color::rgb(u.skin));
-    c.r.sprite(sprite, world_to_screen(c.s, x, y), d);
+    c.sprite_lit(sprite, world_to_screen(c.s, x, y), d);
 }
 
 fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
@@ -958,7 +1172,7 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     if let TrollState::Dead { t: dt } = t.state {
         tint.a = (1.0 - (dt - 0.5).max(0.0)).max(0.0);
     }
-    c.r.sprite(
+    c.sprite_lit(
         sprite,
         world_to_screen(s, t.x, t.y),
         Draw::tint(tint).flip(t.mover.facing < 0),
@@ -1012,7 +1226,7 @@ fn draw_grass<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     };
     let at = layer_to_screen(s, p.x, s.game.meadows.y, 1.0);
     let tint = c.lit(WHITE);
-    c.world(sprite, at, Draw::tint(tint));
+    c.world_lit(sprite, at, Draw::tint(tint));
 }
 
 fn draw_animal<R: Renderer>(c: &mut Ctx<R>, i: usize) {
@@ -1034,7 +1248,7 @@ fn draw_animal<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     };
     let at = world_to_screen(c.s, a.x, 0.0);
     let tint = c.lit(WHITE);
-    c.r.sprite(sprite, at, Draw::tint(tint).flip(a.mover.facing < 0));
+    c.sprite_lit(sprite, at, Draw::tint(tint).flip(a.mover.facing < 0));
 }
 
 fn draw_tool<R: Renderer>(c: &mut Ctx<R>, i: usize) {
@@ -1052,7 +1266,7 @@ fn draw_tool<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     if let Some(sh) = shop {
         d = d.recolor(Color::rgb(sh.colors.0), Color::rgb(sh.colors.1));
     }
-    c.world(*sprite, at, d);
+    c.world_lit(*sprite, at, d);
 }
 
 fn draw_coin<R: Renderer>(c: &mut Ctx<R>, i: usize) {
@@ -1067,7 +1281,7 @@ fn draw_coin<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     .or(c.sheet.id("coin_spin_0"));
     if let Some(id) = sprite {
         let tint = c.lit(Color::new(1.0, 1.0, 1.0, coin.alpha));
-        c.r.sprite(id, at, Draw::tint(tint));
+        c.sprite_lit(id, at, Draw::tint(tint));
     }
 }
 
@@ -1091,7 +1305,7 @@ fn draw_monarch<R: Renderer>(c: &mut Ctx<R>) {
     };
     if let Some(sp) = clip.sprite("", t) {
         let (mane, coat) = steed_colors(s, steed, true);
-        c.r.sprite(sp, root, Draw::tint(tint).flip(flip).recolor(mane, coat));
+        c.sprite_lit(sp, root, Draw::tint(tint).flip(flip).recolor(mane, coat));
     }
     // Clips that don't animate the rider (idle, eat) leave the prefab defaults.
     let who = heraldry::rider(s.game.look);
@@ -1101,7 +1315,7 @@ fn draw_monarch<R: Renderer>(c: &mut Ctx<R>) {
         let d = Draw::tint(tint)
             .flip(flip)
             .recolor(Color::rgb(s.game.coat.primary), SKIN);
-        c.r.sprite(rider, king, d);
+        c.sprite_lit(rider, king, d);
     }
     // Crown is a child of the rider, so its keys are relative to them.
     let (cx, cy) = if clip.has_offsets(who.crown_track) {
@@ -1130,37 +1344,99 @@ fn celestial_screen(s: &Session, i: usize) -> (f32, f32) {
     layer_to_screen(s, x, y, 0.0)
 }
 
-fn draw_celestial<R: Renderer>(c: &mut Ctx<R>, i: usize, glow: bool) {
+fn draw_celestial<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     let s = c.s;
     let cel = &s.world.celestials[i];
     let light = c.light();
     let at = celestial_screen(s, i);
-    if glow {
-        let tint = Color::rgba(
-            light.colors[if cel.is_sun {
-                color::SUN_GLOW
-            } else {
-                color::MOON_GLOW
-            }],
-        );
-        if let Some(g) = cel.glow {
-            c.world(
-                g,
-                at,
-                Draw::tint(tint).scale(cel.glow_scale).additive().smooth(),
-            );
-        }
+    let tint = Color::rgba(
+        light.colors[if cel.is_sun {
+            color::SUN_TINT
+        } else {
+            color::MOON_TINT
+        }],
+    );
+    if let Some(sp) = cel.sprite {
+        c.world(sp, at, Draw::tint(tint));
+    }
+}
+
+/// Glow child `j` of celestial `i`: the preset's glow colour over the
+/// child's own `SpriteRenderer` colour, fading as the body sets. orig: the
+/// `CelestialBody`'s glow children, tinted by the BlenderState glow colours.
+fn draw_celestial_glow<R: Renderer>(c: &mut Ctx<R>, i: usize, j: usize) {
+    let s = c.s;
+    let cel = &s.world.celestials[i];
+    let g = &cel.glows[j];
+    let up = celestial_up(cel, s.game.clock.time);
+    if up <= 0.0 {
+        return;
+    }
+    let Some(sp) = c.sheet.world(g.sprite) else {
+        return;
+    };
+    let preset = c.light().colors[if cel.is_sun {
+        color::SUN_GLOW
     } else {
-        let tint = Color::rgba(
-            light.colors[if cel.is_sun {
-                color::SUN_TINT
-            } else {
-                color::MOON_TINT
-            }],
-        );
-        if let Some(sp) = cel.sprite {
-            c.world(sp, at, Draw::tint(tint));
+        color::MOON_GLOW
+    }];
+    // Baked into the tint like the fire glows: additive blending adds
+    // tint.rgb × tint.a.
+    let a = preset[3] * g.color[3] * up;
+    if a <= 0.004 {
+        return;
+    }
+    let tint = Color::new(
+        preset[0] * g.color[0] * a,
+        preset[1] * g.color[1] * a,
+        preset[2] * g.color[2] * a,
+        1.0,
+    );
+    c.r.sprite(
+        sp,
+        celestial_screen(s, i),
+        Draw::tint(tint)
+            .scale(g.scale)
+            .additive()
+            .smooth(),
+    );
+}
+
+/// The night star field, fading with the blended `stars` level. orig:
+/// `Stars` (Heaven layer, camera-fixed); its layout isn't exported, so the
+/// field is procedural: fixed places, gentle per-star twinkle.
+fn draw_stars<R: Renderer>(c: &mut Ctx<R>) {
+    let level = c.light().floats[float::STARS];
+    if level <= 0.004 {
+        return;
+    }
+    const STAR_COUNT: usize = 110;
+    let t = c.s.t;
+    let bottom = screen_y(0.0) - 10.0;
+    let mut state = 0x9E37_79B9_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for _ in 0..STAR_COUNT {
+        let (x, y, kind, rate, phase) =
+            (next(), next(), next(), next(), next());
+        let x = 1.0 + (x >> 8) as f32 / (1 << 24) as f32 * (W - 2.0);
+        let y = 3.0 + (y >> 8) as f32 / (1 << 24) as f32 * (bottom - 3.0).max(1.0);
+        let big = kind >> 24 < 6; // every sixth star is a brighter 2×2 one
+        let size = if big { 2.0 } else { 1.0 };
+        // A slow triangle wave per star, 0..1; the field dips gently in and
+        // out rather than blinking in step.
+        let w = t * (0.4 + (rate >> 8) as f32 / (1 << 24) as f32 * 0.8) + (phase >> 8) as f32 / (1 << 24) as f32;
+        let twinkle = 1.0 - (w - w.floor()).abs() * 0.35;
+        let a = level * twinkle * if big { 1.0 } else { 0.7 };
+        if a <= 0.004 {
+            continue;
         }
+        let (x, y) = (x.round(), y.round());
+        c.r.rect(Rect::new(x, y, size, size), Color::new(1.0, 1.0, 1.0, a));
     }
 }
 
@@ -1179,20 +1455,25 @@ fn draw_dog<R: Renderer>(c: &mut Ctx<R>) {
         let dr = Draw::tint(c.lit(WHITE))
             .flip(d.mover.facing < 0)
             .recolor(WHITE, Color::rgb(d.color));
-        c.r.sprite(sp, world_to_screen(c.s, d.x, 0.0), dr);
+        c.sprite_lit(sp, world_to_screen(c.s, d.x, 0.0), dr);
     }
 }
 
 /// Everything on the top screen.
 pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
-    let mut c = Ctx { s, sheet, r };
+    let mut c = Ctx { s, sheet, r, lights: Vec::new() };
     draw_world(&mut c);
     draw_overlays(&mut c);
 }
 
 fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     let s = c.s;
-    let colors = s.game.blender.state.colors;
+    let light = s.game.blender.state;
+    let colors = light.colors;
+    // orig: the sky quad's `Custom/Sky` shader takes no lighting, so its
+    // gradient shows the presets' colours as they are (night stays navy).
+    // The fill and haze quads use `Haze Material` (`Custom/PowerSprite2`,
+    // `_AmbientResponse` 1), so those go through the ambient light.
     let sky_top = Color::rgba(colors[color::SKY_TOP]);
     let sky_bottom = Color::rgba(colors[color::SKY_BOTTOM]);
     // Above the sky quad the original shows its top color; below the horizon,
@@ -1204,7 +1485,13 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     c.r.rect(Rect::new(0.0, below, W, H - below), sky_bottom);
 
     let game_z = layer_z(&s.world);
-    for (key, item) in draw_list(s) {
+    let items = draw_list(s);
+    c.lights = items
+        .iter()
+        .filter_map(|(_, item)| fire_item(s, item))
+        .filter_map(|(at, fire, seed)| fire_light(s, at, &fire, seed))
+        .collect();
+    for (key, item) in items {
         c.r.depth(stereo_depth(-key.2 - game_z));
         match item {
             DrawItem::Part(oi, pi) => draw_part(c, &s.game.level.objects[oi], pi),
@@ -1222,8 +1509,8 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                 c.r,
                 FILL.1,
                 FILL.2,
-                Color::rgba(colors[color::FILL_BOTTOM]),
-                Color::rgba(colors[color::FILL_TOP]),
+                lit(Color::rgba(colors[color::FILL_BOTTOM]), &light),
+                lit(Color::rgba(colors[color::FILL_TOP]), &light),
             ),
             DrawItem::HazeFar | DrawItem::HazeNear => {
                 let (_, b, t) = if matches!(item, DrawItem::HazeFar) {
@@ -1231,14 +1518,15 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                 } else {
                     HAZE_NEAR
                 };
-                let haze = Color::rgba(colors[color::HAZE]);
+                let haze = lit(Color::rgba(colors[color::HAZE]), &light);
                 if haze.a > 0.0 {
                     gradient(c.r, b, t, haze, Color { a: 0.0, ..haze });
                 }
             }
             DrawItem::Water => draw_water(c),
-            DrawItem::Celestial(i) => draw_celestial(c, i, false),
-            DrawItem::Glow(i) => draw_celestial(c, i, true),
+            DrawItem::Celestial(i) => draw_celestial(c, i),
+            DrawItem::Glow(i, j) => draw_celestial_glow(c, i, j),
+            DrawItem::Stars => draw_stars(c),
             DrawItem::Grass(i) => draw_grass(c, i),
             DrawItem::Animal(i) => draw_animal(c, i),
             DrawItem::FreeSteed(i) => draw_free_steed(c, i),
@@ -1251,21 +1539,9 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Dog => draw_dog(c),
             DrawItem::LoosePart(i) => draw_loose_part(c, i),
             DrawItem::Deckhand(i) => draw_deckhand(c, i),
-            DrawItem::Fire { o, f, scenery } => {
-                let objs = if scenery { &s.game.level.scenery } else { &s.game.level.objects };
-                let o = &objs[o];
-                let fire = s.world.protos[o.proto as usize].fires[f];
-                let dir = if o.flip { -1.0 } else { 1.0 };
-                let at = layer_to_screen(s, o.x + dir * fire.at.0, o.y + fire.at.1, s.world.layer(o.layer).ratio);
-                draw_fire(c, at, &fire, o.id.wrapping_mul(7) + f as u32);
-            }
-            DrawItem::Torch => {
-                let m = &s.game.monarch;
-                if let Some(mut fire) = s.world.steeds[s.game.steed as usize].torch {
-                    fire.real_light = true;
-                    let f = m.facing as f32;
-                    let at = world_to_screen(s, m.x + fire.at.0 * f, fire.at.1);
-                    draw_fire(c, at, &fire, 1);
+            DrawItem::Fire { .. } | DrawItem::Torch => {
+                if let Some((at, fire, seed)) = fire_item(s, &item) {
+                    draw_fire(c, at, &fire, seed);
                 }
             }
             DrawItem::Boulder(i) => {
@@ -1273,12 +1549,14 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                 if let Some(sp) = s.world.boulder_sprite {
                     let at = world_to_screen(s, b.x, b.y);
                     let tint = c.lit(WHITE);
-                    c.world(sp, at, Draw::tint(tint).angle(b.spin.to_radians()));
+                    c.world_lit(sp, at, Draw::tint(tint).angle(b.spin.to_radians()));
                 }
             }
         }
     }
 
+    c.r.depth(stereo_depth(0.0));
+    draw_ground_light(c);
     c.r.depth(0.0);
     // The teleporter exit (placeholder rings until its sprites are drawn).
     if let Some(e) = s.game.teleports.exit {
@@ -1298,18 +1576,54 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     }
 }
 
-/// The water: its colour, and over it last frame's scene above the horizon,
-/// mirrored, squashed and rippled row by row. Opaque, so whatever has set
-/// below the horizon stays hidden. orig: `Water` with `Custom/Water`, which
-/// displaces each pixel; here each row moves as a whole (no fragment shaders
-/// on the 3DS).
+/// How fast the water turns from mirror to `waterColor` with depth below
+/// the shore, in the shader's mesh `v` per world unit. orig: `Custom/Water`
+/// mixes by `(v + 0.2) × waterColor.a`; fitted against the PC's midday water
+/// (about 0.2 at the shore, 0.7 at the screen's bottom edge).
+const WATER_V_PER_UNIT: f32 = 0.32;
+
+/// The water: last frame's scene above the horizon, mirrored, squashed and
+/// rippled row by row, fading into `waterColor` with depth. Opaque, so
+/// whatever has set below the horizon stays hidden. orig: `Water` with
+/// `Custom/Water` (from the PC build's GLSL): `lerp(w × reflection + (1 − w)
+/// × ambient, waterColor, clamp((v + 0.2) × waterColor.a))`, `w` = 1 − 0.8 ×
+/// (rain + snow). It displaces each pixel; here each row moves as a whole (no
+/// fragment shaders on the 3DS), and its sparkles and ragged shoreline aren't
+/// drawn.
 fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
     let s = c.s;
     let w = &s.world.water;
     let colors = s.game.blender.state.colors;
     let water = Color::rgba(colors[color::WATER]);
     let horizon = screen_y(w.top);
-    c.r.rect(Rect::new(0.0, horizon, W, H - horizon), Color { a: 1.0, ..water });
+    let light = &s.game.blender.state;
+    let wet = (light.floats[float::RAIN] + light.floats[float::SNOW]).clamp(0.0, 1.0);
+    let mirror = 1.0 - 0.8 * wet;
+    let amb = light.colors[color::AMBIENT];
+    // How much of `waterColor` shows `row` pixels below the shore.
+    let mix = |row: f32| ((row / PPU * WATER_V_PER_UNIT + 0.2) * water.a).clamp(0.0, 1.0);
+    let base = |t: f32| {
+        let k = (1.0 - t) * (1.0 - mirror);
+        Color::new(
+            water.r * t + amb[0] * k,
+            water.g * t + amb[1] * k,
+            water.b * t + amb[2] * k,
+            1.0,
+        )
+    };
+    // The colour under the reflection: linear in depth until it saturates.
+    let full = if water.a > 0.0 && WATER_V_PER_UNIT > 0.0 {
+        ((1.0 / water.a - 0.2) / WATER_V_PER_UNIT * PPU).max(0.0)
+    } else {
+        H
+    };
+    let ramp_end = (horizon + full).min(H);
+    if ramp_end > horizon {
+        c.r.gradient(Rect::new(0.0, horizon, W, ramp_end - horizon), base(mix(0.0)), base(mix(ramp_end - horizon)));
+    }
+    if ramp_end < H {
+        c.r.rect(Rect::new(0.0, ramp_end, W, H - ramp_end), base(1.0));
+    }
     // orig: _MaxDisplacement z/w weigh the coarse and fine maps (dry weather).
     let (coarse_k, fine_k) = (0.3, 0.2);
     let (mw, mh) = (w.size.0 as f32, w.size.1 as f32);
@@ -1318,11 +1632,6 @@ fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
     let centre = band_px / 2.0;
     let bottom = screen_y(w.bottom).min(H);
     let squash = w.reflection_scale.max(0.1);
-    // Lifted a third of the way to white: on the 3DS screen the plain
-    // multiply read too dark against open ground (forest water stays dark,
-    // since it mirrors the forest).
-    let lift = |v: f32| v + (1.0 - v) * 0.35;
-    let tint = Color::new(lift(water.r), lift(water.g), lift(water.b), water.a);
     let mut y = horizon;
     while y < bottom {
         let row = y - horizon;
@@ -1335,6 +1644,11 @@ fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
         let src_y = (horizon - row / squash + dy).clamp(1.0 / squash, horizon);
         let (sx, dx0) = if dx >= 0.0 { (dx, 0.0) } else { (0.0, -dx) };
         let span = W - dx.abs();
+        let k = (1.0 - mix(row)) * mirror;
+        if k <= 0.004 {
+            break;
+        }
+        let tint = Color::new(k, k, k, 1.0);
         c.r.reflect(
             Rect::new(dx0, y, span, 1.0),
             Rect::new(sx, src_y, span, -1.0 / squash),
@@ -1441,6 +1755,44 @@ fn draw_overlays<R: Renderer>(c: &mut Ctx<R>) {
         let shown = if s.debug_lines { lines.len() } else { 0 };
         for (i, l) in lines.into_iter().take(shown).chain(note).enumerate() {
             crate::text::draw(c.r, c.sheet, &l, 4.0, 12.0 + i as f32 * 11.0, 14.0, WHITE);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sort_key;
+
+    /// The packed key orders exactly as the tuple compare it replaced.
+    #[test]
+    fn sort_key_keeps_painters_order() {
+        let layers = [i16::MIN, -3, -1, 0, 1, 7, i16::MAX];
+        let zs = [
+            f32::NEG_INFINITY,
+            -1e9,
+            -12.5,
+            -0.7,
+            -1e-30,
+            -0.0,
+            0.0,
+            1e-30,
+            0.7,
+            12.5,
+            f32::INFINITY,
+        ];
+        let mut keys = Vec::new();
+        for &l in &layers {
+            for &o in &layers {
+                for &z in &zs {
+                    keys.push((l, o, z));
+                }
+            }
+        }
+        for a in &keys {
+            for b in &keys {
+                let old = a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.total_cmp(&b.2));
+                assert_eq!(sort_key(*a).cmp(&sort_key(*b)), old, "{a:?} vs {b:?}");
+            }
         }
     }
 }

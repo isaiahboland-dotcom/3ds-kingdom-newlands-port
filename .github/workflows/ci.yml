@@ -29,7 +29,7 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: setup.sh lints
-        run: shellcheck tools/setup.sh tools/cia/build.sh
+        run: shellcheck build.sh tools/setup.sh tools/cia/build.sh
 
   n3ds:
     name: 3DS build

@@ -27,6 +27,8 @@ pub mod color {
 pub mod float {
     pub const FOG_DENSITY: usize = 2;
     pub const STARS: usize = 5;
+    pub const RAIN: usize = 6;
+    pub const SNOW: usize = 7;
 }
 
 /// The current blended lighting. orig: `Blender.state`.
@@ -71,21 +73,39 @@ fn circular_interval(t: f32, left: f32, right: f32, divisor: f32) -> f32 {
     }
 }
 
-/// Sun/moon position relative to the camera-fixed Heaven layer, in units.
-/// Above the horizon between rise and set, below it otherwise.
-/// orig: `CelestialBody.Update()`.
-pub fn celestial_position(c: &CelestialDef, time: f32) -> (f32, f32) {
-    let f = core::f32::consts::PI
+/// Progress along the body's half-ellipse arc as an angle: 0 at rise, π at
+/// set, past the ends while below the horizon. orig: `CelestialBody.Update()`.
+fn celestial_angle(c: &CelestialDef, time: f32) -> f32 {
+    core::f32::consts::PI
         * if c.rises_at < c.sets_at {
             circular_interval(time, c.rises_at, c.sets_at, 24.0)
         } else {
             1.0 + circular_interval(time, c.sets_at, c.rises_at, 24.0)
-        };
+        }
+}
+
+/// Sun/moon position relative to the camera-fixed Heaven layer, in units.
+/// Above the horizon between rise and set, below it otherwise.
+/// orig: `CelestialBody.Update()`.
+pub fn celestial_position(c: &CelestialDef, time: f32) -> (f32, f32) {
+    let f = celestial_angle(c, time);
     (
         -libm::cosf(f) * c.orbit_scale.0 + c.orbit_center.0,
         libm::sinf(f) * c.orbit_scale.1 + c.orbit_center.1,
     )
 }
+
+/// How far the body has climbed above the horizon: 1 while up, 0 while down,
+/// fading over the last [`GLOW_HORIZON_FADE`] of the arc's height. The
+/// original's glow shows only while its body is up; without the fade a set
+/// sun's wide halo keeps painting the sky above the horizon after dark.
+pub fn celestial_up(c: &CelestialDef, time: f32) -> f32 {
+    (libm::sinf(celestial_angle(c, time)) / GLOW_HORIZON_FADE).clamp(0.0, 1.0)
+}
+
+/// Height of the rise/set fade band of [`celestial_up`], in arc height
+/// (`sin(f)`): full glow a little above the horizon, none below it.
+const GLOW_HORIZON_FADE: f32 = 0.1;
 
 /// orig: `BlenderStateFader`.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -175,6 +195,11 @@ impl Blender {
             .iter()
             .all(|f| (f.preset as usize) < world.lights.len())
     }
+    /// The presets on the stack and their weights, bottom first (dev tools).
+    pub fn presets(&self) -> impl Iterator<Item = (u16, f32)> + '_ {
+        self.stack.iter().map(|f| (f.preset, f.weight))
+    }
+
     /// orig: `Blender.Init()`.
     pub fn new(world: &WorldData) -> Self {
         let mut b = Blender::default();
@@ -246,20 +271,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sun_is_up_at_noon_and_down_at_midnight() {
-        let sun = CelestialDef {
+    fn sun() -> CelestialDef {
+        CelestialDef {
             sprite: None,
-            glow: None,
+            glows: vec![],
             is_sun: true,
             orbit_scale: (4.0, 3.5),
             orbit_center: (0.0, 0.5),
             rises_at: 6.5,
             sets_at: 21.5,
             z: 60.0,
-            glow_z: vec![],
-            glow_scale: 8.0,
-        };
+        }
+    }
+
+    #[test]
+    fn sun_is_up_at_noon_and_down_at_midnight() {
+        let sun = sun();
         let (x, y) = celestial_position(&sun, 14.0);
         assert!(x.abs() < 1e-3 && (y - 4.0).abs() < 1e-3, "{x} {y}");
         assert!(
@@ -270,6 +297,23 @@ mod tests {
             celestial_position(&sun, 2.0).1 < 0.5,
             "below the horizon at night"
         );
+    }
+
+    #[test]
+    fn the_glow_fades_out_across_the_horizon() {
+        let sun = sun();
+        assert_eq!(celestial_up(&sun, 14.0), 1.0, "fully up at noon");
+        assert_eq!(celestial_up(&sun, 2.0), 0.0, "down at night");
+        assert_eq!(celestial_up(&sun, sun.sets_at + 1.0), 0.0, "after set");
+        // Part-way through the fade just after rising and just before setting.
+        let mid = celestial_up(&sun, sun.rises_at + 0.2);
+        assert!(mid > 0.0 && mid < 1.0, "after rise: {mid}");
+        let mid = celestial_up(&sun, sun.sets_at - 0.2);
+        assert!(mid > 0.0 && mid < 1.0, "before set: {mid}");
+        // Symmetric around the horizon.
+        let rising = celestial_up(&sun, sun.rises_at + 0.1);
+        let setting = celestial_up(&sun, sun.sets_at - 0.1);
+        assert!((rising - setting).abs() < 1e-4, "{rising} vs {setting}");
     }
 
     #[test]

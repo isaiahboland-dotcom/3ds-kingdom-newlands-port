@@ -14,7 +14,49 @@ The 3DS backend enables the faster CPU mode where supported. There is currently 
 
 Experimental Stereoscopic 3D
 
-## Desktop setup
+## Installation
+
+There are two ways to build the game: the **automated install** (`build.sh`) installs every dependency and builds everything in one command, while the **manual install** lets you run each step yourself.
+
+### Automated install
+
+Written for Debian/Ubuntu, Fedora, and Arch based distros (including Mint, Pop!_OS, Manjaro, EndeavourOS, and CachyOS). It has only been tested on Arch based distros so far; **Debian and Fedora remain untested**, in particular the automatic devkitPro install (Fedora has no official devkitPro packages, so that route is a best effort). If a step fails there, set `INSTALL_DEPS=no` in `.env`, install the dependencies by hand as described under [Manual install](#manual-install), and run `./build.sh` again; reports are welcome. You need your own PC copy of Kingdom: New Lands; the Steam **Linux** build is what the port is developed against.
+
+```sh
+git clone https://github.com/isaiahboland-dotcom/3ds-kingdom-newlands-port.git
+cd 3ds-kingdom-newlands-port
+cp .example.env .env    # optional: edit to change the defaults
+./build.sh
+```
+
+`build.sh` will, as needed:
+
+1. Install the system packages for your distro (asks for `sudo`).
+2. Install Rust with rustup, the nightly toolchain with `rust-src`, and `cargo-3ds`.
+3. Install devkitPro's `3ds-dev` tools into `/opt/devkitpro`.
+4. Find your game, convert its assets, and build the game (via `tools/setup.sh`).
+5. Lay out the SD card files in `dist/sdcard/`, and copy them to your SD card if `SDCARD` is set.
+
+Steps that are already done are skipped, so running it again just rebuilds. Settings in `.env` (all optional, see [`.example.env`](.example.env)):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `KINGDOM_GAME` | searched | Game folder containing `Kingdom_Data`. Steam libraries, `~/GOG Games`, and `gamefiles/` are searched when empty. |
+| `TARGET` | ask | `desktop`, `3ds` (`.3dsx`), or `cia` (`.3dsx` and `.cia`). Left empty, `build.sh` asks whether to build the `.3dsx` or the `.cia` (the `.3dsx` without a terminal). |
+| `INSTALL_DEPS` | `yes` | Set to `no` to only check for dependencies, never install them. |
+| `DEVKITPRO` / `DEVKITARM` | `/opt/devkitpro` | Existing devkitPro installation. |
+| `ASSETRIPPER` | downloaded | Path to an AssetRipper 2.0.0 executable you already have. |
+| `SDCARD` | empty | Mounted SD card (e.g. `/run/media/$USER/3DS`) to copy the result onto. |
+
+Paths may contain spaces without quotes and may use `~` or `$HOME`. Variables already exported in your shell override `.env`. You can also pick the target for one run with `./build.sh desktop`, `./build.sh 3ds`, or `./build.sh cia`, and force a fresh asset rip with `./build.sh --rerip`.
+
+When it finishes, copy everything inside `dist/sdcard/` onto the root of your SD card, merging folders (existing saves are kept). Launch `kingdom.3dsx` from the Homebrew Launcher, or install `cias/kingdom.cia` with FBI. Sound needs your console's DSP firmware at `sdmc:/3ds/dspfirm.cdc` (run DSP1 once). For the desktop target, play with `cargo run --release -p desktop`.
+
+### Manual install
+
+The steps below are what `build.sh` automates.
+
+#### Desktop setup
 
 Run the commands below from the repository root. The asset pipeline was developed against the Steam **Linux Mono build** of Kingdom: New Lands. Other game builds and Windows/macOS hosts have not been fully validated; WSL with a Linux game installation is the recommended starting point on Windows.
 
@@ -42,7 +84,7 @@ Extraction does not require decompiling the game scripts yourself. The optional 
 
 The desktop backend reads `assets/` by default; set `KINGDOM_ASSETS` to override it. Saves use `KINGDOM_SAVES`, then `$XDG_DATA_HOME/kingdom-3ds`, then `~/.local/share/kingdom-3ds` (or `saves/` if no home directory is available). Saves are tied to the converted `world.bin`; converting a different game build can make existing saves incompatible.
 
-## Building for 3DS
+#### Building for 3DS
 
 Install [devkitPro](https://devkitpro.org/wiki/Getting_Started) with the `3ds-dev` group, including `tex3ds`, then install the Rust build tools:
 
@@ -72,7 +114,7 @@ tools/setup.sh --game "/path/to/Kingdom New Lands" --cia
 
 This also creates `kingdom.cia` beside the `.3dsx`. Install it with a title manager such as FBI and copy the same audio directory to the SD card. Packaging uses `makerom` and `bannertool` from `PATH`, or builds them under `tools/cia/`; this needs Git, make, and a C/C++ compiler. The banner, icon, and jingle are generated from your own game files.
 
-## Manual conversion and builds
+#### Manual conversion and builds
 
 If you already have an AssetRipper 2.0.0 Unity project export at `reference/ripped/ExportedProject`:
 
@@ -119,6 +161,7 @@ Desktop development shortcuts include F1 for diagnostics, 1–4 for simulation s
 - `crates/desktop`: macroquad desktop backend.
 - `crates/n3ds`: separately built 3DS backend.
 - `tools/extract`: local asset conversion and 3DS packaging helpers.
+- `build.sh`, `.example.env`: automated install.
 - `tools/setup.sh`, `tools/cia/`: setup and CIA packaging.
 
 Checks that do not require game files:
@@ -127,10 +170,10 @@ Checks that do not require game files:
 cargo build --workspace --all-targets --locked
 cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
-shellcheck tools/setup.sh tools/cia/build.sh
+shellcheck build.sh tools/setup.sh tools/cia/build.sh
 python3 tools/check_public_files.py
 ```
 
 CI runs these checks and a separate 3DS build with an empty RomFS, which verifies compilation without distributing game data. An empty RomFS build cannot run the game.
 
-Keep game installations in `gamefiles/`, references in `reference/`, and generated data in `assets/` or the ignored 3DS staging directories. Do not force-add these files or attach asset-containing builds to public releases. Source comments identify original classes and observed behavior for reference; decompiled C# must stay local. See [the publication audit](docs/publication-audit.md) for the scope and limits of the repository checks.
+Keep game installations in `gamefiles/`, references in `reference/`, and generated data in `assets/`, `dist/`, or the ignored 3DS staging directories. Do not force-add these files or attach asset-containing builds to public releases. Source comments identify original classes and observed behavior for reference; decompiled C# must stay local. See [the publication audit](docs/publication-audit.md) for the scope and limits of the repository checks.

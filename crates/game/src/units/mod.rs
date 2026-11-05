@@ -1346,10 +1346,8 @@ impl Population {
             let out = |x: f32| x < l || x > r;
             let posted = match u.ai {
                 Ai::Work { target, .. } => level
-                    .objects
-                    .iter()
-                    .find(|o| o.id == target)
-                    .is_some_and(|o| night_post(ctx.world, o)),
+                    .index_of(target)
+                    .is_some_and(|i| night_post(ctx.world, &level.objects[i])),
                 _ => false,
             };
             if !posted && (out(u.x) || u.mover.goal.is_some_and(|(g, _)| out(g))) {
@@ -1806,6 +1804,22 @@ impl Population {
         }
         // (target id, x, workersNeeded rank, priority)
         let mut jobs: Vec<(u32, f32, i32, i32)> = Vec::new();
+        // Workers at each target, in one pass: a per-site scan over the units
+        // made this O(sites × units) once a second.
+        let mut busy: Vec<(u32, i32)> = Vec::new();
+        for u in &self.units {
+            let t = match u.ai {
+                Ai::Work { target, .. } => target,
+                _ => match u.queued_work {
+                    Some(t) => t,
+                    None => continue,
+                },
+            };
+            match busy.binary_search_by_key(&t, |b| b.0) {
+                Ok(i) => busy[i].1 += 1,
+                Err(i) => busy.insert(i, (t, 1)),
+            }
+        }
         for o in &level.objects {
             if !work_available(world, o, ctx.worker_statue) {
                 continue;
@@ -1838,14 +1852,10 @@ impl Population {
                 0
             };
             let max = max_workers(world, o) as i32;
-            let busy = self
-                .units
-                .iter()
-                .filter(|u| {
-                    matches!(u.ai, Ai::Work { target, .. } if target == o.id)
-                        || u.queued_work == Some(o.id)
-                })
-                .count() as i32;
+            let busy = busy
+                .binary_search_by_key(&o.id, |b| b.0)
+                .map(|i| busy[i].1)
+                .unwrap_or(0);
             let needed = max - busy;
             for i in 0..needed.max(0) {
                 jobs.push((o.id, o.x, needed - i, priority));

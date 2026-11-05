@@ -264,7 +264,7 @@ checksum = "0c87e182de0887fd5361989c677c4e8f5000cd9491d6d563161a8f3a5519fc7f"
 
 [[package]]
 name = "desktop"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "cpal",
  "game",
@@ -302,7 +302,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "extract"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "game",
  "png 0.18.1",
@@ -381,7 +381,7 @@ dependencies = [
 
 [[package]]
 name = "game"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "libm",
  "postcard",
@@ -832,7 +832,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "platform"
-version = "1.0.0"
+version = "1.2.0"
 
 [[package]]
 name = "png"
@@ -979,7 +979,7 @@ dependencies = [
 
 [[package]]
 name = "scene"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "game",
  "lewton",

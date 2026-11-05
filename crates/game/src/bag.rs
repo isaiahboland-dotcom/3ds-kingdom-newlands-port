@@ -3,9 +3,14 @@
 //! the purse for real.
 //!
 //! orig: `CoinBag`, `BagCoin` (Box2D bodies against the bag's colliders).
+//!
+//! Like Box2D, coins sleep when settled and are woken only by what touches
+//! them: a coin spent or spilled disturbs its neighbours, not the whole
+//! purse (waking all of a 300-coin pile costs milliseconds per tick on an
+//! Old 3DS). Scratch buffers are reused between ticks, so a churning pile
+//! doesn't allocate.
 //! Units are the bag's own (y up, origin at the bag sprites' pivot).
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::data::BagDef;
@@ -33,6 +38,10 @@ const SLOP: f32 = 0.01;
 /// may only close the gap this step (so a resting pile can come to rest).
 const MARGIN: f32 = 0.02;
 const ITERATIONS: usize = 8;
+/// Solves per tick (1/120 s each). Longer steps (one 1/60 s, or 1/30 s
+/// every other tick) leave a resting pile with enough rocking that it never
+/// falls asleep: it shimmers on screen and, never sleeping, ends up costing
+/// more than this (see docs/perf.md).
 const SUBSTEPS: usize = 2;
 /// orig: `BagCoin.Blink()`: 0.2 s to full white, then back.
 const BLINK_TIME: f32 = 0.2;
@@ -98,14 +107,31 @@ pub struct Bag {
     /// Coins added so far (picks the colour). orig: `_coins.Count` at spawn.
     spawned: u32,
     /// Last step's contact impulses, to start this step's from (warm
-    /// starting). Keyed by (coin, other coin or the bag, disc, disc).
+    /// starting). Keyed by (coin, other coin or the bag, disc, disc),
+    /// sorted by key. A `BTreeMap` here cost a heap node per contact per
+    /// step; a sorted flat `Vec` doesn't.
     #[cfg_attr(feature = "serde", serde(skip))]
-    warm: BTreeMap<(u16, u16, u8, u8), (f32, f32)>,
+    warm: Vec<WarmImpulse>,
+    /// Reused per step (see [`Bag::step`]): the contacts found and the
+    /// sweep-and-prune order.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    scratch: Scratch,
+}
+
+/// Step scratch space, kept across ticks so the heap stops churning.
+#[derive(Clone, Default, Debug, PartialEq)]
+struct Scratch {
+    contacts: Vec<Contact>,
+    order: Vec<usize>,
 }
 
 /// The bag itself, as the "other coin" of a contact key.
 const BAG_KEY: u16 = u16::MAX;
 
+/// A warm-start entry: contact key and its last impulses (normal, tangent).
+type WarmImpulse = ((u16, u16, u8, u8), (f32, f32));
+
+#[derive(Clone, Debug, PartialEq)]
 struct Contact {
     key: (u16, u16, u8, u8),
     a: usize,
@@ -220,11 +246,31 @@ impl Bag {
             let from_queue = gone.min(self.to_add);
             self.to_add -= from_queue;
             gone -= from_queue;
+            // Only the neighbours of a taken coin fall into its hole; the
+            // rest of the pile keeps sleeping (Box2D wakes touching islands,
+            // not the world).
+            let mut holes: Vec<(f32, f32)> = Vec::new();
             for _ in 0..gone {
-                self.coins.pop();
-                self.warm.clear();
+                if let Some(c) = self.coins.pop() {
+                    holes.push((c.x, c.y));
+                }
             }
-            for c in &mut self.coins {
+            if !holes.is_empty() {
+                self.warm.clear();
+                self.wake_near(&holes);
+            }
+        }
+    }
+
+    /// Wakes coins that could rest on the holes just made at `holes`
+    /// (a couple of coin widths around each).
+    fn wake_near(&mut self, holes: &[(f32, f32)]) {
+        const REACH: f32 = 0.3;
+        for c in &mut self.coins {
+            if holes
+                .iter()
+                .any(|&(x, y)| (c.x - x).abs() < REACH && (c.y - y).abs() < REACH)
+            {
                 c.asleep = false;
             }
         }
@@ -317,6 +363,7 @@ impl Bag {
         }
         let h = dt / SUBSTEPS as f32;
         for _ in 0..SUBSTEPS {
+            crate::prof::mark("bag_int");
             self.step(h, def, &mut events);
         }
     }
@@ -345,11 +392,15 @@ impl Bag {
             [(c.x - dx, c.y - dy), (c.x, c.y), (c.x + dx, c.y + dy)]
         };
         let e = def.bounciness;
-        let mut contacts: Vec<Contact> = Vec::new();
+        let mut contacts = core::mem::take(&mut self.scratch.contacts);
+        contacts.clear();
         let n = self.coins.len();
         // Sweep along x: only coins within reach of each other can touch.
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| self.coins[a].x.total_cmp(&self.coins[b].x));
+        let mut order = core::mem::take(&mut self.scratch.order);
+        order.clear();
+        order.extend(0..n);
+        order.sort_unstable_by(|&a, &b| self.coins[a].x.total_cmp(&self.coins[b].x));
+        crate::prof::mark("bag_sort");
         let reach = 2.0 * (half + r);
         for ii in 0..n {
             let i = order[ii];
@@ -444,13 +495,20 @@ impl Bag {
             }
         }
         // Waking: an awake coin pressing on a sleeping one.
+        crate::prof::mark("bag_sweep");
         for k in &contacts {
             if let Some(b) = k.b {
                 let (sa, sb) = (self.coins[k.a].asleep, self.coins[b].asleep);
                 if sa != sb {
                     let mover = if sa { b } else { k.a };
                     let c = &self.coins[mover];
-                    if c.vx * c.vx + c.vy * c.vy > WAKE_SPEED * WAKE_SPEED {
+                    // Judged by how it left the last solve: this step's
+                    // gravity alone (0.075 at 1/120 s) would read as moving,
+                    // so a coin merely resting on a sleeper woke it every
+                    // substep and the pile flip-flopped between asleep and
+                    // awake.
+                    let (vx, vy) = (c.vx / ld, c.vy / ld + g * dt);
+                    if vx * vx + vy * vy > WAKE_SPEED * WAKE_SPEED {
                         self.coins[if sa { k.a } else { b }].asleep = false;
                     }
                 }
@@ -487,10 +545,15 @@ impl Bag {
             }
         }
         // Warm start: each contact begins with last step's impulse.
-        let warm = core::mem::take(&mut self.warm);
+        let mut warm = core::mem::take(&mut self.warm);
         for k in &mut contacts {
             // Only touching contacts: a gap mustn't be pushed open further.
-            let Some(&(jn, jt)) = warm.get(&k.key).filter(|_| k.depth >= 0.0) else {
+            let Some((jn, jt)) = warm
+                .binary_search_by(|&(key, _)| key.cmp(&k.key))
+                .ok()
+                .map(|i| warm[i].1)
+                .filter(|_| k.depth >= 0.0)
+            else {
                 continue;
             };
             k.jn = jn;
@@ -510,6 +573,7 @@ impl Bag {
             }
         }
         for _ in 0..ITERATIONS {
+            crate::prof::mark("bag_solve");
             for k in &mut contacts {
                 let im_b =
                     k.b.map_or(0.0, |b| if self.coins[b].asleep { 0.0 } else { 1.0 });
@@ -559,7 +623,12 @@ impl Bag {
                 }
             }
         }
-        self.warm = contacts.iter().map(|k| (k.key, (k.jn, k.jt))).collect();
+        // Warm starting: keep this step's impulses, sorted by key for next
+        // step's binary searches. Same buffer, so nothing is reallocated.
+        warm.clear();
+        warm.extend(contacts.iter().map(|k| (k.key, (k.jn, k.jt))));
+        warm.sort_unstable_by_key(|&(key, _)| key);
+        self.warm = warm;
         for c in self.coins.iter_mut().filter(|c| !c.asleep) {
             c.x += c.vx * dt;
             c.y += c.vy * dt;
@@ -609,26 +678,29 @@ impl Bag {
                 c.still = if still { c.still + dt } else { 0.0 };
             }
             if inside(&def.spill, c.x, c.y) || c.y < -5.0 {
+                let (x, y) = (c.x, c.y);
                 self.coins.remove(i);
                 self.warm.clear();
                 self.count = self.count.saturating_sub(1);
                 events(BagEvent::Spilled);
-                for c in &mut self.coins {
-                    c.asleep = false;
-                }
+                // The gap it left, not the whole purse.
+                self.wake_near(&[(x, y)]);
                 continue;
             }
             i += 1;
         }
         // orig: Box2D sleeps bodies still for `m_TimeToSleep`. (It sleeps whole
-        // islands of touching bodies; without its warm starting a few coins in a
-        // big pile never quite stop rocking, so here each coin sleeps alone,
-        // and is woken by anything landing on it.)
+        // islands of touching bodies; here each coin sleeps alone, and is
+        // woken by a moving coin landing on it or by the coins under it
+        // being taken. A full purse settles completely this way.)
         for c in &mut self.coins {
             if !c.asleep && c.still >= SLEEP_TIME {
                 c.sleep();
             }
         }
+        // Hand the scratch buffers back for the next step.
+        self.scratch.contacts = contacts;
+        self.scratch.order = order;
     }
 }
 
@@ -706,5 +778,38 @@ mod tests {
         run(&mut bag, &def, &mut coins, 40.0);
         assert!(coins < 120, "nothing spilled");
         assert_eq!(bag.count(), coins);
+    }
+
+    /// A settled purse must fall asleep and stay put: a pile that keeps
+    /// rocking shimmers on the touch screen and never stops costing solver
+    /// time (it did with a 1/30 s step).
+    #[test]
+    fn a_settled_pile_sleeps_and_holds_still() {
+        let def = cup();
+        let mut bag = Bag::default();
+        let mut coins = 12;
+        run(&mut bag, &def, &mut coins, 15.0);
+        assert_eq!(bag.coins.len(), 12);
+        assert_eq!(bag.awake(), 0, "the pile never settled");
+        let before: Vec<(f32, f32, f32)> = bag.coins.iter().map(|c| (c.x, c.y, c.angle)).collect();
+        run(&mut bag, &def, &mut coins, 2.0);
+        let after: Vec<(f32, f32, f32)> = bag.coins.iter().map(|c| (c.x, c.y, c.angle)).collect();
+        assert_eq!(before, after, "a sleeping pile moved");
+    }
+
+    /// A full purse, heaped past the brim and spilled down to what fits,
+    /// must fall asleep too. It didn't: the wake test read this substep's
+    /// gravity as motion, so any awake coin resting on a sleeping one woke
+    /// it, and big piles flip-flopped forever (hundreds of µs per tick on
+    /// the bench host, tens of ms on an Old 3DS).
+    #[test]
+    fn a_full_purse_sleeps() {
+        let def = cup();
+        let mut bag = Bag::default();
+        let mut coins = 60;
+        run(&mut bag, &def, &mut coins, 30.0);
+        assert!(bag.coins.len() > 20, "the cup barely holds anything");
+        run(&mut bag, &def, &mut coins, 10.0);
+        assert_eq!(bag.awake(), 0, "a full purse never settled");
     }
 }
