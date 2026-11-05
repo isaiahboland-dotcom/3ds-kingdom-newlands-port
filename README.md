@@ -14,6 +14,8 @@ The 3DS backend enables the faster CPU mode where supported. There is currently 
 
 Experimental Stereoscopic 3D
 
+O3ds is supported although there can be some stuttering encountered when multiple farmers are giving you a lot of coins, and when many builders are at work. I am working on further optimizations with the help of AI
+
 ## Desktop setup
 
 Run the commands below from the repository root. The asset pipeline was developed against the Steam **Linux Mono build** of Kingdom: New Lands. Other game builds and Windows/macOS hosts have not been fully validated; WSL with a Linux game installation is the recommended starting point on Windows.
@@ -134,3 +136,5 @@ python3 tools/check_public_files.py
 CI runs these checks and a separate 3DS build with an empty RomFS, which verifies compilation without distributing game data. An empty RomFS build cannot run the game.
 
 Keep game installations in `gamefiles/`, references in `reference/`, and generated data in `assets/` or the ignored 3DS staging directories. Do not force-add these files or attach asset-containing builds to public releases. Source comments identify original classes and observed behavior for reference; decompiled C# must stay local. See [the publication audit](docs/publication-audit.md) for the scope and limits of the repository checks.
+
+
