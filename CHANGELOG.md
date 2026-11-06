@@ -17,11 +17,7 @@
 
 - Coins in the purse jittered on the touch screen and never settled. The
   pile had been switched to one 1/30 s step every other tick to save time,
-  but at that step a resting pile keeps rocking, so it never falls asleep:
-  it shimmered and, never sleeping, cost more (82 µs vs 34 µs per tick for
-  a settled 60-coin purse on the bench host). It is back to two 1/120 s
-  substeps per tick; a test now checks that a settled pile sleeps and holds
-  still (`bag::tests::a_settled_pile_sleeps_and_holds_still`).
+  but at that step a resting pile keeps rocking, so it never falls asleep.
 
 ### Changed
 
@@ -66,20 +62,8 @@
 
 ### Performance
 
-- A full coin purse now falls completely asleep. Any awake coin resting on
-  a sleeping one woke it every substep (the wake test counted the
-  substep's gravity as motion), so a 60–80 coin purse kept 15–45 coins
-  awake and visibly shifting forever: 68–220 µs/tick on the bench host,
-  now under 1 µs (`bag::tests::a_full_purse_sleeps`). The `bagjitter`
-  bench now takes spilled coins out of the purse as the game does.
-- The draw list sorts packed integer keys instead of stable-sorting tuples:
-  the sort is ~2× faster, in the same order (`top::sort_key`).
-- The coin purse pile no longer wakes every coin when one is spent or
-  spills; only its neighbours are disturbed, and the solver reuses its
-  scratch buffers and a flat warm-start table. Simulated stress benchmarks of a mid-game kingdom (40 sites, 24
-  builders, 150 loose coins, a 400-coin purse) show the worst tick during
-  payment bursts over 3× faster and the average tick 3.1× faster; the Old
-  3DS estimate drops from ~26 ms spikes to ~4.5 ms.
+
+- The draw list sorts packed integer keys instead of stable-sorting tuples
 - Coins pick up in one fused pass over the grabbers instead of two scans,
   flying coins skip the pickup checks when nothing can reach them, and
   coins being sucked into a purse find it through a sorted index rather
