@@ -8,11 +8,13 @@ This project is not affiliated with or endorsed by Raw Fury or Noio. Kingdom and
 
 ## Status
 
-The project implements the core simulation, island progression, saves, shared screen rendering, desktop audio, and a 3DS backend with controls, SD saves, DSP audio, and stereoscopic rendering. It is a work in progress: behavior comparisons with the original, audio/reflection/stereo checks on hardware, and performance measurements on Old and New 3DS remain incomplete. See [deviations](docs/deviations.md), [systems](docs/systems.md), and [performance notes](docs/perf.md).
+The project implements the core simulation, island progression, saves, shared screen rendering, desktop audio, and a 3DS backend with controls, SD saves, DSP audio, and stereoscopic rendering. It is a work in progress: mainly issues with lighting especially at night and around torches/campfire and fixing minor bugs and glitches that may appear alongside optimizations to get a smoother experience on the o3ds. See [deviations](docs/deviations.md), [systems](docs/systems.md), and [performance notes](docs/perf.md).
 
 The 3DS backend enables the faster CPU mode where supported. There is currently no user-facing performance tier option. Mod support is not included.
 
 Experimental Stereoscopic 3D
+
+O3ds is supported although there can be some stuttering encountered when multiple farmers are giving you a lot of coins, and when many builders are at work. I am working on further optimizations with the help of AI
 
 ## Installation
 
