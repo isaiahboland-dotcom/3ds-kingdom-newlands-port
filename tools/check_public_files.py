@@ -22,9 +22,14 @@ GAME_EXTENSIONS = {
     '.smdh', '.elf', '.cdc',
 }
 
+# Binary files deliberately published after manual review (exact paths only).
+REVIEWED_BINARIES = {'banner/banner.webp'}
+
 
 def problem(name, data):
     path = Path(name)
+    if name in REVIEWED_BINARIES:
+        return None
     if name.startswith(PRIVATE) or path.suffix.lower() in GAME_EXTENSIONS:
         return 'private game/tool/build path or asset extension'
     if b'\0' in data:
