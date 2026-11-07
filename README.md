@@ -4,6 +4,8 @@
        width="100%">
 </p>
 
+*Actual gameplay captured from the Rust reimplementation of Kingdom: New Lands. Not footage from the original PC release.*
+
 # Kingdom: New Lands for Nintendo 3DS
 
 An unofficial Rust reimplementation of **Kingdom: New Lands**, with a desktop backend for development and a Nintendo 3DS backend. You must supply your own PC copy of the game and convert its assets locally.
