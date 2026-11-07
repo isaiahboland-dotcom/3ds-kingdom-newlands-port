@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="banner/banner.webp"
+       alt="Kingdom: New Lands pixel art landscape"
+       width="100%">
+</p>
+
 # Kingdom: New Lands for Nintendo 3DS
 
 An unofficial Rust reimplementation of **Kingdom: New Lands**, with a desktop backend for development and a Nintendo 3DS backend. You must supply your own PC copy of the game and convert its assets locally.
