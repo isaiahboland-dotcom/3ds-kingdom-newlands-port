@@ -1251,6 +1251,21 @@ impl WorldData {
             .copied()
             .unwrap_or(LayerDef { ratio: 1.0, z: 0.0 })
     }
+
+    /// The shipped `EnemyManager.redMoon` preset, already stored in existing
+    /// asset packs. Extraction verifies that the scene points to this entry.
+    pub fn red_moon_preset(&self) -> Option<u16> {
+        let mut matches = self
+            .lights
+            .iter()
+            .enumerate()
+            .filter(|(_, preset)| preset.is_red_moon_overlay());
+        let (index, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        u16::try_from(index).ok()
+    }
 }
 
 /// Color fields of a lighting preset, in `Light::colors` order.
@@ -1304,6 +1319,24 @@ pub struct LightPreset {
     pub enabled: u32,
     pub colors: [[f32; 4]; 17],
     pub floats: [f32; 8],
+}
+
+impl LightPreset {
+    fn is_red_moon_overlay(&self) -> bool {
+        // Moon tint and glow, cloud highlight and stratus tint, and stars.
+        const ENABLED: u32 = 0x0040_6c00;
+        const COLORS: [usize; 4] = [10, 11, 13, 14];
+        const STARS: usize = 5;
+        self.name == "Red Moon"
+            && self.category == 0
+            && !self.test_only
+            && self.enabled == ENABLED
+            && COLORS
+                .iter()
+                .flat_map(|&i| self.colors[i])
+                .chain([self.floats[STARS]])
+                .all(|value| (0.0..=1.0).contains(&value))
+    }
 }
 
 /// orig: `Day` asset.

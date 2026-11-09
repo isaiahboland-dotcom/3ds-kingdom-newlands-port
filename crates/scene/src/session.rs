@@ -13,6 +13,41 @@ use platform::Storage;
 
 use crate::touch::MapChoice;
 
+pub(crate) const STAR_COUNT: usize = 110;
+const STAR_SAMPLE_TICKS: u16 = 300;
+
+#[derive(Clone, Copy)]
+struct Stars {
+    visible: usize,
+    ticks: u16,
+}
+
+impl Default for Stars {
+    fn default() -> Self {
+        // Both authored emitters start enabled and unmasked.
+        Self {
+            visible: STAR_COUNT,
+            ticks: 0,
+        }
+    }
+}
+
+impl Stars {
+    fn step(&mut self, level: f32) {
+        self.ticks += 1;
+        // orig: Stars.SlowUpdate samples every five active seconds at 60 Hz.
+        if self.ticks == STAR_SAMPLE_TICKS {
+            self.ticks = 0;
+            self.visible = if level > 0.5 {
+                let hidden = ((1.0 - level) * 2.0 * STAR_COUNT as f32).round_ties_even();
+                STAR_COUNT.saturating_sub(hidden as usize)
+            } else {
+                0
+            };
+        }
+    }
+}
+
 pub struct Session {
     pub game: GameState,
     pub world: WorldData,
@@ -23,6 +58,7 @@ pub struct Session {
     pub paused: bool,
     pub debug: bool,
     pub camera_x: f32,
+    stars: Option<Stars>,
     pub bag_bounce: f32,
     pub day_banner: Option<(u32, f32)>,
     /// Animator state for the monarch: current action and time in its clip.
@@ -110,6 +146,7 @@ impl Session {
     pub fn new(world: WorldData, island: usize, seed: u32, progress: Progress) -> Self {
         let game = GameState::start(&world, island, seed, &progress, None);
         let camera_x = game.monarch.x;
+        let stars = world.red_moon_preset().map(|_| Stars::default());
         let mut s = Session {
             game,
             world,
@@ -119,6 +156,7 @@ impl Session {
             paused: false,
             debug: false,
             camera_x,
+            stars,
             bag_bounce: 0.0,
             day_banner: None,
             anim: (Action::Stand, 0.0),
@@ -282,6 +320,7 @@ impl Session {
                 let seed = self.game.rng.next_u32();
                 let g = GameState::start(&self.world, 0, seed, &self.progress, None);
                 self.resume(g);
+                self.stars = self.stars.map(|_| Stars::default());
                 if let Some(t) = self.world.audio.sound("IntroSequence.introSoundTrack") {
                     self.music_cues.push(crate::sound::MusicCue::Play(t));
                 }
@@ -349,6 +388,7 @@ impl Session {
             self.game.look = look;
         }
         self.camera_x = self.game.monarch.x;
+        self.stars = self.stars.map(|_| Stars::default());
         self.won_for = 0.0;
         // orig: UnlockManager.Restore → AutoSave.
         if voyage.is_some() {
@@ -366,6 +406,24 @@ impl Session {
         self.step_ticks(raw, self.speed);
     }
 
+    /// The visible portion of the procedural star field.
+    pub fn visible_stars(&self) -> usize {
+        self.star_field().0
+    }
+
+    pub(crate) fn star_field(&self) -> (usize, f32) {
+        if let Some(stars) = self.stars {
+            return (stars.visible, 1.0);
+        }
+        // Worlds without the authored overlay retain continuously blended stars.
+        let level = self.game.blender.state.floats[game::lighting::float::STARS];
+        if level <= 0.004 {
+            (0, 0.0)
+        } else {
+            (STAR_COUNT, level)
+        }
+    }
+
     /// One frame that advances the simulation `ticks` times (a backend
     /// running slower than 60 fps catches up this way).
     pub fn step_ticks(&mut self, raw: RawInput, ticks: u32) {
@@ -381,6 +439,9 @@ impl Session {
             raw.bag_tap = false;
             self.events.clear();
             self.game.tick(&self.world, &controls, &mut self.events);
+            if let Some(stars) = &mut self.stars {
+                stars.step(self.game.blender.state.floats[game::lighting::float::STARS]);
+            }
             for e in &self.events {
                 crate::sound::on_event(
                     &self.world,
@@ -455,5 +516,131 @@ impl Session {
                 self.day_banner = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use game::data::{
+        DayDef, DirectorDef, LevelConfigDef, LightPreset, LIGHT_COLORS, LIGHT_FLOATS,
+    };
+    use game::greed::GreedEvent;
+    use game::lighting::float::STARS;
+
+    fn world() -> WorldData {
+        WorldData {
+            days: vec![DayDef {
+                name: "day".into(),
+                seasons: 7,
+                weathers: 1,
+                tracks: vec![],
+            }],
+            director: DirectorDef {
+                regular_days: vec![0],
+                boss_days: vec![0],
+                recovery_days: vec![0],
+                num_regular_days: (3, 4),
+                ..Default::default()
+            },
+            levels: vec![LevelConfigDef {
+                name: "island".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            steeds: vec![Default::default()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stars_sample_the_blend_every_five_active_seconds_and_keep_phase_on_load() {
+        let mut world = world();
+        world.lights.push(LightPreset {
+            name: "Red Moon".into(),
+            category: 0,
+            weather: 32,
+            season: 1,
+            part_of_day: 3,
+            test_only: false,
+            enabled: 0x0040_6c00,
+            colors: [[0.0, 0.0, 0.0, 1.0]; LIGHT_COLORS.len()],
+            floats: [0.0; LIGHT_FLOATS.len()],
+        });
+        let mut s = Session::new(world, 0, 1, Progress::default());
+        let input = RawInput::default();
+        let period = u32::from(STAR_SAMPLE_TICKS);
+        s.game.blender.state.floats[STARS] = 0.75;
+        s.step_ticks(input, period - 1);
+        assert_eq!(s.star_field(), (STAR_COUNT, 1.0));
+        s.paused = true;
+        s.step_ticks(input, period);
+        assert_eq!(s.star_field(), (STAR_COUNT, 1.0));
+        s.paused = false;
+        s.step_ticks(input, 1);
+        assert_eq!(s.star_field(), (STAR_COUNT / 2, 1.0));
+        s.game.blender.state.floats[STARS] = 0.5;
+        s.step_ticks(input, period - 1);
+        s.resume(s.game.clone());
+        assert_eq!(s.visible_stars(), STAR_COUNT / 2);
+        s.step_ticks(input, 1);
+        assert_eq!(s.visible_stars(), 0);
+    }
+
+    #[test]
+    fn stars_in_worlds_without_the_overlay_keep_continuous_opacity() {
+        let mut s = Session::new(world(), 0, 1, Progress::default());
+        assert_eq!(s.visible_stars(), 0);
+        s.game.blender.state.floats[STARS] = 0.4;
+        assert_eq!(s.star_field(), (STAR_COUNT, 0.4));
+    }
+
+    #[test]
+    fn wave_cue_fires_on_boss_admission_instead_of_portal_open() {
+        let mut world = world();
+        world
+            .audio
+            .refs
+            .push(("EnemyManager.enemiesSpawnedSound".into(), 0));
+        let mut s = Session::new(world, 0, 1, Progress::default());
+        for event in [GreedEvent::PortalOpened(1), GreedEvent::Retaliation] {
+            crate::sound::on_event(
+                &s.world,
+                &s.game,
+                &GameEvent::Greed(event),
+                &mut s.cues,
+                &mut s.music_cues,
+            );
+            assert!(s.cues.is_empty());
+        }
+        crate::sound::on_event(
+            &s.world,
+            &s.game,
+            &GameEvent::Greed(GreedEvent::BossWaveSpawned { portal: 1 }),
+            &mut s.cues,
+            &mut s.music_cues,
+        );
+        assert_eq!(
+            s.cues,
+            [crate::sound::Cue {
+                sound: 0,
+                x: None,
+                clip: None,
+            }]
+        );
     }
 }

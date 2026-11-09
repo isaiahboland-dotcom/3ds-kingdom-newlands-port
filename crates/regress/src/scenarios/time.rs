@@ -6,7 +6,7 @@ use game::state::TICK;
 use game::time::DayEvent;
 
 use super::island;
-use crate::scenario::{Area, Checks, Class, Scenario};
+use crate::scenario::{no_metrics, Area, Checks, Class, Scenario};
 use crate::script::Script;
 use crate::sim::Sim;
 use crate::tod::{self, LightSample};
@@ -157,7 +157,144 @@ fn check_lighting(s: &Sim, c: &mut Checks) {
 }
 
 pub fn scenarios() -> Vec<Scenario> {
-    vec![time_of_day_lighting(), day_night_cycle()]
+    vec![
+        time_of_day_lighting(),
+        day_night_cycle(),
+        boss_wave_red_moon(),
+    ]
+}
+
+fn red_moon_island(seed: u32) -> Sim {
+    use game::data::{LightPreset, PortalDef, Proto, WaveDef, LIGHT_COLORS, LIGHT_FLOATS};
+    use game::director::WaveKind;
+    use game::lighting::{color, float};
+    use game::time::DayCounter;
+
+    let mut world = worlds::lit_world();
+    // Keep the underlying stars constant even during the dawn transition,
+    // so the sampled value directly measures the overlay's fade.
+    for preset in &mut world.lights {
+        preset.floats[float::STARS] = 1.0;
+    }
+    let mut colors = [[0.0; 4]; LIGHT_COLORS.len()];
+    colors[color::MOON_TINT] = [0.6, 0.2, 0.1, 1.0];
+    world.lights.push(LightPreset {
+        name: "Red Moon".into(),
+        category: 0,
+        weather: 0,
+        season: 0,
+        part_of_day: 0,
+        test_only: false,
+        enabled: 0x0040_6c00,
+        colors,
+        floats: [0.0; LIGHT_FLOATS.len()],
+    });
+
+    let portal = world.protos.len() as u16;
+    world.protos.push(Proto {
+        name: "Portal".into(),
+        portal: Some(PortalDef {
+            cliff: false,
+            hit_points: 100,
+            by_arrows: true,
+            by_knights: true,
+            hit_box: (-1.0, 1.0, 0.0, 2.0),
+            defense_range: 0.0,
+            defense_delay: (0.0, 0.0),
+            defense_cooldown: 0.0,
+            rebuild_days: 0.0,
+            rift: None,
+        }),
+        ..Default::default()
+    });
+    world.waves.push(WaveDef {
+        boss_wave: true,
+        ..Default::default()
+    });
+    world.levels[0].waves[1] = [Some(0); 3];
+
+    let mut game = worlds::island(&world, seed, 0);
+    game.clock.time = 17.0;
+    game.days = DayCounter::new(&game.clock);
+    worlds::place(&mut game, &world, portal, 25.0, false);
+    game.greed.schedule(
+        &world,
+        &game.level,
+        0,
+        WaveKind::Boss,
+        game.season,
+        game.clock.day,
+        game.campfire,
+        game.borders,
+        &mut game.rng,
+    );
+    let mut sim = Sim::new(world, game);
+    sim.light_every = Some(1);
+    sim
+}
+
+fn check_red_moon(s: &Sim, c: &mut Checks) {
+    const OPEN: &str = "Greed.PortalOpened";
+    const ADMISSION: &str = "Greed.BossWaveSpawned";
+    const DAWN: &str = "Day.Started";
+    c.eq("opened portals", s.log.count(OPEN), 1);
+    c.eq("admitted boss waves", s.log.count(ADMISSION), 1);
+    c.eq("day starts", s.log.count(DAWN), 1);
+    c.that(s.game.greed.trolls.is_empty(), || {
+        "an empty boss wave spawned enemies".into()
+    });
+
+    let (Some(&open), Some(&admission), Some(&dawn)) = (
+        s.log.first.get(OPEN),
+        s.log.first.get(ADMISSION),
+        s.log.first.get(DAWN),
+    ) else {
+        return;
+    };
+    c.that(open < admission && admission + 660 < dawn, || {
+        format!("expected opening, full fade and then dawn, got {open}, {admission}, {dawn}")
+    });
+
+    for (label, tick, stars) in [
+        ("opening leaves stars alone", open, 1.0),
+        ("before admission", admission.saturating_sub(1), 1.0),
+        ("five seconds after admission", admission + 300, 0.5),
+        ("full overlay", admission + 660, 0.0),
+        ("overlay still active at dawn", dawn, 0.0),
+        ("five seconds after dawn", dawn + 300, 0.5),
+        ("overlay removed after dawn", dawn + 660, 1.0),
+    ] {
+        let sample = s.lights.iter().find(|sample| sample.tick == tick);
+        c.near(label, sample.map_or(f32::NAN, |l| l.stars), stars, 0.003);
+    }
+
+    let ambient = s
+        .lights
+        .iter()
+        .find(|sample| sample.tick == admission + 660)
+        .map_or(f32::NAN, |l| tod::luma(l.ambient) as f32);
+    c.near(
+        "boss overlay keeps night ambient",
+        ambient,
+        preset_luma(s, game::time::PartOfDay::Night) as f32,
+        1e-3,
+    );
+}
+
+fn boss_wave_red_moon() -> Scenario {
+    Scenario {
+        name: "boss_wave_red_moon",
+        area: Area::Time,
+        class: Class::Internal,
+        summary: "An admitted empty boss wave fades the stars out in ten seconds and dawn brings them back over ten seconds",
+        seed: 1,
+        setup: red_moon_island,
+        script: || Script::new().idle(135.0),
+        checkpoint_every: 30 * 60,
+        check: check_red_moon,
+        metrics: no_metrics,
+        known_issue: None,
+    }
 }
 
 fn time_of_day_lighting() -> Scenario {

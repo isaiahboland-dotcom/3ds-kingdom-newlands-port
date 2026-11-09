@@ -106,7 +106,7 @@ pub fn load_game(
         }
         postcard::from_bytes(&old)
     };
-    let g: GameState = if stored == VERSION {
+    let mut g: GameState = if stored == VERSION {
         postcard::from_bytes(body)
     } else {
         postcard::from_bytes(body)
@@ -117,6 +117,7 @@ pub fn load_game(
     if !g.ids_valid(world) {
         return Err(LoadError::Corrupt);
     }
+    g.blender.rebind_red_moon(world);
     Ok(g)
 }
 
