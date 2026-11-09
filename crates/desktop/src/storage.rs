@@ -31,8 +31,19 @@ impl Files {
 }
 
 impl platform::Storage for Files {
-    fn read(&self, slot: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.path(slot)).ok()
+    fn read(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+        let path = self.path(slot);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    // A dangling link is still an occupied slot.
+                    _ => Err(platform::ReadError),
+                }
+            }
+            Err(_) => Err(platform::ReadError),
+        }
     }
 
     fn write(&mut self, slot: &str, data: &[u8]) -> bool {

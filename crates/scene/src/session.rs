@@ -61,8 +61,10 @@ pub struct Session {
     pub music_cues: Vec<crate::sound::MusicCue>,
     /// The game slot saves go to (`save::game_slot`).
     pub slot: usize,
+    /// The active slot must be loaded successfully before this run may write to it.
+    active_slot_protected: bool,
     /// What each slot holds, read when the pause menu opens.
-    pub slots: [Option<SlotInfo>; save::SLOTS],
+    pub slots: [SlotState; save::SLOTS],
     /// The banner editor, open over the pause menu.
     pub editor: Option<crate::touch::Editor>,
     /// The corner notice for saving (see [`SaveNotice`]).
@@ -94,6 +96,20 @@ pub struct SlotInfo {
     pub island: String,
     pub day: u32,
     pub coins: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum SlotState {
+    #[default]
+    Empty,
+    Saved(SlotInfo),
+    Protected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SavedGameError {
+    Read,
+    Invalid(save::LoadError),
 }
 
 impl SaveNotice {
@@ -130,7 +146,8 @@ impl Session {
             cues: Vec::new(),
             music_cues: Vec::new(),
             slot: 0,
-            slots: [None, None, None],
+            active_slot_protected: false,
+            slots: Default::default(),
             water_camera: camera_x,
             world_id: 0,
             ended: None,
@@ -165,22 +182,29 @@ impl Session {
 
     /// orig: `PersistentManager.Save("AUTO")`. Returns false if it failed.
     pub fn save(&mut self) -> bool {
-        let written = self.write_save();
+        let written = self.write_save(self.slot);
         self.save_notice = written.map(SaveNotice::result);
         written.unwrap_or(true)
     }
 
     /// Writes the run: whether it worked, or `None` with nothing to save
     /// (saving off, or the run over).
-    fn write_save(&mut self) -> Option<bool> {
-        let st = self.storage.as_mut()?;
+    fn write_save(&mut self, slot: usize) -> Option<bool> {
+        self.storage.as_ref()?;
         if self.game.game_over || self.game.won {
             return None;
         }
+        if slot == self.slot && self.active_slot_protected {
+            return Some(false);
+        }
+        if self.read_game(slot).is_err() {
+            self.active_slot_protected |= slot == self.slot;
+            return Some(false);
+        }
         let bytes = save::save_game(&self.game, self.world_id);
+        let st = self.storage.as_mut()?;
         Some(
-            st.write(&save::game_slot(self.slot), &bytes)
-                && st.write(save::CURRENT_SLOT, &[self.slot as u8]),
+            st.write(&save::game_slot(slot), &bytes) && st.write(save::CURRENT_SLOT, &[slot as u8]),
         )
     }
 
@@ -188,7 +212,7 @@ impl Session {
     fn update_save_notice(&mut self, dt: f32) {
         self.save_notice = match self.save_notice {
             Some(SaveNotice::Saving(t, None)) => self
-                .write_save()
+                .write_save(self.slot)
                 .map(|ok| SaveNotice::Saving(t + dt, Some(ok))),
             Some(SaveNotice::Saving(t, Some(ok))) if t + dt < SAVING_MIN_TIME => {
                 Some(SaveNotice::Saving(t + dt, Some(ok)))
@@ -203,6 +227,8 @@ impl Session {
     /// The slot the last session used (stored with each save).
     pub fn last_slot(st: &dyn platform::Storage) -> usize {
         st.read(save::CURRENT_SLOT)
+            .ok()
+            .flatten()
             .and_then(|b| b.first().copied())
             .map_or(0, |b| (b as usize).min(save::SLOTS - 1))
     }
@@ -215,6 +241,13 @@ impl Session {
         } else {
             self.close_editor();
         }
+    }
+
+    /// Keep the active slot protected even if its file is repaired while the
+    /// current session still holds a different run.
+    pub fn protect_active_slot(&mut self) {
+        self.active_slot_protected = true;
+        self.set_paused(true);
     }
 
     /// Shows the coat of arms and monarch `look` on this island, and keeps
@@ -233,16 +266,53 @@ impl Session {
 
     fn write_progress(&mut self) {
         if let Some(st) = &mut self.storage {
-            st.write(save::UNLOCKS_SLOT, &save::save_progress(&self.progress));
+            if Self::read_progress(st.as_ref()).is_ok() {
+                st.write(save::UNLOCKS_SLOT, &save::save_progress(&self.progress));
+            }
         }
+    }
+
+    fn read_progress(st: &dyn Storage) -> Result<Option<Progress>, SavedGameError> {
+        st.read(save::UNLOCKS_SLOT)
+            .map_err(|_| SavedGameError::Read)?
+            .as_deref()
+            .map(save::load_progress)
+            .transpose()
+            .map_err(SavedGameError::Invalid)
+    }
+
+    pub fn saved_progress(st: &dyn Storage) -> Progress {
+        Self::read_progress(st).ok().flatten().unwrap_or_default()
+    }
+
+    pub fn saved_game(
+        st: &dyn Storage,
+        slot: usize,
+        world_id: u32,
+        world: &WorldData,
+    ) -> Result<Option<GameState>, SavedGameError> {
+        st.read(&save::game_slot(slot))
+            .map_err(|_| SavedGameError::Read)?
+            .as_deref()
+            .map(|bytes| save::load_game(bytes, world_id, world))
+            .transpose()
+            .map_err(SavedGameError::Invalid)
+    }
+
+    fn read_game(&self, slot: usize) -> Result<Option<GameState>, SavedGameError> {
+        self.storage.as_deref().map_or(Ok(None), |st| {
+            Self::saved_game(st, slot, self.world_id, &self.world)
+        })
     }
 
     fn read_slots(&mut self) {
         for i in 0..save::SLOTS {
-            self.slots[i] = self.storage.as_ref().and_then(|st| {
-                let g = save::load_game(&st.read(&save::game_slot(i))?, self.world_id, &self.world)
-                    .ok()?;
-                Some(SlotInfo {
+            if i == self.slot && self.active_slot_protected {
+                self.slots[i] = SlotState::Protected;
+                continue;
+            }
+            self.slots[i] = match self.read_game(i) {
+                Ok(Some(g)) => SlotState::Saved(SlotInfo {
                     island: self
                         .world
                         .levels
@@ -250,15 +320,26 @@ impl Session {
                         .map_or(String::new(), |l| l.name.clone()),
                     day: g.days.day,
                     coins: g.wallet.coins(),
-                })
-            });
+                }),
+                Ok(None) => SlotState::Empty,
+                Err(_) => SlotState::Protected,
+            };
+            if i == self.slot && self.slots[i] == SlotState::Protected {
+                self.active_slot_protected = true;
+            }
         }
     }
 
     /// Saves the run into slot `i`, which autosaves use from now on.
     pub fn save_to(&mut self, i: usize) -> bool {
-        self.slot = i.min(save::SLOTS - 1);
-        let ok = self.save();
+        let i = i.min(save::SLOTS - 1);
+        let written = self.write_save(i);
+        self.save_notice = written.map(SaveNotice::result);
+        let ok = written.unwrap_or(true);
+        if written == Some(true) || self.storage.is_none() {
+            self.slot = i;
+            self.active_slot_protected = false;
+        }
         self.read_slots();
         ok
     }
@@ -266,12 +347,16 @@ impl Session {
     /// Loads slot `i`, or starts a new game in it when it's empty. Unpauses.
     pub fn load_from(&mut self, i: usize) {
         let i = i.min(save::SLOTS - 1);
-        let saved = self
-            .storage
-            .as_ref()
-            .and_then(|st| st.read(&save::game_slot(i)))
-            .and_then(|b| save::load_game(&b, self.world_id, &self.world).ok());
+        let Ok(saved) = self.read_game(i) else {
+            if i == self.slot {
+                self.protect_active_slot();
+            } else {
+                self.set_paused(true);
+            }
+            return;
+        };
         self.slot = i;
+        self.active_slot_protected = false;
         self.map = None;
         self.ended = None;
         self.won_for = 0.0;
@@ -314,9 +399,12 @@ impl Session {
             won: g.won,
             t: 0.0,
         });
-        if let Some(st) = &mut self.storage {
-            st.write(save::UNLOCKS_SLOT, &save::save_progress(&self.progress));
-            if self.game.game_over {
+        self.write_progress();
+        if self.game.game_over
+            && !self.active_slot_protected
+            && matches!(self.read_game(self.slot), Ok(Some(_)))
+        {
+            if let Some(st) = &mut self.storage {
                 st.delete(&save::game_slot(self.slot));
             }
         }
@@ -455,5 +543,179 @@ impl Session {
                 self.day_banner = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod save_protection_tests {
+    use super::*;
+    use game::data::{DayDef, DirectorDef, LevelConfigDef};
+    use std::{
+        cell::RefCell,
+        collections::{BTreeMap, BTreeSet},
+        rc::Rc,
+    };
+
+    #[derive(Clone, Default)]
+    struct Memory(Rc<RefCell<Files>>);
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    struct Files {
+        bytes: BTreeMap<String, Vec<u8>>,
+        unreadable: BTreeSet<String>,
+    }
+
+    impl Storage for Memory {
+        fn read(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+            let files = self.0.borrow();
+            if files.unreadable.contains(slot) {
+                Err(platform::ReadError)
+            } else {
+                Ok(files.bytes.get(slot).cloned())
+            }
+        }
+
+        fn write(&mut self, slot: &str, data: &[u8]) -> bool {
+            self.0.borrow_mut().bytes.insert(slot.into(), data.to_vec());
+            true
+        }
+
+        fn delete(&mut self, slot: &str) {
+            self.0.borrow_mut().bytes.remove(slot);
+        }
+    }
+
+    fn session(storage: &Memory) -> Session {
+        let world = WorldData {
+            days: vec![DayDef {
+                name: "day".into(),
+                seasons: 7,
+                weathers: 1,
+                tracks: vec![],
+            }],
+            director: DirectorDef {
+                regular_days: vec![0],
+                boss_days: vec![0],
+                recovery_days: vec![0],
+                num_regular_days: (3, 4),
+                ..Default::default()
+            },
+            levels: vec![LevelConfigDef {
+                name: "island".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 5,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+            }],
+            steeds: vec![Default::default()],
+            ..Default::default()
+        };
+        let mut s = Session::new(world, 0, 17, Progress::default());
+        s.world_id = 42;
+        s.storage = Some(Box::new(storage.clone()));
+        s
+    }
+
+    #[test]
+    fn failed_load_protects_files_from_save_autosave_and_game_over() {
+        for (unreadable, wrong_world) in [(true, false), (false, true), (false, false)] {
+            let mut memory = Memory::default();
+            let mut s = session(&memory);
+            let data = if wrong_world {
+                save::save_game(&s.game, 7)
+            } else {
+                b"existing data".to_vec()
+            };
+            memory.write(save::GAME_SLOT, &data);
+            memory.write(save::CURRENT_SLOT, &[0]);
+            memory.write(save::UNLOCKS_SLOT, b"existing progress");
+            if unreadable {
+                memory
+                    .0
+                    .borrow_mut()
+                    .unreadable
+                    .insert(save::GAME_SLOT.into());
+            }
+            let before = memory.0.borrow().clone();
+            s.game.wallet.set(27);
+            let original_run = save::save_game(&s.game, s.world_id);
+
+            assert!(Session::saved_game(&memory, 0, s.world_id, &s.world).is_err());
+            s.load_from(0);
+            assert!(s.paused);
+            assert_eq!(s.slots[0], SlotState::Protected);
+            assert_eq!(save::save_game(&s.game, s.world_id), original_run);
+            assert!(!s.save());
+            s.save_notice = Some(SaveNotice::Saving(0.0, None));
+            s.step_ticks(RawInput::default(), 1);
+            assert!(matches!(
+                s.save_notice,
+                Some(SaveNotice::Saving(_, Some(false)))
+            ));
+            s.game.game_over = true;
+            s.end_run();
+            assert_eq!(*memory.0.borrow(), before);
+        }
+    }
+
+    #[test]
+    fn rejecting_another_slot_preserves_current_run_and_empty_slots_still_work() {
+        let mut memory = Memory::default();
+        let mut s = session(&memory);
+        s.game.wallet.set(27);
+        assert!(s.save());
+        memory.write(&save::game_slot(1), b"existing data");
+        let before = memory.0.borrow().clone();
+        s.load_from(1);
+        assert!(!s.save_to(1));
+        assert_eq!(s.slot, 0);
+        assert_eq!(s.game.wallet.coins(), 27);
+        assert_eq!(*memory.0.borrow(), before);
+
+        s.load_from(2);
+        assert!(!s.paused);
+        assert_eq!(s.slot, 2);
+        let saved = Session::saved_game(&memory, 2, s.world_id, &s.world)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.wallet.coins(), 5);
+        assert_eq!(Session::last_slot(&memory), 2);
+    }
+
+    #[test]
+    fn restored_active_file_requires_retry_before_save_or_delete() {
+        let mut memory = Memory::default();
+        let mut s = session(&memory);
+        s.game.wallet.set(27);
+        let restored = save::save_game(&s.game, s.world_id);
+        s.game.wallet.set(5);
+        memory.write(save::GAME_SLOT, b"existing data");
+        s.load_from(0);
+        memory.write(save::GAME_SLOT, &restored);
+
+        assert!(!s.save());
+        assert!(!s.save_to(0));
+        assert_eq!(s.slots[0], SlotState::Protected);
+        s.game.game_over = true;
+        s.end_run();
+        assert_eq!(memory.read(save::GAME_SLOT).unwrap(), Some(restored));
+
+        s.load_from(0);
+        assert!(!s.paused);
+        assert!(!s.game.game_over);
+        assert_eq!(s.game.wallet.coins(), 27);
+        assert!(s.save());
     }
 }
