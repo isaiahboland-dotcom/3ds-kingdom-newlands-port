@@ -167,6 +167,7 @@ Desktop development shortcuts include F1 for diagnostics, 1–4 for simulation s
 - `crates/platform`: platform traits.
 - `crates/scene`: shared rendering, UI, audio mixing, and session state.
 - `crates/desktop`: macroquad desktop backend.
+- `crates/regress`: headless gameplay regression and parity runner ([architecture](docs/regression/ARCHITECTURE.md)).
 - `crates/n3ds`: separately built 3DS backend.
 - `tools/extract`: local asset conversion and 3DS packaging helpers.
 - `build.sh`, `.example.env`: automated install.
@@ -177,10 +178,17 @@ Checks that do not require game files:
 ```sh
 cargo build --workspace --all-targets --locked
 cargo test --workspace --locked
+cargo run --release -p regress -- run --seeds 24 --tpf 1,2,3
 cargo clippy --workspace --all-targets --locked -- -D warnings
 shellcheck build.sh tools/setup.sh tools/cia/build.sh
 python3 tools/check_public_files.py
 ```
+
+The regression runner plays scripted scenarios (coins, paying, movement, building, day/night) on synthetic islands. It checks they're deterministic, unchanged by frame batching, consistent with blessed snapshots in `crates/regress/golden/`, and within tolerance of original-game reference values in `crates/regress/reference/`. Run it before and after an optimization: gameplay outcomes must not change. With your own converted assets you can also soak-test real islands (`regress soak --assets assets`), and record a desktop session with `--record bug.replay.toml` and replay it (`regress replay bug.replay.toml --assets assets`). Replays contain inputs only, but they're tied to your `world.bin`.
+
+Some reference values are measured from the original PC game with a local harness (`tools/orig-harness/`; numbers only, nothing from the game is committed). The port matches the measured monarch walk and gallop speeds and citizen walk and run speeds to four decimal places. These numbers come from the headless runner on desktop. Old 3DS numbers will be reported soon.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to run the parity and regression tests before and after a change.
 
 CI runs these checks and a separate 3DS build with an empty RomFS, which verifies compilation without distributing game data. An empty RomFS build cannot run the game.
 

@@ -1101,7 +1101,11 @@ impl<'a> Builder<'a> {
             torch_threshold: 0.5,
             ..Default::default()
         };
-        if let Some((node, f)) = inp.prefabs.values().find_map(|n| comp(n, "Fire").map(|f| (n, f))) {
+        if let Some((node, f)) = inp
+            .prefabs
+            .values()
+            .find_map(|n| comp(n, "Fire").map(|f| (n, f)))
+        {
             style.strength = keys(f, "sizeToStrengthCurve");
             style.intensity = keys(f, "intensityCurve");
             style.range = keys(f, "rangeCurve");
@@ -1109,16 +1113,23 @@ impl<'a> Builder<'a> {
             for c in node["children"].as_array().into_iter().flatten() {
                 if let Some(l) = comp(c, "Class108") {
                     let col = &l["m_Color"];
-                    style.light_color = ["r", "g", "b"].map(|k| col[k].as_f64().unwrap_or(1.0) as f32);
+                    style.light_color =
+                        ["r", "g", "b"].map(|k| col[k].as_f64().unwrap_or(1.0) as f32);
                 }
                 if let Some(sr) = comp(c, "SpriteRenderer") {
                     style.glow = self.sprite(sr.get("m_Sprite"));
                     let col = &sr["m_Color"];
-                    style.glow_color = ["r", "g", "b", "a"].map(|k| col[k].as_f64().unwrap_or(1.0) as f32);
+                    style.glow_color =
+                        ["r", "g", "b", "a"].map(|k| col[k].as_f64().unwrap_or(1.0) as f32);
                     style.glow_scale = vec3(&c["scale"])[0];
                 }
             }
-            for flame in f.get("flamePrefabs").and_then(Value::as_array).into_iter().flatten() {
+            for flame in f
+                .get("flamePrefabs")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 let Some(fnode) = asset_path(Some(flame)).and_then(|p| inp.prefabs.get(p)) else {
                     continue;
                 };
@@ -1165,7 +1176,8 @@ impl<'a> Builder<'a> {
         }
         // The material's maps: red and green channels of each.
         let load = |name: &str| -> Option<(u16, u16, Vec<[u8; 2]>)> {
-            let img = crate::sprites::Image::load_png(&inp.assets_dir.join("Texture2D").join(name)).ok()?;
+            let img = crate::sprites::Image::load_png(&inp.assets_dir.join("Texture2D").join(name))
+                .ok()?;
             let (iw, ih) = (img.w as usize, img.h as usize);
             // PNG rows run top-down; Unity's v runs bottom-up.
             let texels = (0..ih)

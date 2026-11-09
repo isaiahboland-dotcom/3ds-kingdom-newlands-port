@@ -11,8 +11,8 @@
 
 mod audio;
 mod gpu;
-mod storage;
 mod savefile;
+mod storage;
 
 use std::rc::Rc;
 

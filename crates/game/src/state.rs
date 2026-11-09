@@ -548,6 +548,12 @@ impl GameState {
         }
     }
 
+    /// Rebuild the payable list on the next tick: for tests and scenarios
+    /// that place objects with `level.add` after the island is generated.
+    pub fn mark_payables_dirty(&mut self) {
+        self.payables_dirty = true;
+    }
+
     /// Debug: finish every scaffold now.
     pub fn complete_construction(&mut self, world: &WorldData) {
         let building: Vec<u32> = self
@@ -1305,9 +1311,13 @@ impl GameState {
         }
 
         crate::prof::mark("pay");
+        // Sites finished this tick. Two builders can land the last stroke on
+        // the same site in one tick; it's built (and `started`) once.
+        let mut built_now: Vec<u32> = Vec::new();
         for id in build::step(world, &mut self.level, dt) {
             self.payables_dirty = true;
             self.started(world, id);
+            built_now.push(id);
             events.push(GameEvent::Built(id));
         }
         if self.level.objects.iter().any(|o| o.cooldown > 0.0) {
@@ -1556,7 +1566,8 @@ impl GameState {
                         .level
                         .index_of(id)
                         .is_some_and(|i| !build::under_construction(world, &self.level.objects[i]));
-                    if done {
+                    if done && !built_now.contains(&id) {
+                        built_now.push(id);
                         self.payables_dirty = true;
                         self.started(world, id);
                         events.push(GameEvent::Built(id));

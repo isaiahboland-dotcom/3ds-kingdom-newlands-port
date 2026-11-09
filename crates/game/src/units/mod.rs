@@ -21,6 +21,10 @@ use crate::rng::Rng;
 /// Ground deceleration when a character slows down: default physics
 /// material friction √(0.4 × 0.4) × gravity 15.
 const FRICTION_DECEL: f32 = 6.0;
+/// Unity's fixed physics step (`Time.fixedDeltaTime`, 50 Hz).
+const PHYSICS_STEP: f32 = 0.02;
+/// Citizens' `Rigidbody2D.linearDrag` (every citizen prefab).
+const CITIZEN_DRAG: f32 = 1.0;
 /// orig: `Mover.PositionEpsilon` / `RubberBandDist`.
 const POSITION_EPSILON: f32 = 0.0625;
 const RUBBER_BAND: f32 = 0.75;
@@ -188,6 +192,15 @@ pub fn random_outfit(role: Role, rng: &mut Rng) -> [f32; 3] {
 
 /// orig: `Mover`. Goal seeking slows near the goal; speeding up is instant,
 /// slowing down is friction.
+///
+/// For citizens ([`Mover::update_citizen`]) it follows what Box2D does to a
+/// `Rigidbody2D` with linear drag `d` on the default material, each 0.02 s
+/// physics step: gravity, then drag scales the velocity by 1/(1 + h·d),
+/// which also shrinks the normal impulse and so the friction limit, then
+/// friction takes 6·h off, then the body moves. `Mover.Update()` sets the
+/// speed back every frame, so a held speed `s` moves at (s − 6h)/(1 + hd),
+/// and a free one slows by (6 + d·v)/(1 + hd) per second. Measured in the
+/// original with a peasant: 0.6 → 0.4706, 1.4 → 1.2549 (trace fixtures).
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Mover {
@@ -233,12 +246,31 @@ impl Mover {
         self.set_speed(0.0, 0);
     }
 
+    /// The speed setting. orig: `Mover._moveSpeed`.
+    pub fn move_speed(&self) -> f32 {
+        self.move_speed
+    }
+
     /// orig: `Mover.Pause()`.
     pub fn pause(&mut self, t: f32) {
         self.pause = self.pause.max(t);
     }
 
+    /// Friction-only braking, no held-speed loss (things whose bodies
+    /// haven't been measured in the original yet).
     pub fn update(&mut self, x: &mut f32, dt: f32) {
+        self.step(x, dt, None);
+    }
+
+    /// A citizen's body: drag 1 on the default material, every physics
+    /// step modelled (see the type's docs).
+    pub fn update_citizen(&mut self, x: &mut f32, dt: f32) {
+        self.step(x, dt, Some(CITIZEN_DRAG));
+    }
+
+    /// `drag`: the body's `Rigidbody2D.linearDrag` when the physics step is
+    /// modelled.
+    fn step(&mut self, x: &mut f32, dt: f32, drag: Option<f32>) {
         let mut target = None;
         if self.pause > 0.0 {
             self.pause -= dt;
@@ -264,12 +296,25 @@ impl Mover {
                 // each tick saw-toothed across the walk/run threshold, and
                 // every switch restarted the clip (builders "stutter-stepped").
                 let floor = target.filter(|t| t * self.vx > 0.0).unwrap_or(0.0);
-                let step = FRICTION_DECEL * dt;
+                let step = match drag {
+                    Some(d) => (FRICTION_DECEL + d * self.vx.abs()) / (1.0 + PHYSICS_STEP * d) * dt,
+                    None => FRICTION_DECEL * dt,
+                };
                 self.vx = if self.vx > 0.0 {
                     (self.vx - step).max(floor)
                 } else {
                     (self.vx + step).min(floor)
                 };
+            }
+        }
+        // At the target, Mover is holding the speed: friction (and drag) take
+        // one physics step's worth off it before the body moves.
+        if let (Some(d), Some(t)) = (drag, target) {
+            if t != 0.0 && self.vx == t {
+                let moved =
+                    (t.abs() - FRICTION_DECEL * PHYSICS_STEP).max(0.0) / (1.0 + PHYSICS_STEP * d);
+                *x += moved * t.signum() * dt;
+                return;
             }
         }
         *x += self.vx * dt;
@@ -417,10 +462,7 @@ impl Unit {
             role,
             x,
             z: t.z + rng.value() * 0.01,
-            mover: Mover {
-                facing: 1,
-                ..Default::default()
-            },
+            mover: Mover::new(),
             coins: 0,
             skin: random_skin(rng),
             outfit: random_outfit(role, rng),
@@ -528,7 +570,10 @@ pub enum UnitEvent {
     Spawned(u32),
     BuildPoint(u32),
     /// A completed worker stroke, positioned before its target can disappear.
-    WorkSound { x: f32, tree: bool },
+    WorkSound {
+        x: f32,
+        tree: bool,
+    },
     TreeChopped(u32),
     PaidTaxes(u32),
     /// A farmer worked a field. orig: `Farmland.ReceiveFarming()`.
@@ -1184,7 +1229,7 @@ impl Population {
         u.inspired -= dt;
         if u.stunned > 0.0 {
             u.stunned -= dt;
-            u.mover.update(&mut u.x, dt);
+            u.mover.update_citizen(&mut u.x, dt);
             u.anim = Anim::Stunned;
             u.anim_t += dt;
             return None;
@@ -1233,7 +1278,7 @@ impl Population {
         if u.role == Role::Archer && !lead.is_some_and(|l| l.2) {
             archer_shoot(u, dt, ctx, lead.is_some(), rng, events);
             if u.shoot.is_some() {
-                u.mover.update(&mut u.x, dt);
+                u.mover.update_citizen(&mut u.x, dt);
                 if u.anim != Anim::Shoot {
                     u.anim = Anim::Shoot;
                     u.anim_t = 0.0;
@@ -1482,7 +1527,7 @@ impl Population {
         }
 
         // Movement, staying on the island.
-        u.mover.update(&mut u.x, dt);
+        u.mover.update_citizen(&mut u.x, dt);
         if level.width > 1.0 {
             u.x = u.x.clamp(level.left + 0.5, level.left + level.width - 0.5);
         }
@@ -1825,7 +1870,11 @@ impl Population {
                 continue;
             }
             // orig: ballista crews never flee, so they wind it at night too.
-            let (lo, hi) = if night_post(world, o) { (portal_lo, portal_hi) } else { (lo, hi) };
+            let (lo, hi) = if night_post(world, o) {
+                (portal_lo, portal_hi)
+            } else {
+                (lo, hi)
+            };
             if o.x <= lo || o.x >= hi {
                 continue;
             }
@@ -2430,7 +2479,10 @@ fn worker_work(
     }
     // A stroke finished. orig: Workable.FinishWork → OnWorkFinish.
     u.works_before_moving -= 1;
-    events(UnitEvent::WorkSound { x: u.x, tree: is_tree });
+    events(UnitEvent::WorkSound {
+        x: u.x,
+        tree: is_tree,
+    });
     if is_tree {
         let o = &mut level.objects[i];
         o.chops_left -= 1;
@@ -3052,6 +3104,26 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn citizens_lose_friction_and_drag_at_a_held_speed() {
+        for (setting, measured) in [(0.6, 0.4706), (1.4, 1.2549)] {
+            let mut m = Mover::new();
+            m.set_speed(setting, 1);
+            let mut x = 0.0;
+            for _ in 0..540 {
+                m.update_citizen(&mut x, 1.0 / 60.0);
+            }
+            assert_eq!(m.vx, setting, "Mover still asks for the setting");
+            assert!((x / 9.0 - measured).abs() < 1e-3, "{setting}: {}", x / 9.0);
+            // Let go: friction and drag stop it.
+            m.stop();
+            for _ in 0..60 {
+                m.update_citizen(&mut x, 1.0 / 60.0);
+            }
+            assert_eq!(m.vx, 0.0);
+        }
+    }
 
     #[test]
     fn free_archers_balance_after_recruitment_and_losses_without_taking_specialists() {

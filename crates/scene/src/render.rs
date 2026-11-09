@@ -132,7 +132,12 @@ pub trait Renderer {
         let mid = |a: f32, b: f32| (a + b) / 2.0;
         self.add(
             r,
-            Color::new(mid(top.r, bottom.r), mid(top.g, bottom.g), mid(top.b, bottom.b), mid(top.a, bottom.a)),
+            Color::new(
+                mid(top.r, bottom.r),
+                mid(top.g, bottom.g),
+                mid(top.b, bottom.b),
+                mid(top.a, bottom.a),
+            ),
         );
     }
     fn circle(&mut self, x: f32, y: f32, radius: f32, c: Color);

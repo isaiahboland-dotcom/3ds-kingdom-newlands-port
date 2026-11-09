@@ -14,7 +14,11 @@ fn main() {
             continue;
         }
         let s = &a.sounds[*id as usize];
-        let clips: Vec<&str> = s.clips.iter().map(|&c| a.clips[c as usize].name.as_str()).collect();
+        let clips: Vec<&str> = s
+            .clips
+            .iter()
+            .map(|&c| a.clips[c as usize].name.as_str())
+            .collect();
         println!(
             "{key} -> {} vol {:.2} spatial {:.1} {:?} loop {} max {} {:?}",
             s.name, s.volume, s.spatial, s.group, s.looping, s.max_distance, clips

@@ -50,7 +50,11 @@ fn main() {
             spilled += tick(&mut bag, def, &mut n, &mut rng);
             let now: Vec<_> = bag.coins.iter().map(|c| (px(c), c.angle)).collect();
             let m = now.iter().zip(&prev).filter(|(a, b)| a.0 != b.0).count();
-            let t = now.iter().zip(&prev).filter(|(a, b)| (a.1 - b.1).abs() > 0.5).count();
+            let t = now
+                .iter()
+                .zip(&prev)
+                .filter(|(a, b)| (a.1 - b.1).abs() > 0.5)
+                .count();
             moved += m;
             turned += t;
             frames_moving += (m + t > 0) as u32;

@@ -103,7 +103,10 @@ impl<R: Renderer> Ctx<'_, R> {
         if g.w as f32 > POINT_LIT_MAX_W {
             return tint;
         }
-        let centre = (at.0 - g.px + g.w as f32 / 2.0, at.1 - g.py + g.h as f32 / 2.0);
+        let centre = (
+            at.0 - g.px + g.w as f32 / 2.0,
+            at.1 - g.py + g.h as f32 / 2.0,
+        );
         let mut add = [0.0f32; 3];
         for l in &self.lights {
             let f = ((centre.0 - l.at.0).powi(2) + (centre.1 - l.at.1).powi(2)).sqrt() / l.range;
@@ -193,7 +196,6 @@ const POINT_LIGHT_K: f32 = 0.6;
 /// The ground's rough colour, for the light it throws back.
 const GROUND_ALBEDO: [f32; 3] = [0.22, 0.14, 0.09];
 
-
 /// Screen pixel of a world point in a layer with parallax `ratio`.
 pub fn layer_to_screen(s: &Session, x: f32, y: f32, ratio: f32) -> (f32, f32) {
     (
@@ -273,7 +275,11 @@ pub enum DrawItem {
     /// Someone standing on the boat's deck.
     Deckhand(usize),
     /// Fire `f` of object `o` (of the scenery when `scenery`).
-    Fire { o: usize, f: usize, scenery: bool },
+    Fire {
+        o: usize,
+        f: usize,
+        scenery: bool,
+    },
     /// The monarch's torch.
     Torch,
 }
@@ -343,7 +349,11 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
             let mut z = layer.z + o.z + part.z;
             // The ghost waits where the forest grows, so it's drawn just
             // behind the monarch rather than lost behind a trunk.
-            if g.tutorial.ghost.as_ref().is_some_and(|gh| gh.object == o.id) {
+            if g.tutorial
+                .ghost
+                .as_ref()
+                .is_some_and(|gh| gh.object == o.id)
+            {
                 z = MONARCH_Z - 0.02;
             }
             items.push((
@@ -489,7 +499,10 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
         .map(|(i, &(k, _))| (u128::from(sort_key(k)) << 32) | i as u128)
         .collect();
     order.sort_unstable();
-    order.into_iter().map(|o| items[o as u32 as usize]).collect()
+    order
+        .into_iter()
+        .map(|o| items[o as u32 as usize])
+        .collect()
 }
 
 /// `(sort layer, order, z)` as one integer in the same order: the sort
@@ -516,7 +529,13 @@ fn torch_lit(s: &Session) -> bool {
 }
 
 /// Draw items for an object's burning fires, above its own parts.
-fn push_fires(items: &mut Vec<((i16, i16, f32), DrawItem)>, s: &Session, o: &game::level::Object, oi: usize, scenery: bool) {
+fn push_fires(
+    items: &mut Vec<((i16, i16, f32), DrawItem)>,
+    s: &Session,
+    o: &game::level::Object,
+    oi: usize,
+    scenery: bool,
+) {
     let proto = &s.world.protos[o.proto as usize];
     if proto.fires.is_empty() {
         return;
@@ -546,7 +565,11 @@ fn fire_intensity(s: &Session, fire: &FireDef, seed: u32) -> (f32, f32, f32) {
         h as f32 / (1u32 << 23) as f32 * 2.0 - 1.0
     };
     let flicker = noise(k.floor()) + (noise(k.floor() + 1.0) - noise(k.floor())) * k.fract();
-    (strength, sample_keys(&st.intensity, strength) + flicker * 0.3 * dark, dark)
+    (
+        strength,
+        sample_keys(&st.intensity, strength) + flicker * 0.3 * dark,
+        dark,
+    )
 }
 
 /// A fire's point light. Every fire gets one, as on the PC's high quality
@@ -571,11 +594,20 @@ fn fire_light(s: &Session, at: (f32, f32), fire: &FireDef, seed: u32) -> Option<
 fn fire_item(s: &Session, item: &DrawItem) -> Option<((f32, f32), FireDef, u32)> {
     match *item {
         DrawItem::Fire { o, f, scenery } => {
-            let objs = if scenery { &s.game.level.scenery } else { &s.game.level.objects };
+            let objs = if scenery {
+                &s.game.level.scenery
+            } else {
+                &s.game.level.objects
+            };
             let o = &objs[o];
             let fire = s.world.protos[o.proto as usize].fires[f];
             let dir = if o.flip { -1.0 } else { 1.0 };
-            let at = layer_to_screen(s, o.x + dir * fire.at.0, o.y + fire.at.1, s.world.layer(o.layer).ratio);
+            let at = layer_to_screen(
+                s,
+                o.x + dir * fire.at.0,
+                o.y + fire.at.1,
+                s.world.layer(o.layer).ratio,
+            );
             Some((at, fire, o.id.wrapping_mul(7) + f as u32))
         }
         DrawItem::Torch => {
@@ -595,15 +627,16 @@ fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: 
     let s = c.s;
     let st = &s.world.fire;
     // The flame: the prefab nearest in size that has a sprite animation.
-    let flame = st
-        .flames
-        .iter()
-        .filter(|f| f.1.is_some())
-        .min_by(|a, b| {
-            let d = |f: &((f32, f32), Option<u16>)| (f.0 .0 - fire.size.0).powi(2) + (f.0 .1 - fire.size.1).powi(2);
-            d(a).total_cmp(&d(b))
-        });
-    if let Some(name) = flame.and_then(|f| f.1).map(|id| s.world.sprites[id as usize].as_str()) {
+    let flame = st.flames.iter().filter(|f| f.1.is_some()).min_by(|a, b| {
+        let d = |f: &((f32, f32), Option<u16>)| {
+            (f.0 .0 - fire.size.0).powi(2) + (f.0 .1 - fire.size.1).powi(2)
+        };
+        d(a).total_cmp(&d(b))
+    });
+    if let Some(name) = flame
+        .and_then(|f| f.1)
+        .map(|id| s.world.sprites[id as usize].as_str())
+    {
         if let Some(sp) = flame_clip(c, name, s.t + seed as f32 * 0.13) {
             c.r.sprite(sp, at, Draw::tint(WHITE).additive());
         }
@@ -684,7 +717,14 @@ fn draw_fire_reflection<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &Fire
     let y = screen_y(w.top) + 0.25 * PPU * w.reflection_scale;
     for i in 0..copies {
         let x = (at.0 + (i as f32 - (copies - 1) as f32 / 2.0) * 8.0).round();
-        c.r.sprite(sp, (x, y), Draw::tint(tint).angle(core::f32::consts::PI).flip(i % 2 == 1).additive());
+        c.r.sprite(
+            sp,
+            (x, y),
+            Draw::tint(tint)
+                .angle(core::f32::consts::PI)
+                .flip(i % 2 == 1)
+                .additive(),
+        );
     }
 }
 
@@ -694,7 +734,9 @@ const REFLECTED_LIGHT: [f32; 3] = [0.797, 0.597, 0.24];
 /// The animation for flame sprite `name` (`fire_small_burn_4` →
 /// `fire_small_burn`, `fire_mid_burn_7` → `fire_mid`).
 fn flame_clip<R: Renderer>(c: &Ctx<R>, name: &str, t: f32) -> Option<u32> {
-    let mut n = name.trim_end_matches(|ch: char| ch.is_ascii_digit()).trim_end_matches('_');
+    let mut n = name
+        .trim_end_matches(|ch: char| ch.is_ascii_digit())
+        .trim_end_matches('_');
     loop {
         if let Some(sp) = c.frame(n, t) {
             return Some(sp);
@@ -974,8 +1016,18 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
     // orig: Ghost's animator (ghost_King / ghost_Queen) and SpriteFX fade;
     // it's the last monarch (`PreviousPlayerModel`, `PreviousPlayerColor`),
     // in their color with a pale `ghostColor` for skin.
-    if let Some(gh) = s.game.tutorial.ghost.as_ref().filter(|gh| gh.object == o.id) {
-        let clip = if look.queen { "ghost_Queen" } else { "ghost_King" };
+    if let Some(gh) = s
+        .game
+        .tutorial
+        .ghost
+        .as_ref()
+        .filter(|gh| gh.object == o.id)
+    {
+        let clip = if look.queen {
+            "ghost_Queen"
+        } else {
+            "ghost_King"
+        };
         if let Some(id) = c.frame(clip, gh.anim_t) {
             sprite = id;
         }
@@ -1395,10 +1447,7 @@ fn draw_celestial_glow<R: Renderer>(c: &mut Ctx<R>, i: usize, j: usize) {
     c.r.sprite(
         sp,
         celestial_screen(s, i),
-        Draw::tint(tint)
-            .scale(g.scale)
-            .additive()
-            .smooth(),
+        Draw::tint(tint).scale(g.scale).additive().smooth(),
     );
 }
 
@@ -1421,15 +1470,15 @@ fn draw_stars<R: Renderer>(c: &mut Ctx<R>) {
         state
     };
     for _ in 0..STAR_COUNT {
-        let (x, y, kind, rate, phase) =
-            (next(), next(), next(), next(), next());
+        let (x, y, kind, rate, phase) = (next(), next(), next(), next(), next());
         let x = 1.0 + (x >> 8) as f32 / (1 << 24) as f32 * (W - 2.0);
         let y = 3.0 + (y >> 8) as f32 / (1 << 24) as f32 * (bottom - 3.0).max(1.0);
         let big = kind >> 24 < 6; // every sixth star is a brighter 2×2 one
         let size = if big { 2.0 } else { 1.0 };
         // A slow triangle wave per star, 0..1; the field dips gently in and
         // out rather than blinking in step.
-        let w = t * (0.4 + (rate >> 8) as f32 / (1 << 24) as f32 * 0.8) + (phase >> 8) as f32 / (1 << 24) as f32;
+        let w = t * (0.4 + (rate >> 8) as f32 / (1 << 24) as f32 * 0.8)
+            + (phase >> 8) as f32 / (1 << 24) as f32;
         let twinkle = 1.0 - (w - w.floor()).abs() * 0.35;
         let a = level * twinkle * if big { 1.0 } else { 0.7 };
         if a <= 0.004 {
@@ -1461,7 +1510,12 @@ fn draw_dog<R: Renderer>(c: &mut Ctx<R>) {
 
 /// Everything on the top screen.
 pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
-    let mut c = Ctx { s, sheet, r, lights: Vec::new() };
+    let mut c = Ctx {
+        s,
+        sheet,
+        r,
+        lights: Vec::new(),
+    };
     draw_world(&mut c);
     draw_overlays(&mut c);
 }
@@ -1619,7 +1673,11 @@ fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
     };
     let ramp_end = (horizon + full).min(H);
     if ramp_end > horizon {
-        c.r.gradient(Rect::new(0.0, horizon, W, ramp_end - horizon), base(mix(0.0)), base(mix(ramp_end - horizon)));
+        c.r.gradient(
+            Rect::new(0.0, horizon, W, ramp_end - horizon),
+            base(mix(0.0)),
+            base(mix(ramp_end - horizon)),
+        );
     }
     if ramp_end < H {
         c.r.rect(Rect::new(0.0, ramp_end, W, H - ramp_end), base(1.0));
@@ -1666,7 +1724,9 @@ fn centered<R: Renderer>(c: &mut Ctx<R>, text: &str, y: f32, size: f32) {
 /// Bottom-right: a spinning coin while saving, then the result, fading out.
 fn draw_save_notice<R: Renderer>(c: &mut Ctx<R>) {
     use crate::session::SaveNotice;
-    let Some(notice) = c.s.save_notice else { return };
+    let Some(notice) = c.s.save_notice else {
+        return;
+    };
     let (text, spin, left) = match notice {
         SaveNotice::Saving(..) => ("Saving", true, 1.0),
         SaveNotice::Saved(t) => ("Game saved", false, t),

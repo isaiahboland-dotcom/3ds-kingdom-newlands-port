@@ -25,20 +25,29 @@ GAME_EXTENSIONS = {
 # Binary files deliberately published after manual review (exact paths only).
 REVIEWED_BINARIES = {'banner/banner.webp'}
 
+# Our own C# (the original-game measurement harness), reviewed: allowed the
+# .cs/.csproj extension and Unity imports, but still checked for decompiler
+# and asset-ripper export markers (exact paths only).
+REVIEWED_SOURCES = {
+    'tools/orig-harness/plugin/Plugin.cs',
+    'tools/orig-harness/plugin/KingdomTrace.csproj',
+}
+
 
 def problem(name, data):
     path = Path(name)
     if name in REVIEWED_BINARIES:
         return None
-    if name.startswith(PRIVATE) or path.suffix.lower() in GAME_EXTENSIONS:
+    reviewed = name in REVIEWED_SOURCES
+    if name.startswith(PRIVATE) or (path.suffix.lower() in GAME_EXTENSIONS and not reviewed):
         return 'private game/tool/build path or asset extension'
     if b'\0' in data:
         return 'unexpected binary file'
     # Common signatures from ILSpy/AssetRipper script exports.
-    if any(marker in data for marker in (
-        b'// ' + b'Decompiled with', b'// ' + b'Assembly-CSharp, Version=',
-        b'using ' + b'UnityEngine;', b'using ' + b'UnityEngine\r',
-    )):
+    markers = [b'// ' + b'Decompiled with', b'// ' + b'Assembly-CSharp, Version=']
+    if not reviewed:
+        markers += [b'using ' + b'UnityEngine;', b'using ' + b'UnityEngine\r']
+    if any(marker in data for marker in markers):
         return 'possible decompiled Unity source'
     return None
 

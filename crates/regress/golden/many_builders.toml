@@ -1,0 +1,462 @@
+# Blessed by `cargo run -p regress -- run --bless`. Internal regression
+# baseline, not original-game evidence.
+[meta]
+schema = 1
+commit = "9f1ac79c3ba2-dirty"
+build = "1.2.0"
+profile = "release"
+platform = "x86_64-unknown-linux-gnu"
+fixture = "many_builders"
+world = "synthetic"
+island = 0
+seed = 7
+ticks_per_frame = 1
+ticks = 9000
+tick_seconds = 0.01666666753590107
+
+[[checkpoint]]
+version = 1
+tick = 600
+clock_day = 0
+day_shown = 1
+daytime = false
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 40
+has_crown = true
+game_over = false
+won = false
+clock_time = 4.999927520751953
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "925e182e64d1a2e7"
+event_hash = "dfc9ff769d4d0849"
+
+[checkpoint.events]
+"Unit.BuildPoint" = 59
+"Unit.WorkSound" = 59
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 1200
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 40
+has_crown = true
+game_over = false
+won = false
+clock_time = 5.999855041503906
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "5277a8e1ecba0dc9"
+event_hash = "e693240742fc8d37"
+
+[checkpoint.events]
+"Day.Started" = 1
+"Unit.BuildPoint" = 279
+"Unit.WorkSound" = 279
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 1800
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 37
+has_crown = true
+game_over = false
+won = false
+clock_time = 6.999782562255859
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "7367c13e65a156b4"
+event_hash = "cb575d0718c77ce1"
+
+[checkpoint.events]
+Built = 3
+"Day.Started" = 1
+"Unit.BuildPoint" = 558
+"Unit.WorkSound" = 558
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 2400
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 37
+has_crown = true
+game_over = false
+won = false
+clock_time = 7.9997100830078125
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "fb445acdc015e628"
+event_hash = "da6570d065c838b5"
+
+[checkpoint.events]
+Built = 3
+"Day.Started" = 1
+"Unit.BuildPoint" = 821
+"Unit.WorkSound" = 821
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 3000
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 35
+has_crown = true
+game_over = false
+won = false
+clock_time = 8.999923706054688
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "49b47d796ef27a56"
+event_hash = "6c822db84f032ab8"
+
+[checkpoint.events]
+Built = 5
+"Day.Started" = 1
+"Unit.BuildPoint" = 1104
+"Unit.WorkSound" = 1104
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 3600
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 29
+has_crown = true
+game_over = false
+won = false
+clock_time = 10.000137329101563
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "9d2981ee0ccd43de"
+event_hash = "ccb4c778344dfcfa"
+
+[checkpoint.events]
+Built = 11
+"Day.Started" = 1
+"Unit.BuildPoint" = 1349
+"Unit.WorkSound" = 1349
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 4200
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 19
+has_crown = true
+game_over = false
+won = false
+clock_time = 11.000350952148438
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "46d09c0705bd1ce2"
+event_hash = "83be3b3e531f8ef4"
+
+[checkpoint.events]
+Built = 21
+"Day.Started" = 1
+"Unit.BuildPoint" = 1506
+"Unit.WorkSound" = 1506
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 4800
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 15
+has_crown = true
+game_over = false
+won = false
+clock_time = 12.000564575195313
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "2ecd46bb25ae954c"
+event_hash = "74215cf64a73a694"
+
+[checkpoint.events]
+Built = 25
+"Day.Started" = 1
+"Unit.BuildPoint" = 1760
+"Unit.WorkSound" = 1760
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 5400
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 14
+has_crown = true
+game_over = false
+won = false
+clock_time = 13.000778198242188
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "1c6c5f17bb1c09e9"
+event_hash = "31f60f6b367b709a"
+
+[checkpoint.events]
+Built = 26
+"Day.Started" = 1
+"Unit.BuildPoint" = 2027
+"Unit.WorkSound" = 2027
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 6000
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 8
+has_crown = true
+game_over = false
+won = false
+clock_time = 14.000991821289063
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "74bfe825a74f0b3e"
+event_hash = "bba06a3d61613971"
+
+[checkpoint.events]
+Built = 32
+"Day.Started" = 1
+"Unit.BuildPoint" = 2278
+"Unit.WorkSound" = 2278
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 6600
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 2
+has_crown = true
+game_over = false
+won = false
+clock_time = 15.001205444335938
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "a08947b8cbff85af"
+event_hash = "cc218e938f04e4f5"
+
+[checkpoint.events]
+Built = 38
+"Day.Started" = 1
+"Unit.BuildPoint" = 2395
+"Unit.WorkSound" = 2395
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 7200
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 16.001419067382813
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "362d2a16023e8eae"
+event_hash = "77e7caf9940c9fa5"
+
+[checkpoint.events]
+Built = 40
+"Day.Started" = 1
+"Unit.BuildPoint" = 2400
+"Unit.WorkSound" = 2400
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 7800
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 17.001632690429688
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "60e75445383be5f0"
+event_hash = "77e7caf9940c9fa5"
+
+[checkpoint.events]
+Built = 40
+"Day.Started" = 1
+"Unit.BuildPoint" = 2400
+"Unit.WorkSound" = 2400
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 8400
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 18.001846313476563
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "67a0ad7efe063d04"
+event_hash = "77e7caf9940c9fa5"
+
+[checkpoint.events]
+Built = 40
+"Day.Started" = 1
+"Unit.BuildPoint" = 2400
+"Unit.WorkSound" = 2400
+"WaveDue.Regular" = 1
+
+[[checkpoint]]
+version = 1
+tick = 9000
+clock_day = 0
+day_shown = 1
+daytime = true
+season = "Summer"
+wallet = 0
+coins_live = 0
+coins_floating = 0
+coins_held = 0
+roles = [0, 0, 24, 0, 0, 0]
+objects = 40
+under_construction = 0
+has_crown = true
+game_over = false
+won = false
+clock_time = 19.002059936523438
+monarch_x = 0.0
+monarch_velocity = 0.0
+state_hash = "85e913e0885caa9d"
+event_hash = "77e7caf9940c9fa5"
+
+[checkpoint.events]
+Built = 40
+"Day.Started" = 1
+"Unit.BuildPoint" = 2400
+"Unit.WorkSound" = 2400
+"WaveDue.Regular" = 1
