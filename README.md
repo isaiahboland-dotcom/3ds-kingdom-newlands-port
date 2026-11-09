@@ -22,6 +22,34 @@ Experimental Stereoscopic 3D
 
 O3ds is supported although there can be some stuttering encountered when multiple farmers are giving you a lot of coins, and when many builders are at work. I am working on further optimizations with the help of AI
 
+## Screenshots
+
+> **Note:** In each comparison, the **left** image is this Rust engine running on PC and the **right** image is the original PC version of the game. We're still working to get as close to the base game as we can without sacrificing playability on the 3DS, so expect some visual differences.
+
+**Clear**
+
+![Clear season: Rust port (left) vs original PC game (right)](docs/images/compare-clear.png)
+
+**Dusty**
+
+![Dusty season: Rust port (left) vs original PC game (right)](docs/images/compare-dusty.png)
+
+**Fresh**
+
+![Fresh season: Rust port (left) vs original PC game (right)](docs/images/compare-fresh.png)
+
+**Bottom screen (3DS)**
+
+![3DS bottom screen showing the purse, time of day, stamina and camp compass](docs/images/bottomscreen.png)
+
+The bottom screen shows your coin purse and the current day. The top (yellow) bar is the time of day, the green bar is your stamina, and the compass below them points toward your camp.
+
+### How we check our work
+
+The comparison shots above come from the regression runner's time-of-day check (`regress tod`), which renders the port and the original at the same moments of the day so lighting differences are easy to spot.
+
+We check movement the same way. A small measurement harness (`tools/orig-harness/`) recorded the monarch's walk and gallop speeds and the citizens' walk and run speeds in the original PC game, using three seeds each. Only the numbers are saved, in `crates/regress/reference/`. The regression runner then plays the same movement in the port and fails if any speed drifts outside tolerance. Right now the port matches all four measured speeds to four decimal places. Because the runner is run before and after every optimization, a performance change can't quietly alter how the game plays.
+
 ## Installation
 
 There are two ways to build the game: the **automated install** (`build.sh`) installs every dependency and builds everything in one command, while the **manual install** lets you run each step yourself.

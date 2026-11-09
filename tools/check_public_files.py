@@ -23,7 +23,14 @@ GAME_EXTENSIONS = {
 }
 
 # Binary files deliberately published after manual review (exact paths only).
-REVIEWED_BINARIES = {'banner/banner.webp'}
+REVIEWED_BINARIES = {
+    'banner/banner.webp',
+    # README screenshots: port vs original comparisons and the 3DS bottom screen.
+    'docs/images/compare-clear.png',
+    'docs/images/compare-dusty.png',
+    'docs/images/compare-fresh.png',
+    'docs/images/bottomscreen.png',
+}
 
 # Our own C# (the original-game measurement harness), reviewed: allowed the
 # .cs/.csproj extension and Unity imports, but still checked for decompiler
