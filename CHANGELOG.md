@@ -1,9 +1,16 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 — 2026-11-08
 
 ### Added
 
+- 3DS debug overlay (tap SELECT): the first line now shows FPS averaged
+  over 30 frames, the lowest and highest readings, and the longest single
+  frame since the overlay was opened. Reopen it to reset them.
+- README: season comparison screenshots (Rust port on PC next to the
+  original PC game), the 3DS bottom screen, a recap of how the regression
+  runner checks lighting and movement speeds, and the first Old 3DS FPS
+  numbers (57.9 idle, about 26–35 in busy play, low 24.6, high 59.9).
 - `crates/regress`: a deterministic gameplay regression and parity
   framework (see `docs/regression/ARCHITECTURE.md`). It has a headless
   runner that drives `GameState` exactly as `Session` does, input scripts,
