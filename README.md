@@ -22,6 +22,19 @@ Experimental Stereoscopic 3D
 
 O3ds is supported although there can be some stuttering encountered when multiple farmers are giving you a lot of coins, and when many builders are at work. I am working on further optimizations with the help of AI
 
+### Performance on Old 3DS
+
+Measured on an Old 3DS XL during the first days of a new game:
+
+| | FPS |
+|---|---|
+| Idle | 57.9 |
+| Typical gameplay | about 26–35, depending on what's happening |
+| Lowest | 24.6 |
+| Highest | 59.9 |
+
+To see these numbers yourself, tap **SELECT** during gameplay to open the debug overlay. Its first line shows the current FPS (averaged over 30 frames), the lowest and highest readings, and the longest single frame since you opened it. Close and reopen the overlay to reset them. The overlay times each game system while it's open, so the numbers are slightly lower than normal play.
+
 ## Screenshots
 
 > **Note:** In each comparison, the **left** image is this Rust engine running on PC and the **right** image is the original PC version of the game. We're still working to get as close to the base game as we can without sacrificing playability on the 3DS, so expect some visual differences.
