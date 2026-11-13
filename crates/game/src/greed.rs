@@ -290,6 +290,212 @@ pub enum PortalPhase {
     },
 }
 
+/// The four states of the PC `portal.controller`. Gameplay Open/Closed is
+/// immediate; its visible opening/closing animation has its own saved clock.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortalVisualState {
+    Close,
+    Open,
+    Idle,
+    Destroy,
+}
+
+impl PortalVisualState {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Close => "Close",
+            Self::Open => "Open",
+            Self::Idle => "Idle",
+            Self::Destroy => "Destroy",
+        }
+    }
+
+    fn length(self) -> f32 {
+        match self {
+            Self::Close => 1.2,
+            Self::Open => 1.1000001,
+            Self::Idle => 2.0,
+            Self::Destroy => 1.6875,
+        }
+    }
+}
+
+/// The port implements this authored zero-blend graph, rather than silently
+/// treating every future Unity controller as having the same transition rules.
+pub fn validate_portal_graph(
+    library: &crate::animation::Library,
+) -> Result<(), alloc::string::String> {
+    use alloc::format;
+    if !library.controllers.iter().any(|c| c.name == "portal") {
+        return Ok(());
+    }
+    if library
+        .default_state("portal")
+        .is_none_or(|s| s.name != "Close")
+    {
+        return Err("unsupported portal default state".into());
+    }
+    for phase in [
+        PortalVisualState::Close,
+        PortalVisualState::Open,
+        PortalVisualState::Idle,
+        PortalVisualState::Destroy,
+    ] {
+        let state = phase.name();
+        let clip = library
+            .state_clip("portal", state)
+            .ok_or_else(|| format!("missing portal/{state} clip"))?;
+        let animator_state = library.state("portal", state).expect("state owns clip");
+        if !clip.validate()
+            || (clip.length - phase.length()).abs() > 1e-6
+            || clip.looping != (phase == PortalVisualState::Idle)
+            || animator_state.speed != 1.0
+            || animator_state.cycle_offset != 0.0
+            || animator_state.speed_parameter.is_some()
+        {
+            return Err(format!("unsupported portal/{state} clip timing"));
+        }
+    }
+    let transitions: Vec<_> = library
+        .transitions
+        .iter()
+        .filter(|t| t.controller == "portal")
+        .collect();
+    let expected = [
+        ("Close", "Open", Some("Open"), None),
+        ("Open", "Idle", None, Some(1.0)),
+        ("Destroy", "Open", Some("Open"), None),
+        ("Idle", "Destroy", Some("Destroy"), None),
+        ("Idle", "Close", Some("Close"), None),
+    ];
+    if transitions.len() != expected.len() {
+        return Err("unsupported portal transition graph".into());
+    }
+    for (from, to, trigger, exit) in expected {
+        let matches = transitions
+            .iter()
+            .filter(|t| t.from == from && t.to.as_deref() == Some(to))
+            .filter(|t| t.duration == 0.0 && t.offset == 0.0 && t.exit_time == exit)
+            .filter(|t| match trigger {
+                None => t.conditions.is_empty(),
+                Some(trigger) => {
+                    t.conditions.len() == 1
+                        && t.conditions[0].parameter == trigger
+                        && t.conditions[0].mode == 1
+                }
+            })
+            .count();
+        if matches != 1 {
+            return Err(format!("unsupported portal transition {from}->{to}"));
+        }
+    }
+    let idle: Vec<_> = transitions.iter().filter(|t| t.from == "Idle").collect();
+    if idle[0].to.as_deref() != Some("Destroy") {
+        return Err("unsupported portal trigger priority".into());
+    }
+    Ok(())
+}
+
+const PORTAL_OPEN: u8 = 1;
+const PORTAL_CLOSE: u8 = 2;
+const PORTAL_DESTROY: u8 = 4;
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PortalVisual {
+    pub object: u32,
+    pub state: PortalVisualState,
+    /// Clip seconds, including the state's speed, independent of global time.
+    pub elapsed: f32,
+    /// Unity trigger parameters remain set until a matching edge consumes them.
+    pub triggers: u8,
+}
+
+impl PortalVisual {
+    fn new(object: u32, phase: PortalPhase) -> Self {
+        let state = match phase {
+            PortalPhase::Closed => PortalVisualState::Close,
+            PortalPhase::Open => PortalVisualState::Idle,
+            PortalPhase::Crumbled { .. } | PortalPhase::Rebuilding { .. } => {
+                PortalVisualState::Destroy
+            }
+        };
+        Self {
+            object,
+            state,
+            elapsed: if state == PortalVisualState::Idle {
+                0.0
+            } else {
+                state.length()
+            },
+            triggers: 0,
+        }
+    }
+
+    fn trigger(&mut self, trigger: u8) {
+        self.triggers |= trigger;
+        self.consume_trigger();
+    }
+
+    fn consume_trigger(&mut self) {
+        // The authored graph has no AnyState transitions. A Close/Destroy
+        // requested during Open waits until Open reaches Idle. Idle's Destroy
+        // edge precedes Close. Every edge has zero duration and offset.
+        let next = match self.state {
+            PortalVisualState::Close | PortalVisualState::Destroy
+                if self.triggers & PORTAL_OPEN != 0 =>
+            {
+                Some((PORTAL_OPEN, PortalVisualState::Open))
+            }
+            PortalVisualState::Idle if self.triggers & PORTAL_DESTROY != 0 => {
+                Some((PORTAL_DESTROY, PortalVisualState::Destroy))
+            }
+            PortalVisualState::Idle if self.triggers & PORTAL_CLOSE != 0 => {
+                Some((PORTAL_CLOSE, PortalVisualState::Close))
+            }
+            _ => None,
+        };
+        if let Some((trigger, next)) = next {
+            self.triggers &= !trigger;
+            self.state = next;
+            self.elapsed = 0.0;
+        }
+    }
+
+    fn advance(&mut self, mut dt: f32) {
+        if !dt.is_finite() || dt < 0.0 {
+            return;
+        }
+        // At most three queued triggers plus Open's automatic exit can fire.
+        // A bounded loop also protects callers from malformed fixture data.
+        for _ in 0..8 {
+            let before = self.state;
+            self.consume_trigger();
+            if self.state != before {
+                continue;
+            }
+            let length = self.state.length();
+            if self.state == PortalVisualState::Open {
+                let remaining = (length - self.elapsed).max(0.0);
+                if dt >= remaining {
+                    dt -= remaining;
+                    self.state = PortalVisualState::Idle;
+                    self.elapsed = 0.0;
+                    continue;
+                }
+            }
+            self.elapsed += dt;
+            if self.state == PortalVisualState::Idle && length > 0.0 {
+                self.elapsed %= length;
+            } else {
+                self.elapsed = self.elapsed.min(length);
+            }
+            return;
+        }
+    }
+}
+
 /// orig: `Portal.SpawnCheck()` coroutine.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -397,6 +603,8 @@ pub struct Greed {
     retaliations_spawned: u32,
     /// orig: `Director._cliffsCurrentlyDestroyed`.
     cliffs_down: u32,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    portal_visuals: Vec<PortalVisual>,
 }
 
 /// A portal as the greed module sees it this tick.
@@ -437,6 +645,68 @@ pub struct GreedCtx<'a> {
 }
 
 impl Greed {
+    pub fn portal_animation(&self, object: u32) -> Option<(&'static str, f32)> {
+        self.portal_visuals
+            .iter()
+            .find(|v| v.object == object)
+            .map(|v| (v.state.name(), v.elapsed))
+    }
+
+    #[cfg(feature = "save")]
+    pub(crate) fn portal_visuals(&self) -> &[PortalVisual] {
+        &self.portal_visuals
+    }
+
+    #[cfg(feature = "save")]
+    pub(crate) fn restore_portal_visuals(
+        &mut self,
+        visuals: Vec<PortalVisual>,
+        world: &WorldData,
+        level: &Level,
+    ) -> bool {
+        if !visuals.iter().enumerate().all(|(i, v)| {
+            v.elapsed.is_finite()
+                && (0.0..=v.state.length()).contains(&v.elapsed)
+                && v.triggers & !(PORTAL_OPEN | PORTAL_CLOSE | PORTAL_DESTROY) == 0
+                && !visuals[..i].iter().any(|other| other.object == v.object)
+                && level.index_of(v.object).is_some_and(|index| {
+                    world
+                        .protos
+                        .get(level.objects[index].proto as usize)
+                        .is_some_and(|p| p.portal.is_some())
+                })
+        }) {
+            return false;
+        }
+        self.portal_visuals = visuals;
+        true
+    }
+
+    fn trigger_portal(&mut self, object: u32, phase: PortalPhase, trigger: u8) {
+        let visual =
+            if let Some(visual) = self.portal_visuals.iter_mut().find(|v| v.object == object) {
+                visual
+            } else {
+                self.portal_visuals.push(PortalVisual::new(object, phase));
+                self.portal_visuals.last_mut().expect("just pushed")
+            };
+        visual.trigger(trigger);
+    }
+
+    fn open_portal(&mut self, object: u32, events: &mut impl FnMut(GreedEvent)) {
+        let p = self.portal_mut(object);
+        if p.phase == PortalPhase::Closed {
+            p.phase = PortalPhase::Open;
+            self.trigger_portal(object, PortalPhase::Closed, PORTAL_OPEN);
+            events(GreedEvent::PortalOpened(object));
+        }
+    }
+
+    /// orig: `Portal.HandleOnReceiveHit` calls Open if the hit was survived.
+    pub(crate) fn portal_hit(&mut self, object: u32, events: &mut impl FnMut(GreedEvent)) {
+        self.open_portal(object, events);
+    }
+
     pub fn portals_in(world: &WorldData, level: &Level) -> Vec<(u32, f32)> {
         level
             .objects
@@ -481,6 +751,7 @@ impl Greed {
             return;
         }
         p.queue.clear();
+        let previous = p.phase;
         p.phase = if cliff {
             PortalPhase::Rebuilding {
                 left: rebuild_days * 24.0 * SECONDS_PER_HOUR,
@@ -488,6 +759,7 @@ impl Greed {
         } else {
             PortalPhase::Crumbled { t: 10.0 }
         };
+        self.trigger_portal(object, previous, PORTAL_DESTROY);
         events(GreedEvent::PortalDestroyed { object, cliff });
         if cliff {
             self.cliffs_down += 1;
@@ -510,13 +782,17 @@ impl Greed {
         self.next_wave += 1;
         let wave = self.next_wave;
         let p = self.portal_mut(portal);
-        if p.phase != PortalPhase::Open {
+        let previous = p.phase;
+        if previous != PortalPhase::Open {
             p.phase = PortalPhase::Open;
             p.next_in = 0.5;
         }
         p.interval = (15.0 / enemies.len() as f32).min(1.0);
         p.queue.extend(enemies.into_iter().map(|e| (e, wave, boss)));
         p.close_after = close_after;
+        if previous != PortalPhase::Open {
+            self.trigger_portal(portal, previous, PORTAL_OPEN);
+        }
     }
 
     /// orig: `Kingdom.ClosestSpawner(side, checkOtherSideIfNoneFound: true)`.
@@ -847,11 +1123,7 @@ impl Greed {
             if !s.opened && hours_now >= s.open_at {
                 self.scheduled[i].opened = true;
                 // orig: Portal.Open() only from Closed.
-                let p = self.portal_mut(s.portal);
-                if p.phase == PortalPhase::Closed {
-                    p.phase = PortalPhase::Open;
-                    events(GreedEvent::PortalOpened(s.portal));
-                }
+                self.open_portal(s.portal, &mut events);
             }
             if hours_now >= s.spawn_at {
                 self.scheduled.remove(i);
@@ -869,6 +1141,7 @@ impl Greed {
         self.update_portals(dt, ctx, rng, &mut events);
         // Portal spawn queues. orig: Portal.Update.
         let mut spawns: Vec<(EnemyKind, f32, u32, bool)> = Vec::new();
+        let mut closed = Vec::new();
         for p in &mut self.portals {
             if p.phase != PortalPhase::Open {
                 continue;
@@ -883,6 +1156,7 @@ impl Greed {
                         .any(|i| i.object == p.object && i.cliff);
                     if !cliff {
                         p.phase = PortalPhase::Closed;
+                        closed.push(p.object);
                     }
                 }
                 continue;
@@ -900,6 +1174,9 @@ impl Greed {
                 p.next_in = p.interval;
             }
         }
+        for object in closed {
+            self.trigger_portal(object, PortalPhase::Open, PORTAL_CLOSE);
+        }
         for (kind, x, wave, boss) in spawns {
             let id = self.spawn_troll(kind, x, wave, boss, rng);
             events(GreedEvent::Spawned(id));
@@ -910,6 +1187,13 @@ impl Greed {
         self.update_arrows(dt, ctx, &mut events);
         self.update_bolts(dt, &mut events);
         self.update_crown(dt);
+        self.portal_visuals.retain_mut(|visual| {
+            let active = level.index_of(visual.object).is_some();
+            if active {
+                visual.advance(dt);
+            }
+            active
+        });
     }
 
     fn portal_mut(&mut self, object: u32) -> &mut PortalState {
@@ -941,11 +1225,14 @@ impl Greed {
             self.portal_mut(info.object);
         }
         let mut defence: Vec<u32> = Vec::new();
+        let mut rebuilt = Vec::new();
         for p in &mut self.portals {
             match p.phase {
                 PortalPhase::Crumbled { t } => {
                     let t = t - dt;
                     if t <= 0.0 {
+                        self.portal_visuals
+                            .retain(|visual| visual.object != p.object);
                         events(GreedEvent::PortalRemoved(p.object));
                     }
                     p.phase = PortalPhase::Crumbled { t };
@@ -958,6 +1245,7 @@ impl Greed {
                         p.phase = PortalPhase::Open;
                         p.defense = Defense::Watch { t: 0.0 };
                         self.cliffs_down = self.cliffs_down.saturating_sub(1);
+                        rebuilt.push((p.object, PortalPhase::Rebuilding { left }));
                         events(GreedEvent::PortalRebuilt(p.object));
                     } else {
                         p.phase = PortalPhase::Rebuilding { left };
@@ -1004,6 +1292,9 @@ impl Greed {
                     }
                 }
             };
+        }
+        for (object, previous) in rebuilt {
+            self.trigger_portal(object, previous, PORTAL_OPEN);
         }
         // orig: Portal.SpawnDefenseWave: the season's defence wave, today's size.
         let s = season_index(ctx.season);
@@ -1700,6 +1991,244 @@ mod tests {
         Curve {
             keys: vec![[0.0, v, 0.0, 0.0], [100.0, v, 0.0, 0.0]],
         }
+    }
+
+    fn portal_fixture() -> (WorldData, Level, u32) {
+        use crate::data::{Layer, PortalDef, Proto};
+        let world = WorldData {
+            protos: vec![Proto {
+                portal: Some(PortalDef {
+                    cliff: false,
+                    hit_points: 100,
+                    by_arrows: true,
+                    by_knights: true,
+                    hit_box: (-1.0, 1.0, 0.0, 3.0),
+                    defense_range: 3.0,
+                    defense_delay: (2.0, 16.0),
+                    defense_cooldown: 6.0,
+                    rebuild_days: 3.0,
+                    rift: None,
+                }),
+                ..Default::default()
+            }],
+            levels: vec![LevelConfigDef {
+                name: "portal fixture".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            ..Default::default()
+        };
+        let mut level = Level::empty(-20.0, 200.0);
+        let id = level.add(crate::level::instantiate(
+            &world,
+            0,
+            Layer::Game,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+        ));
+        (world, level, id)
+    }
+
+    fn advance_portal(
+        g: &mut Greed,
+        w: &WorldData,
+        level: &Level,
+        id: u32,
+        dt: f32,
+        cliff: bool,
+    ) -> Vec<GreedEvent> {
+        let infos = [PortalInfo {
+            object: id,
+            x: 0.0,
+            hit_box: (-1.0, 1.0, 0.0, 3.0),
+            by_arrows: true,
+            defense_range: 3.0,
+            defense_delay: (2.0, 16.0),
+            defense_cooldown: 6.0,
+            cliff,
+        }];
+        let ctx = GreedCtx {
+            world: w,
+            level_index: 0,
+            campfire: 100.0,
+            borders: Borders {
+                left: 10.0,
+                right: 120.0,
+            },
+            monarch_x: 100.0,
+            monarch_has_crown: true,
+            targets: &[],
+            loot: &[],
+            portals: &[],
+            portal_infos: &infos,
+            threats: &[],
+            season: Season::Summer,
+            day: 0,
+            boat: false,
+        };
+        let mut events = vec![];
+        g.update(dt, 0.0, &ctx, level, &mut Rng::new(3), |e| events.push(e));
+        events
+    }
+
+    #[test]
+    fn portal_wave_open_close_waits_for_authored_exit_and_cliff_stays_open() {
+        let (world, level, id) = portal_fixture();
+        let mut g = Greed::default();
+        g.queue_wave(id, vec![EnemyKind::Troll], false, true);
+        assert!(g.portal_open(id), "gameplay opens immediately");
+        assert_eq!(g.portal_animation(id), Some(("Open", 0.0)));
+        advance_portal(&mut g, &world, &level, id, 0.6, false);
+        let before = g.portal_animation(id);
+        g.portal_hit(id, &mut |_| {});
+        assert_eq!(
+            g.portal_animation(id),
+            before,
+            "repeated Open must not restart"
+        );
+        advance_portal(&mut g, &world, &level, id, 0.1, false);
+        assert_eq!(g.portal_phase(id), PortalPhase::Closed);
+        assert_eq!(
+            g.portal_animation(id).unwrap().0,
+            "Open",
+            "Close trigger waits for Idle"
+        );
+        advance_portal(&mut g, &world, &level, id, 0.5, false);
+        let (state, time) = g.portal_animation(id).unwrap();
+        assert_eq!(state, "Close");
+        assert!(
+            (time - 0.1).abs() < 1e-6,
+            "catch-up carries time into closing: {time}"
+        );
+        advance_portal(&mut g, &world, &level, id, 10.0, false);
+        assert_eq!(g.portal_animation(id), Some(("Close", 1.2)));
+
+        let mut cliff = Greed::default();
+        cliff.queue_wave(id, vec![EnemyKind::Troll], false, true);
+        advance_portal(&mut cliff, &world, &level, id, 0.6, true);
+        advance_portal(&mut cliff, &world, &level, id, 0.6, true);
+        assert!(cliff.portal_open(id));
+        assert_eq!(cliff.portal_animation(id).unwrap().0, "Idle");
+    }
+
+    #[test]
+    fn portal_destroy_trigger_waits_during_open_then_rebuild_restarts_open() {
+        let (world, mut level, id) = portal_fixture();
+        let mut g = Greed::default();
+        g.portal_hit(id, &mut |_| {});
+        advance_portal(&mut g, &world, &level, id, 0.25, true);
+        g.portal_destroyed(id, true, 3.0, &mut |_| {});
+        assert_eq!(g.portal_animation(id), Some(("Open", 0.25)));
+        advance_portal(&mut g, &world, &level, id, 1.1, true);
+        let (state, time) = g.portal_animation(id).unwrap();
+        assert_eq!(state, "Destroy");
+        assert!((time - 0.25).abs() < 1e-6);
+        advance_portal(&mut g, &world, &level, id, 2.0, true);
+        assert_eq!(g.portal_animation(id), Some(("Destroy", 1.6875)));
+        g.portal_mut(id).phase = PortalPhase::Rebuilding { left: 0.01 };
+        let events = advance_portal(&mut g, &world, &level, id, 0.02, true);
+        assert_eq!(g.portal_animation(id), Some(("Open", 0.02)));
+        assert!(events.contains(&GreedEvent::PortalRebuilt(id)));
+        level.objects.clear();
+        advance_portal(&mut g, &world, &level, id, 0.1, true);
+        assert!(
+            g.portal_visuals.is_empty(),
+            "removed objects cannot leave clocks behind"
+        );
+
+        let mut closed = Greed::default();
+        closed.portal_destroyed(id, false, 0.0, &mut |_| {});
+        assert_eq!(
+            closed.portal_animation(id),
+            Some(("Close", 1.2)),
+            "the PC graph has no Destroy edge from Close"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "save")]
+    fn portal_clocks_round_trip_and_legacy_v5_remains_readable() {
+        let (mut world, _, _) = portal_fixture();
+        world.days.push(crate::data::DayDef {
+            name: "fixture".into(),
+            seasons: 7,
+            weathers: 1,
+            tracks: vec![],
+        });
+        world.steeds.push(Default::default());
+        world.director.regular_days.push(0);
+        world.director.boss_days.push(0);
+        world.director.recovery_days.push(0);
+        let mut game = crate::state::GameState::new(&world, 0, 3);
+        let id = game.level.add(crate::level::instantiate(
+            &world,
+            0,
+            crate::data::Layer::Game,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+        ));
+        let legacy = crate::save::save_game(&game, 73);
+        assert_eq!(
+            crate::save::save_game(&crate::save::load_game(&legacy, 73, &world).unwrap(), 73),
+            legacy
+        );
+
+        game.greed.portal_hit(id, &mut |_| {});
+        game.greed.portal_visuals[0].advance(0.4);
+        game.greed.portal_destroyed(id, true, 3.0, &mut |_| {});
+        let saved = crate::save::save_game(&game, 73);
+        let mut resumed = crate::save::load_game(&saved, 73, &world).unwrap();
+        assert_eq!(resumed.greed.portal_animation(id), Some(("Open", 0.4)));
+        assert_eq!(crate::save::save_game(&resumed, 73), saved);
+        resumed.greed.portal_visuals[0].advance(0.9);
+        let (state, time) = resumed.greed.portal_animation(id).unwrap();
+        assert_eq!(state, "Destroy");
+        assert!((time - 0.2).abs() < 1e-6);
+        assert!(matches!(
+            crate::save::load_game(&saved[..saved.len() - 1], 73, &world),
+            Err(crate::save::LoadError::Corrupt)
+        ));
+        let mut trailing = saved.clone();
+        trailing.push(0);
+        assert!(matches!(
+            crate::save::load_game(&trailing, 73, &world),
+            Err(crate::save::LoadError::Corrupt)
+        ));
+        let mut unknown = saved;
+        let tag = unknown
+            .windows(8)
+            .position(|bytes| &bytes[..8] == b"KNEXPORT")
+            .unwrap()
+            + 4;
+        unknown[tag..tag + 4].copy_from_slice(b"XXXX");
+        assert!(matches!(
+            crate::save::load_game(&unknown, 73, &world),
+            Err(crate::save::LoadError::Format)
+        ));
+        game.greed.portal_visuals[0].elapsed = f32::NAN;
+        let bad = crate::save::save_game(&game, 73);
+        assert!(matches!(
+            crate::save::load_game(&bad, 73, &world),
+            Err(crate::save::LoadError::Corrupt)
+        ));
     }
 
     #[test]

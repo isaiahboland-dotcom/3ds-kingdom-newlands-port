@@ -976,12 +976,15 @@ fn object_animation<'a>(
         },
         "portal" => {
             use game::greed::PortalPhase;
-            let (state, t) = match s.game.greed.portal_phase(o.id) {
-                PortalPhase::Open => ("Idle", scene_t),
-                PortalPhase::Closed => ("Close", f32::MAX),
-                PortalPhase::Crumbled { t } => ("Destroy", (10.0 - t).max(0.0)),
-                PortalPhase::Rebuilding { .. } => ("Destroy", f32::MAX),
-            };
+            let (state, t) = s.game.greed.portal_animation(o.id).unwrap_or_else(|| {
+                match s.game.greed.portal_phase(o.id) {
+                    PortalPhase::Open => ("Idle", scene_t),
+                    PortalPhase::Closed => ("Close", f32::MAX),
+                    PortalPhase::Crumbled { .. } | PortalPhase::Rebuilding { .. } => {
+                        ("Destroy", f32::MAX)
+                    }
+                }
+            });
             (library.state(controller, state)?, t)
         }
         "boat_sail" => {

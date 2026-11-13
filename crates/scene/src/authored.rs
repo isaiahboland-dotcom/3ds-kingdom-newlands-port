@@ -242,6 +242,7 @@ impl AssetAnimation {
         {
             return Err("animation data contains an invalid clip or sprite reference".into());
         }
+        game::greed::validate_portal_graph(&self.clips)?;
         Ok(())
     }
 }

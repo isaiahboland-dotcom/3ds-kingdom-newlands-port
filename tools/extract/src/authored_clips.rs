@@ -525,6 +525,7 @@ pub fn extract(
     if !library.validate() {
         return Err("invalid authored clip or controller data".into());
     }
+    game::greed::validate_portal_graph(&library)?;
     println!(
         "authored animation: {} clips, {} sprite keys ({} null), {} scalar keys, {} markers, {} states, {} transitions, {} clip aliases",
         library.clips.len(),
@@ -549,6 +550,78 @@ pub fn extract(
 mod tests {
     use super::*;
     use game::animation::Pose;
+
+    #[test]
+    fn portal_graph_gate_rejects_missing_clips_blends_and_changed_trigger_rules() {
+        let mut library = Library::default();
+        library.controllers.push(Controller {
+            name: "portal".into(),
+            default_state: Some("Close".into()),
+        });
+        for (state, length) in [
+            ("Close", 1.2),
+            ("Open", 1.1000001),
+            ("Idle", 2.0),
+            ("Destroy", 1.6875),
+        ] {
+            library.clips.push((
+                state.into(),
+                game::animation::Clip {
+                    length,
+                    looping: state == "Idle",
+                    ..Default::default()
+                },
+            ));
+            library.states.push(AnimatorState {
+                controller: "portal".into(),
+                name: state.into(),
+                clip: Some(state.into()),
+                speed: 1.0,
+                ..Default::default()
+            });
+        }
+        for (from, to, trigger, exit) in [
+            ("Close", "Open", Some("Open"), None),
+            ("Open", "Idle", None, Some(1.0)),
+            ("Destroy", "Open", Some("Open"), None),
+            ("Idle", "Destroy", Some("Destroy"), None),
+            ("Idle", "Close", Some("Close"), None),
+        ] {
+            library.transitions.push(AnimatorTransition {
+                controller: "portal".into(),
+                from: from.into(),
+                to: Some(to.into()),
+                conditions: trigger
+                    .into_iter()
+                    .map(|p| Condition {
+                        parameter: p.into(),
+                        mode: 1,
+                        threshold: 0.0,
+                    })
+                    .collect(),
+                exit_time: exit,
+                duration: 0.0,
+                fixed_duration: true,
+                offset: 0.0,
+            });
+        }
+        assert!(game::greed::validate_portal_graph(&library).is_ok());
+        let mut bad = library.clone();
+        bad.clips.remove(0);
+        assert!(game::greed::validate_portal_graph(&bad).is_err());
+        let mut bad = library.clone();
+        bad.transitions[0].duration = 0.25;
+        assert!(game::greed::validate_portal_graph(&bad).is_err());
+        let mut bad = library.clone();
+        bad.transitions[0].conditions[0].parameter = "Destroy".into();
+        assert!(game::greed::validate_portal_graph(&bad).is_err());
+        let mut bad = library.clone();
+        bad.transitions.swap(3, 4);
+        assert!(game::greed::validate_portal_graph(&bad).is_err());
+        let mut bad = library;
+        bad.transitions[1].offset = 0.5;
+        assert!(game::greed::validate_portal_graph(&bad).is_err());
+    }
 
     const CLIP: &str = "AnimationClip:
   m_Name: test

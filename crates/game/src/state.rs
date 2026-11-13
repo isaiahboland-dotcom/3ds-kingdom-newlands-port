@@ -2238,6 +2238,8 @@ impl GameState {
         }
         self.level.objects[i].hp -= damage;
         if self.level.objects[i].hp > 0 {
+            self.greed
+                .portal_hit(object, &mut |event| events.push(GameEvent::Greed(event)));
             return;
         }
         let mut out = Vec::new();
