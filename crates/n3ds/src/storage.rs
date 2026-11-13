@@ -24,6 +24,18 @@ impl platform::Storage for SdCard {
         }
     }
 
+    fn read_backup(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+        match crate::savefile::read_backup(std::path::Path::new(&Self::path(slot))) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(platform::ReadError),
+        }
+    }
+
+    fn restore_backup(&mut self, slot: &str) -> bool {
+        crate::savefile::restore_backup(std::path::Path::new(&Self::path(slot))).is_ok()
+    }
+
     fn write(&mut self, slot: &str, data: &[u8]) -> bool {
         crate::savefile::write(std::path::Path::new(&Self::path(slot)), data).is_ok()
     }
@@ -33,5 +45,6 @@ impl platform::Storage for SdCard {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}.bak"));
         let _ = std::fs::remove_file(format!("{path}.tmp"));
+        let _ = std::fs::remove_file(format!("{path}.bad"));
     }
 }

@@ -7,6 +7,7 @@ pub mod adpcm;
 pub mod clipfile;
 pub mod heraldry;
 pub mod render;
+pub mod saves;
 pub mod session;
 pub mod sheet;
 pub mod sound;
