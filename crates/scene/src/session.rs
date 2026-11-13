@@ -23,6 +23,9 @@ pub struct Session {
     pub paused: bool,
     pub debug: bool,
     pub camera_x: f32,
+    pub clouds: crate::clouds::Clouds,
+    pub cloud_defs: Option<crate::cloud_data::CloudsDef>,
+    pub atmosphere: Option<crate::atmosphere_data::AtmosphereDef>,
     pub bag_bounce: f32,
     pub day_banner: Option<(u32, f32)>,
     /// Animator state for the monarch: current action and time in its clip.
@@ -119,6 +122,9 @@ impl Session {
             paused: false,
             debug: false,
             camera_x,
+            clouds: crate::clouds::Clouds::new(seed, camera_x),
+            cloud_defs: None,
+            atmosphere: None,
             bag_bounce: 0.0,
             day_banner: None,
             anim: (Action::Stand, 0.0),
@@ -160,6 +166,7 @@ impl Session {
         }
         self.camera_x = self.game.monarch.x;
         self.water_camera = self.camera_x;
+        self.clouds = crate::clouds::Clouds::new(self.game.rng.clone().next_u32(), self.camera_x);
         self.music_cues.clear();
     }
 
@@ -349,6 +356,7 @@ impl Session {
             self.game.look = look;
         }
         self.camera_x = self.game.monarch.x;
+        self.clouds = crate::clouds::Clouds::new(seed, self.camera_x);
         self.won_for = 0.0;
         // orig: UnlockManager.Restore → AutoSave.
         if voyage.is_some() {
@@ -376,7 +384,7 @@ impl Session {
         let (mut saves, mut ended, mut tutorial) = (false, false, false);
         let mut raw = raw;
         self.game.god = self.god;
-        for _ in 0..ticks {
+        for frame_tick in 0..ticks {
             let controls = self.mapper.map(TICK, raw);
             raw.bag_tap = false;
             self.events.clear();
@@ -412,6 +420,22 @@ impl Session {
                 (action, 0.0)
             };
             self.t += TICK;
+            if self.cloud_defs.is_some() || self.atmosphere.is_some() {
+                let target = self.game.teleports.exit.map_or(
+                    self.game.monarch.x + self.game.monarch.velocity * 0.5,
+                    |e| e.x,
+                );
+                let camera = self.camera_x
+                    + (target - self.camera_x)
+                        * (1.0 - (-4.0 * TICK * (frame_tick + 1) as f32).exp());
+                self.clouds.step(
+                    self.cloud_defs.as_ref(),
+                    self.atmosphere.as_ref(),
+                    &self.game.blender.state,
+                    TICK,
+                    camera,
+                );
+            }
         }
         // orig: MainCamera follows the monarch with a lead; plain follow for now.
         // orig: MainCamera follows the teleporter exit while it flies.

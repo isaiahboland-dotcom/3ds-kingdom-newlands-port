@@ -3,7 +3,9 @@
 //! by index. Desktop reads `tools/extract`'s JSON; the 3DS reads the packed
 //! `sheet.bin` that `pack3ds` writes (with recolour masks split out).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use crate::cloud_mesh::{CloudMesh, CloudMeshes};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use serde::{Deserialize, Serialize};
@@ -142,7 +144,13 @@ pub struct Sheet {
     pub names: Vec<String>,
     pub clips: Vec<(String, Clip)>,
     #[serde(skip)]
+    authored: Option<crate::authored::AssetAnimation>,
+    #[serde(skip)]
+    pub reflections: Option<crate::reflection_data::ReflectionParts>,
+    #[serde(skip)]
     index: Map<String, u32>,
+    #[serde(skip)]
+    cloud_meshes: Map<u32, CloudMesh>,
     #[serde(skip)]
     clip_index: Map<String, usize>,
     /// `WorldData::sprites` id → sprite here.
@@ -153,6 +161,36 @@ pub struct Sheet {
 }
 
 impl Sheet {
+    /// Installs optional presentation data after linking the legacy sheet.
+    pub fn install_authored(
+        &mut self,
+        bytes: &[u8],
+        world_id: u32,
+        world: &game::data::WorldData,
+    ) -> Result<(), String> {
+        self.authored = None;
+        let authored = crate::authored::AssetAnimation::decode(bytes, world_id)?;
+        authored.validate(world, self)?;
+        self.authored = Some(authored);
+        Ok(())
+    }
+
+    pub fn authored(&self) -> Option<&crate::authored::AssetAnimation> {
+        self.authored.as_ref()
+    }
+
+    /// An authored frame can explicitly hide its renderer. With no authored
+    /// track, fall back to the packed clip as before.
+    pub(crate) fn frame(&self, clip: &str, path: &str, time: f32) -> Option<Option<u32>> {
+        if let Some(frame) = self
+            .authored()
+            .and_then(|a| a.clips.clip(clip))
+            .and_then(|clip| clip.sprite_frame(path, time))
+        {
+            return Some(frame.and_then(|name| self.id(name)));
+        }
+        self.clip(clip)?.sprite(path, time).map(Some)
+    }
     /// Checks references in JSON and packed sheets before rendering.
     pub fn validate(&self) -> Result<(), String> {
         let valid = |id: u32| (id as usize) < self.sprites.len();
@@ -196,6 +234,36 @@ impl Sheet {
             .map(|n| self.index.get(n).copied())
             .collect();
         self.glyph_index = self.font.glyphs.iter().map(|g| (g.0, (g.1, g.2))).collect();
+    }
+
+    /// Link the entire cloud geometry set, keeping the old geometry on error.
+    pub fn link_cloud_meshes(
+        &mut self,
+        names: &[String],
+        world_id: u32,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let meshes = CloudMeshes::decode(bytes, world_id)?;
+        let mut expected: HashSet<_> = names.iter().map(String::as_str).collect();
+        let mut linked = Map::default();
+        for (name, mesh) in meshes.entries {
+            let id = self
+                .id(&name)
+                .filter(|_| expected.remove(name.as_str()))
+                .ok_or_else(|| format!("unexpected cloud mesh sprite {name}"))?;
+            if !mesh.valid_for(self.get(id)) || linked.insert(id, mesh).is_some() {
+                return Err(format!("invalid cloud mesh geometry for {name}"));
+            }
+        }
+        if !expected.is_empty() {
+            return Err("cloud mesh data does not cover all authored variants".into());
+        }
+        self.cloud_meshes = linked;
+        Ok(())
+    }
+
+    pub fn cloud_mesh(&self, id: u32) -> Option<&CloudMesh> {
+        self.cloud_meshes.get(&id)
     }
 
     /// A character's sprite (none for spaces) and advance.
