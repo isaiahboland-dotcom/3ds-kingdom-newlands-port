@@ -110,6 +110,7 @@ pub fn on_event(
         },
         GameEvent::Coin(c) => match c {
             CoinEvent::HitGround => cue(w.audio.sound("Coin.hitGroundSound"), monarch),
+            CoinEvent::HitGroundAt { x } => cue(w.audio.sound("Coin.hitGroundSound"), Some(x)),
             CoinEvent::PickedUp(Who::Unit(u)) => {
                 cue(w.audio.sound("Wallet.pickupSound"), unit_x(g, u))
             }
@@ -694,6 +695,108 @@ fn forest_weight(g: &GameState, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_world() -> WorldData {
+        use game::data::{DayDef, DirectorDef, LevelConfigDef};
+        WorldData {
+            days: vec![DayDef {
+                name: "day".into(),
+                seasons: 7,
+                weathers: 1,
+                tracks: vec![],
+            }],
+            director: DirectorDef {
+                regular_days: vec![0],
+                boss_days: vec![0],
+                recovery_days: vec![0],
+                num_regular_days: (3, 4),
+                ..Default::default()
+            },
+            levels: vec![LevelConfigDef {
+                name: "island".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            steeds: vec![Default::default()],
+            ..Default::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct MixerLog {
+        plays: Vec<(AudioClipId, f32, f32)>,
+    }
+    impl Mixer for MixerLog {
+        fn play(&mut self, clip: AudioClipId, gain: f32, pan: f32, _: bool) -> Option<Voice> {
+            self.plays.push((clip, gain, pan));
+            Some(self.plays.len() as Voice)
+        }
+        fn set(&mut self, _: Voice, _: f32, _: f32) {}
+        fn stop(&mut self, _: Voice) {}
+        fn playing(&self, _: Voice) -> bool {
+            true
+        }
+        fn pause(&mut self, _: bool) {}
+    }
+
+    #[test]
+    fn coin_impact_uses_event_position_for_symmetric_pan_and_distant_silence() {
+        let mut world = test_world();
+        world.audio.refs.push(("Coin.hitGroundSound".into(), 0));
+        world.audio.sounds.push(SoundDef {
+            clips: vec![0],
+            volume: 1.0,
+            spatial: 1.0,
+            min_distance: 1.0,
+            max_distance: 10.0,
+            max_simultaneous: 8,
+            ..Default::default()
+        });
+        let mut game = GameState::new(&world, 0, 1);
+        game.monarch.x = 0.0;
+        let mut player = Player::new(&world);
+        let mut mixer = MixerLog::default();
+        for x in [-30.0, -5.0, 5.0, 30.0] {
+            game.coins.drop(
+                Who::Unit(9),
+                (x, 0.01),
+                (0.0, -1.0),
+                game::coins::Policy::Nobody,
+                None,
+                None,
+            );
+            let mut events = Vec::new();
+            game.coins
+                .update(game::state::TICK, &[], |e| events.push(GameEvent::Coin(e)));
+            game.coins.list.clear(); // no entity lookup can supply its position now
+            let mut cues = Vec::new();
+            for event in events {
+                on_event(&world, &game, &event, &mut cues, &mut Vec::new());
+            }
+            assert_eq!(cues.len(), 1);
+            assert_eq!(cues[0].x, Some(x));
+            player.start(&world, &mut mixer, cues[0], 0.0);
+        }
+        assert_eq!(mixer.plays.len(), 2);
+        assert!(mixer.plays[0].1 > 0.0);
+        assert_eq!(mixer.plays[0].1, mixer.plays[1].1);
+        assert_eq!(mixer.plays[0].2, -mixer.plays[1].2);
+        assert!(mixer.plays[0].2 < 0.0);
+    }
+
     #[test]
     fn positioned_worker_strokes_fade_out_at_the_emitters_range() {
         let player = Player::new(&WorldData::default());
