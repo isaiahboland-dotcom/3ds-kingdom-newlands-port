@@ -4,6 +4,9 @@
 
 ### Added
 
+- Render the authored stratus and cumulus decks with weather density, wind,
+  parallax, and red-moon color channels when an enhanced pack is installed.
+
 - Extract and draw authored sprite transforms and animation curves from an
   optional animation pack extension. Existing world data, sheets, and
   saves keep their formats.

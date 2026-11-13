@@ -28,6 +28,8 @@ pub struct Assets {
     additive: Material,
     /// Water reflections (see `REFLECT_FS`).
     reflect: Material,
+    cloud: Option<Material>,
+    pub cloud_defs: Option<::scene::cloud_data::CloudsDef>,
     /// The previous frame's top screen, for `reflect`.
     pub previous: Option<Texture2D>,
 }
@@ -62,6 +64,19 @@ varying vec4 color;
 uniform sampler2D Texture;
 void main() {
     gl_FragColor = texture2D(Texture, uv) * color;
+}
+"#;
+
+const CLOUD_FS: &str = r#"#version 100
+precision lowp float;
+varying vec2 uv;
+varying vec4 color;
+uniform sampler2D Texture;
+uniform vec4 CloudLight;
+void main() {
+    vec4 t = texture2D(Texture, uv);
+    if (t.a == 0.0) discard;
+    gl_FragColor = vec4(t.rgb * color.rgb + (1.0 - t.a) * CloudLight.rgb, t.a * color.a);
 }
 "#;
 
@@ -171,7 +186,35 @@ impl Assets {
             },
         )
         .map_err(|e| e.to_string())?;
+        let cloud_path = dir.join(::scene::cloud_data::FILE_NAME);
+        let cloud_defs = match ::scene::cloud_data::load(&cloud_path, world_id, &sheet) {
+            Ok(def) => def,
+            Err(error) => {
+                eprintln!("ignoring {}: {error}", cloud_path.display());
+                None
+            }
+        };
+        let cloud = if cloud_defs.is_some() {
+            Some(
+                load_material(
+                    ShaderSource::Glsl {
+                        vertex: RECOLOR_VS,
+                        fragment: CLOUD_FS,
+                    },
+                    MaterialParams {
+                        uniforms: vec![UniformDesc::new("CloudLight", UniformType::Float4)],
+                        pipeline_params: blend(BlendFactor::OneMinusValue(BlendValue::SourceAlpha)),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
         Ok(Assets {
+            cloud,
+            cloud_defs,
             pages,
             reflect,
             smooth,
@@ -205,7 +248,11 @@ impl Renderer for Assets {
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
         let s = *self.sheet.get(id);
-        if let Some((a, b)) = d.recolor {
+        let cloud = self.cloud.as_ref().zip(d.cloud_light);
+        if let Some((material, light)) = cloud {
+            gl_use_material(material);
+            material.set_uniform("CloudLight", mc(light).to_vec());
+        } else if let Some((a, b)) = d.recolor {
             gl_use_material(&self.recolor);
             self.recolor.set_uniform("RecolorA", mc(a).to_vec());
             self.recolor.set_uniform("RecolorB", mc(b).to_vec());
@@ -253,7 +300,7 @@ impl Renderer for Assets {
                 },
             );
         }
-        if d.recolor.is_some() || d.additive {
+        if cloud.is_some() || d.recolor.is_some() || d.additive {
             gl_use_default_material();
         }
     }

@@ -258,6 +258,7 @@ pub enum DrawItem {
     Glow(usize, usize),
     /// The night star field (Heaven layer, behind the sun and moon).
     Stars,
+    Cloud(usize),
     /// A grass patch.
     Grass(usize),
     FreeSteed(usize),
@@ -290,6 +291,15 @@ fn layer_z(world: &game::data::WorldData) -> f32 {
 
 /// Painter's order: Unity sorts by sorting layer, then order, then distance.
 pub fn draw_list(s: &Session, sheet: &Sheet) -> Vec<((i16, i16, f32), DrawItem)> {
+    let clouds = cloud_draws(s, sheet, &s.game.blender.state);
+    draw_list_with_clouds(s, sheet, &clouds)
+}
+
+fn draw_list_with_clouds(
+    s: &Session,
+    sheet: &Sheet,
+    clouds: &[CloudDraw],
+) -> Vec<((i16, i16, f32), DrawItem)> {
     let world = &s.world;
     let g = &s.game;
     let level = &g.level;
@@ -488,6 +498,9 @@ pub fn draw_list(s: &Session, sheet: &Sheet) -> Vec<((i16, i16, f32), DrawItem)>
         for (j, g) in c.glows.iter().enumerate() {
             items.push(((0, 0, -g.z), DrawItem::Glow(i, j)));
         }
+    }
+    for (i, cloud) in clouds.iter().enumerate() {
+        items.push(((0, 0, -cloud.sample.position[2]), DrawItem::Cloud(i)));
     }
     // A stable sort on the tuple keys was over half of building the list.
     // Each key packs into one integer instead, with the push order as the
@@ -1760,6 +1773,32 @@ pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
     draw_overlays(&mut c);
 }
 
+struct CloudDraw {
+    sample: crate::clouds::CloudSample,
+    id: u32,
+    at: (f32, f32),
+}
+
+fn cloud_draws(s: &Session, sheet: &Sheet, light: &Light) -> Vec<CloudDraw> {
+    let Some(def) = &s.cloud_defs else {
+        return Vec::new();
+    };
+    s.clouds
+        .samples(def, light)
+        .filter_map(|sample| {
+            let id = sheet.id(&def.sprites[usize::from(sample.sprite)])?;
+            let sprite = sheet.get(id);
+            let extent = sprite.px.abs().max((f32::from(sprite.w) - sprite.px).abs());
+            let [x, y, _] = sample.position;
+            (x.abs() * PPU <= W / 2.0 + extent * sample.scale[0] + 16.0).then(|| CloudDraw {
+                sample,
+                id,
+                at: layer_to_screen(s, x, y, 0.0),
+            })
+        })
+        .collect()
+}
+
 fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     let s = c.s;
     let light = s.game.blender.state;
@@ -1779,7 +1818,8 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     c.r.rect(Rect::new(0.0, below, W, H - below), sky_bottom);
 
     let game_z = layer_z(&s.world);
-    let items = draw_list(s, c.sheet);
+    let clouds = cloud_draws(s, c.sheet, &light);
+    let items = draw_list_with_clouds(s, c.sheet, &clouds);
     c.lights = items
         .iter()
         .filter_map(|(_, item)| fire_item(s, item))
@@ -1821,6 +1861,21 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Celestial(i) => draw_celestial(c, i),
             DrawItem::Glow(i, j) => draw_celestial_glow(c, i, j),
             DrawItem::Stars => draw_stars(c),
+            DrawItem::Cloud(i) => {
+                let cloud = &clouds[i];
+                let sample = cloud.sample;
+                let draw = Draw::tint(sample.tint)
+                    .flip(sample.flip)
+                    .cloud_light(sample.light);
+                c.r.sprite(
+                    cloud.id,
+                    cloud.at,
+                    Draw {
+                        basis: Some([sample.scale[0], 0.0, 0.0, sample.scale[1]]),
+                        ..draw
+                    },
+                );
+            }
             DrawItem::Grass(i) => draw_grass(c, i),
             DrawItem::Animal(i) => draw_animal(c, i),
             DrawItem::FreeSteed(i) => draw_free_steed(c, i),

@@ -114,6 +114,11 @@ fn main() {
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
+    let cloud_path = format!("{ROMFS}/{}", scene::cloud_data::FILE_NAME);
+    match scene::cloud_data::load(std::path::Path::new(&cloud_path), world_id, &sheet) {
+        Ok(def) => s.cloud_defs = def,
+        Err(error) => eprintln!("ignoring {cloud_path}: {error}"),
+    }
     if let Some(g) = saved {
         s.resume(g);
     }

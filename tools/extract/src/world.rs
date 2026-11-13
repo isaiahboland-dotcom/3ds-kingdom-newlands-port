@@ -15,6 +15,7 @@ use game::data::{
 };
 use game::data::{Curve, PortalDef, WallDef, WaveDef};
 use scene::authored::{PartVisual, PrefabVisual, TransformNode};
+use scene::cloud_data::{CloudLayerDef, CloudsDef};
 use serde_json::{Map, Value};
 
 /// Components deriving from `Payable` (for overlap regions and half widths).
@@ -1829,6 +1830,249 @@ fn find_component<'v>(roots: &'v Value, ty: &str) -> Option<(&'v Value, &'v Map<
         n["children"].as_array()?.iter().find_map(|c| walk(c, ty))
     }
     roots["roots"].as_array()?.iter().find_map(|r| walk(r, ty))
+}
+
+pub fn clouds(inp: &Inputs<'_>) -> Result<CloudsDef, String> {
+    let (level, _) = find_component(inp.main, "Level").ok_or("main scene has no Level")?;
+    let (children, level_position) = cloud_parent(inp.main, level)?;
+    let (_, world) = find_component(inp.main, "World").ok_or("main scene has no World")?;
+    let mut sprites = Vec::new();
+    let mut layer = |name: &str, color, density, highlight| {
+        let node = cloud_child(children, name)?;
+        cloud_layer(
+            inp,
+            node,
+            color,
+            density,
+            highlight,
+            |dir, path| cloud_material(dir, path).map(|_| ()),
+            |reference| {
+                let name = inp.sprite_names.get(asset_path(Some(reference))?)?;
+                if let Some(index) = sprites.iter().position(|item| item == name) {
+                    return Some(index as SpriteId);
+                }
+                let id = u16::try_from(sprites.len()).ok()?;
+                sprites.push(name.clone());
+                Some(id)
+            },
+        )
+        .map_err(|e| format!("{name}: {e}"))
+    };
+    let mut stratus = layer(
+        "CloudsStratus",
+        "cloudStratusColor",
+        "cloudStratusDensity",
+        None,
+    )?;
+    let mut cumulus = layer(
+        "CloudsCumulus",
+        "cloudBaseColor",
+        "cloudDensity",
+        Some("cloudHighlightColor"),
+    )?;
+    for layer in [&mut stratus, &mut cumulus] {
+        for (axis, offset) in layer.origin.iter_mut().zip(level_position) {
+            *axis += offset;
+        }
+    }
+    let def = CloudsDef {
+        stratus,
+        cumulus,
+        wind_change_cooldown: cloud_number(world.get("windChangeCooldown"), "windChangeCooldown")?,
+        sprites,
+    };
+    if !def.valid() {
+        return Err("invalid sky cloud definition".into());
+    }
+    Ok(def)
+}
+
+fn cloud_layer(
+    inp: &Inputs<'_>,
+    node: &Value,
+    color: &str,
+    density: &str,
+    highlight: Option<&str>,
+    check_material: impl FnOnce(&Path, &str) -> Result<(), String>,
+    mut sprite_id: impl FnMut(&Value) -> Option<SpriteId>,
+) -> Result<CloudLayerDef, String> {
+    let controller = comp(node, "CloudController").ok_or("missing CloudController")?;
+    let parallax = comp(node, "Parallax2D").ok_or("missing parent Parallax2D")?;
+    let parameter = |key| {
+        controller
+            .get(key)
+            .and_then(|v| v["parameterName"].as_str())
+    };
+    if node["active"] != true
+        || !unrotated(node)
+        || !flag(controller, "m_Enabled")
+        || !flag(parallax, "m_Enabled")
+        || !parallax
+            .get("ratio")
+            .is_some_and(|r| r["x"] == 0 && r["y"] == 1)
+        || parameter("baseColor") != Some(color)
+        || parameter("density") != Some(density)
+        || parameter("highlightColor") != highlight
+        || !flag(controller, "useBlenderBaseColor")
+        || flag(controller, "useHighlight") != highlight.is_some()
+    {
+        return Err("unsupported CloudController transform, parallax, or lighting bindings".into());
+    }
+    let reference = controller.get("cloudPrefab").ok_or("missing cloudPrefab")?;
+    let path = asset_path(Some(reference)).ok_or("unlinked cloudPrefab")?;
+    let prefab = inp.prefabs.get(path).ok_or("missing cloud prefab")?;
+    let cloud = comp(prefab, "Cloud").ok_or("missing Cloud component")?;
+    let renderer = comp(prefab, "SpriteRenderer").ok_or("missing cloud SpriteRenderer")?;
+    let randomizer = comp(prefab, "RandomizeSprite").ok_or("missing cloud RandomizeSprite")?;
+    if !unrotated(prefab)
+        || reference["id"]
+            .as_i64()
+            .is_none_or(|id| comp_id(prefab, "Cloud") != Some(id))
+        || !flag(cloud, "m_Enabled")
+        || !flag(renderer, "m_Enabled")
+        || [
+            "m_SortingLayer",
+            "m_SortingLayerID",
+            "m_SortingOrder",
+            "m_FlipX",
+            "m_FlipY",
+            "m_DrawMode",
+            "m_MaskInteraction",
+        ]
+        .iter()
+        .any(|key| renderer.get(*key).and_then(Value::as_i64) != Some(0))
+        || !flag(randomizer, "m_Enabled")
+        || !flag(randomizer, "randomizeOnAwake")
+        || flag(randomizer, "matchParent")
+        || cloud_number(
+            randomizer.get("deactivationProbability"),
+            "deactivationProbability",
+        )? != 0.0
+        || cloud_number(randomizer.get("shiftX"), "shiftX")? != 0.0
+        || prefab["children"]
+            .as_array()
+            .is_some_and(|children| children.iter().any(|child| child["active"] == true))
+    {
+        return Err("unsupported cloud prefab, renderer, or randomization settings".into());
+    }
+    let material = renderer
+        .get("m_Materials")
+        .and_then(Value::as_array)
+        .filter(|materials| materials.len() == 1)
+        .and_then(|materials| asset_path(materials.first()))
+        .ok_or("cloud renderer must reference one material")?;
+    check_material(inp.assets_dir, material)?;
+    let sprites = randomizer
+        .get("sprites")
+        .and_then(Value::as_array)
+        .ok_or("missing cloud variants")?;
+    let sprites = sprites
+        .iter()
+        .map(|r| sprite_id(r).ok_or("unresolved cloud sprite"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let setting = |key| cloud_number(controller.get(key), key);
+    Ok(CloudLayerDef {
+        origin: vec3(&node["pos"]),
+        depth: setting("depth")?,
+        width: setting("width")?,
+        wind_multiplier: setting("windMultiplier")?,
+        lifetime: cloud_number(cloud.get("lifetime"), "lifetime")?,
+        fade_time: cloud_number(cloud.get("fadeTime"), "fadeTime")?,
+        vertical_motion: cloud_number(cloud.get("verticalMotion"), "verticalMotion")?,
+        max_clouds: controller
+            .get("maxClouds")
+            .and_then(Value::as_u64)
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or("invalid maxClouds")?,
+        sprites,
+        prefab_active: prefab["active"]
+            .as_bool()
+            .ok_or("missing cloud prefab active state")?,
+        allow_flip: flag(randomizer, "allowFlip"),
+        y_curve: cloud_curve(controller.get("yCurve"), "yCurve")?,
+        scale_curve: cloud_curve(controller.get("scaleCurve"), "scaleCurve")?,
+        parallax_curve: cloud_curve(controller.get("parallaxRatioCurve"), "parallaxRatioCurve")?,
+    })
+}
+
+fn unrotated(node: &Value) -> bool {
+    vec3(&node["scale"]) == [1.0; 3]
+        && [0.0, 0.0, 0.0, 1.0]
+            .into_iter()
+            .enumerate()
+            .all(|(i, v)| node["rot"][i].as_f64() == Some(v))
+}
+
+fn cloud_parent<'v>(main: &Value, level: &'v Value) -> Result<(&'v [Value], [f32; 3]), String> {
+    if !unrotated(level)
+        || !main["roots"]
+            .as_array()
+            .is_some_and(|roots| roots.iter().any(|root| root["id"] == level["id"]))
+    {
+        return Err("clouds require a scene-root Level without rotation or scale".into());
+    }
+    let children = level["children"]
+        .as_array()
+        .ok_or("Level has no children")?;
+    Ok((children, vec3(&level["pos"])))
+}
+
+fn cloud_child<'v>(children: &'v [Value], name: &str) -> Result<&'v Value, String> {
+    children
+        .iter()
+        .find(|child| child["name"] == name)
+        .ok_or_else(|| format!("Level has no {name}"))
+}
+
+fn cloud_number(value: Option<&Value>, field: &str) -> Result<f32, String> {
+    value
+        .and_then(Value::as_f64)
+        .map(|n| n as f32)
+        .filter(|n| n.is_finite())
+        .ok_or_else(|| format!("invalid cloud {field}"))
+}
+
+fn cloud_curve(value: Option<&Value>, field: &str) -> Result<Curve, String> {
+    let value = value.ok_or_else(|| format!("missing cloud {field}"))?;
+    let keys = value["m_Curve"]
+        .as_array()
+        .ok_or_else(|| format!("missing cloud {field}"))?;
+    for key in keys {
+        for axis in ["time", "value"] {
+            cloud_number(key.get(axis), field)?;
+        }
+        for tangent in ["inSlope", "outSlope"] {
+            if !matches!(key[tangent].as_str(), Some("Infinity" | "-Infinity")) {
+                cloud_number(key.get(tangent), field)?;
+            }
+        }
+    }
+    Ok(curve(value))
+}
+
+fn cloud_material(dir: &Path, path: &str) -> Result<[f32; 4], String> {
+    use crate::yaml::{field, guid_of, inline_map};
+
+    let read =
+        |path: &str| std::fs::read_to_string(dir.join(path)).map_err(|e| format!("{path}: {e}"));
+    let shader = read("Shader/Custom_ShadowReceiver.shader.meta")?;
+    let guid = field(&shader, "guid").ok_or("missing Custom/ShadowReceiver GUID")?;
+    let material = read(path)?;
+    if field(&material, "m_Shader").and_then(guid_of) != Some(guid)
+        || !field(&material, "m_ShaderKeywords").is_some_and(|keywords| {
+            keywords
+                .split_whitespace()
+                .any(|keyword| keyword == "USEAMBIENT_ON")
+        })
+    {
+        return Err(format!(
+            "{path}: expected the ambient ShadowReceiver shader"
+        ));
+    }
+    field(&material, "_LightColor")
+        .and_then(|value| inline_map(value, &["r", "g", "b", "a"]))
+        .and_then(|values| values.try_into().ok())
+        .ok_or_else(|| format!("{path}: missing or invalid _LightColor"))
 }
 
 /// orig: `AnimationCurve` keys.

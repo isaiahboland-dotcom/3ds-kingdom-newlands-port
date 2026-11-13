@@ -6,6 +6,8 @@ pub mod adpcm;
 pub mod authored;
 #[cfg(feature = "clipfile")]
 pub mod clipfile;
+pub mod cloud_data;
+pub mod clouds;
 pub mod heraldry;
 pub mod render;
 pub mod session;

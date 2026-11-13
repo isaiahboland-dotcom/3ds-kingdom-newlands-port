@@ -16,6 +16,7 @@
 //!
 //! `cargo run --release -p extract --bin pack3ds -- assets crates/n3ds/romfs`
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -156,6 +157,18 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         Err(e) => return Err(format!("{FILENAME}: {e}")),
     };
 
+    let cloud_path = src.join(scene::cloud_data::FILE_NAME);
+    let (clouds, cloud_sprites) = match read_file(&cloud_path) {
+        Ok(bytes) => {
+            let def =
+                scene::cloud_data::decode(&bytes, game::save::fingerprint(&world_bytes), &sheet)?;
+            let names: HashSet<String> = def.sprites.into_iter().collect();
+            (Some(bytes), names)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, HashSet::new()),
+        Err(e) => return Err(format!("{}: {e}", cloud_path.display())),
+    };
+
     // Cut every sprite out; split off its recolour masks.
     let mut pieces: Vec<Piece> = Vec::new();
     let mut masks = 0;
@@ -202,8 +215,12 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             }
             any.then_some(m)
         };
-        let a = split(KEY_A);
-        let b = split(KEY_B);
+        let cloud = cloud_sprites.contains(&sheet.names[i]);
+        let [a, b] = if cloud {
+            [None, None]
+        } else {
+            [split(KEY_A), split(KEY_B)]
+        };
         for (k, m) in [a, b].into_iter().enumerate() {
             let Some(m) = m else { continue };
             let id = out_sheet.sprites.len();
@@ -223,12 +240,13 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             });
             masks += 1;
         }
-        let soft = base
-            .px
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|p| p[3] != 0 && p[3] != 255);
+        let soft = cloud
+            || base
+                .px
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[3] != 0 && p[3] != 255);
         pieces.push(Piece {
             sprite: i,
             img: base,
@@ -407,6 +425,14 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     } else if let Err(e) = std::fs::remove_file(authored_out) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(format!("{FILENAME}: {e}"));
+        }
+    }
+    let clouds_out = out.join(scene::cloud_data::FILE_NAME);
+    if let Some(bytes) = clouds {
+        std::fs::write(clouds_out, bytes).map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(clouds_out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
         }
     }
     let sd = out

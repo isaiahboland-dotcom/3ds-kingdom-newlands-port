@@ -60,6 +60,8 @@ pub struct Draw {
     pub flip_y: bool,
     /// Optional row-major affine basis in screen coordinates, about the pivot.
     pub basis: Option<[f32; 4]>,
+    /// Add the highlight weighted by the inverse cloud texture coverage.
+    pub cloud_light: Option<Color>,
     pub tint: Color,
     pub scale: f32,
     /// Radians, clockwise on screen, around the pivot.
@@ -77,6 +79,7 @@ impl Draw {
             flip: false,
             flip_y: false,
             basis: None,
+            cloud_light: None,
             tint,
             scale: 1.0,
             angle: 0.0,
@@ -98,6 +101,11 @@ impl Draw {
 
     pub fn angle(mut self, angle: f32) -> Draw {
         self.angle = angle;
+        self
+    }
+
+    pub fn cloud_light(mut self, light: Color) -> Draw {
+        self.cloud_light = Some(Color::new(light.r, light.g, light.b, 1.0));
         self
     }
 

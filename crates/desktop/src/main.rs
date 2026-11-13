@@ -195,6 +195,7 @@ async fn main() {
         });
     let record_progress = progress.clone();
     let mut app = Session::new(world, island, seed, progress);
+    app.cloud_defs = assets.cloud_defs.take();
     app.debug = std::env::args().any(|a| a == "--debug");
     if let Some(h) = start_hour {
         app.game.clock.time = h;

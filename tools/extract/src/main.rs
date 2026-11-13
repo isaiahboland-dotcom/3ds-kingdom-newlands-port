@@ -108,11 +108,6 @@ fn main() -> ExitCode {
         Err(e) => eprintln!("warning: font: {e}"),
     }
 
-    if let Err(e) = pack::write_pages(&sheet, &out.join("sprites"), &out.join("sprites.json")) {
-        eprintln!("packing: {e}");
-        return ExitCode::FAILURE;
-    }
-
     match clips::extract_all(&assets.join("AnimationClip"), &sheet.names_by_guid) {
         Ok(all) => {
             let json = serde_json::to_string(&all).expect("clips serialize");
@@ -140,14 +135,7 @@ fn main() -> ExitCode {
         .iter()
         .map(|s| (s.name.clone(), (s.img.w, s.img.h, s.ppu)))
         .collect();
-    if let Err(e) = export_scenes(
-        &assets,
-        &guids,
-        &out,
-        &sheet.names_by_path,
-        &sizes,
-        animations,
-    ) {
+    if let Err(e) = export_scenes(&assets, &guids, &out, &mut sheet, &sizes, animations) {
         eprintln!("scenes: {e}");
         return ExitCode::FAILURE;
     }
@@ -173,7 +161,7 @@ fn export_scenes(
     assets: &Path,
     guids: &HashMap<String, PathBuf>,
     out: &Path,
-    sprite_names: &HashMap<String, String>,
+    sheet: &mut sprites::Sheet,
     sprite_sizes: &world::SpriteSizes,
     animations: game::animation::Library,
 ) -> Result<(), String> {
@@ -219,13 +207,13 @@ fn export_scenes(
         &serde_json::Value::Object(data.clone()),
     )?;
 
-    let (mut world, clip_paths, prefabs) = world::build(&world::Inputs {
+    let (mut world, clip_paths, prefab_visuals) = world::build(&world::Inputs {
         main: &main,
         blocks: &blocks,
         loader: &loader,
         prefabs: &prefabs,
         data: &data,
-        sprite_names,
+        sprite_names: &sheet.names_by_path,
         sprite_sizes,
         assets_dir: assets,
     })?;
@@ -240,11 +228,30 @@ fn export_scenes(
     let bytes = postcard::to_allocvec(&world).map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), &bytes).map_err(|e| e.to_string())?;
     let authored = scene::authored::AssetAnimation {
-        prefabs,
+        prefabs: prefab_visuals,
         clips: animations,
     };
     let animation = authored.encode(game::save::fingerprint(&bytes))?;
     std::fs::write(out.join(scene::authored::FILENAME), animation).map_err(|e| e.to_string())?;
+    let clouds = world::clouds(&world::Inputs {
+        main: &main,
+        blocks: &blocks,
+        loader: &loader,
+        prefabs: &prefabs,
+        data: &data,
+        sprite_names: &sheet.names_by_path,
+        sprite_sizes,
+        assets_dir: assets,
+    })?;
+    for sprite in &mut sheet.sprites {
+        if clouds.sprites.contains(&sprite.name) {
+            sprites::bake_cloud_coverage(&mut sprite.img);
+        }
+    }
+    pack::write_pages(sheet, &out.join("sprites"), &out.join("sprites.json"))?;
+    let cloud_bytes = scene::cloud_data::encode(&clouds, game::save::fingerprint(&bytes))?;
+    std::fs::write(out.join(scene::cloud_data::FILE_NAME), cloud_bytes)
+        .map_err(|e| e.to_string())?;
     println!(
         "world: {} blocks, {} protos, {} scatterables, {} islands, {} lights, {} days ({} KiB)",
         world.blocks.len(),
