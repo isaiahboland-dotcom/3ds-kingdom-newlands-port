@@ -24,6 +24,7 @@ pub struct Session {
     pub debug: bool,
     pub camera_x: f32,
     pub(crate) fires: crate::fires::Fires,
+    pub fire_particles: Option<crate::fire_particles::FireParticlesDef>,
     pub bag_bounce: f32,
     pub day_banner: Option<(u32, f32)>,
     /// Animator state for the monarch: current action and time in its clip.
@@ -121,6 +122,7 @@ impl Session {
             debug: false,
             camera_x,
             fires: crate::fires::Fires::new(seed),
+            fire_particles: None,
             bag_bounce: 0.0,
             day_banner: None,
             anim: (Action::Stand, 0.0),
@@ -385,7 +387,8 @@ impl Session {
             raw.bag_tap = false;
             self.events.clear();
             self.game.tick(&self.world, &controls, &mut self.events);
-            self.fires.step(&self.world, &self.game);
+            self.fires
+                .step(&self.world, &self.game, self.fire_particles.as_ref(), 0.0);
             for e in &self.events {
                 crate::sound::on_event(
                     &self.world,

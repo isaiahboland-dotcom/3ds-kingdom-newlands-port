@@ -223,6 +223,11 @@ async fn main() {
     }
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
+    let particle_path = std::path::Path::new(&dir).join(::scene::fire_particles::FILE_NAME);
+    match ::scene::fire_particles::FireParticlesDef::load(&particle_path, &sheet, world_id) {
+        Ok(def) => app.fire_particles = def,
+        Err(err) => eprintln!("ignoring fire particle data: {err}"),
+    }
     app.slot = slot;
     if std::env::args().any(|a| a == "--paused") {
         app.set_paused(true);

@@ -15,6 +15,8 @@
 //!
 //! `cargo run --release -p extract --bin pack3ds -- assets crates/n3ds/romfs`
 
+use std::collections::HashSet;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -136,6 +138,21 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         .map(|p| load_png(&src.join(&p.file)))
         .collect::<Result<_, _>>()?;
 
+    let world = std::fs::read(src.join("world.bin")).map_err(|e| e.to_string())?;
+    let world_id = game::save::fingerprint(&world);
+    let fire_name = scene::fire_particles::FILE_NAME;
+    let fire = scene::fire_particles::FireParticlesDef::read_file(&src.join(fire_name))?;
+    let fire_def = fire
+        .as_deref()
+        .map(|bytes| scene::fire_particles::FireParticlesDef::decode(bytes, world_id))
+        .transpose()?;
+    let fire_sprites: HashSet<&str> = fire_def.iter().flat_map(|def| def.sprites()).collect();
+    if let Some(name) = fire_sprites
+        .iter()
+        .find(|name| !sheet.names.iter().any(|n| n == **name))
+    {
+        return Err(format!("missing fire particle tile {name}"));
+    }
     // Cut every sprite out; split off its recolour masks.
     let mut out_sheet = sheet.clone();
     let mut pieces: Vec<Piece> = Vec::new();
@@ -183,8 +200,11 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             }
             any.then_some(m)
         };
-        let a = split(KEY_A);
-        let b = split(KEY_B);
+        let [a, b] = if fire_sprites.contains(sheet.names[i].as_str()) {
+            [None, None]
+        } else {
+            [split(KEY_A), split(KEY_B)]
+        };
         for (k, m) in [a, b].into_iter().enumerate() {
             let Some(m) = m else { continue };
             let id = out_sheet.sprites.len();
@@ -381,8 +401,14 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     }
     let bin = postcard::to_allocvec(&out_sheet).map_err(|e| e.to_string())?;
     std::fs::write(out.join("sheet.bin"), bin).map_err(|e| e.to_string())?;
-    std::fs::copy(src.join("world.bin"), out.join("world.bin"))
-        .map_err(|e| format!("world.bin: {e}"))?;
+    std::fs::write(out.join("world.bin"), world).map_err(|e| format!("world.bin: {e}"))?;
+    if let Some(bytes) = fire {
+        std::fs::write(out.join(fire_name), bytes).map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(out.join(fire_name)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
+        }
+    }
     let sd = out
         .parent()
         .unwrap_or(Path::new("."))

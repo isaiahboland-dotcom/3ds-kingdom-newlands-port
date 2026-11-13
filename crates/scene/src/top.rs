@@ -24,7 +24,7 @@ pub use game::build::WALK_Y;
 pub const CAMERA_Y: f32 = 1.875;
 /// Depth of the monarch and coins in the game layer. orig: Player prefab z;
 /// `Droppable.Drop` puts coins 0.01 in front of the dropper.
-const MONARCH_Z: f32 = 1.0;
+pub(crate) const MONARCH_Z: f32 = 1.0;
 const COIN_Z: f32 = 0.99;
 
 /// Gradient quads of the main scene: (z, bottom y, top y), in world units.
@@ -282,6 +282,7 @@ pub enum DrawItem {
     },
     /// The monarch's torch.
     Torch,
+    FireParticle(usize),
 }
 
 fn layer_z(world: &game::data::WorldData) -> f32 {
@@ -601,12 +602,17 @@ fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, elapse
         };
         d(a).total_cmp(&d(b))
     });
-    if let Some(name) = flame
-        .and_then(|f| f.1)
-        .map(|id| s.world.sprites[id as usize].as_str())
-    {
-        if let Some(sp) = flame_clip(c, name, elapsed) {
-            c.r.sprite(sp, at, Draw::tint(WHITE).additive());
+    if s.fire_particles.as_ref().is_none_or(|def| {
+        def.nearest(fire.size)
+            .is_none_or(|i| def.variants[i].animated_sprite)
+    }) {
+        if let Some(name) = flame
+            .and_then(|f| f.1)
+            .map(|id| s.world.sprites[id as usize].as_str())
+        {
+            if let Some(sp) = flame_clip(c, name, elapsed) {
+                c.r.sprite(sp, at, Draw::tint(WHITE).additive());
+            }
         }
     }
     draw_fire_reflection(c, at, fire);
@@ -1507,7 +1513,21 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     c.r.rect(Rect::new(0.0, below, W, H - below), sky_bottom);
 
     let game_z = layer_z(&s.world);
-    let items = draw_list(s);
+    let mut items = draw_list(s);
+    let mut particles = Vec::new();
+    if let Some(def) = &s.fire_particles {
+        for particle in s.fires.particles(def, Color::rgba(colors[color::AMBIENT])) {
+            let [x, _, z] = particle.position;
+            if (x - particle.ratio * s.camera_x).abs() > W / PPU / 2.0 + 2.0 {
+                continue;
+            }
+            if let Some(id) = c.sheet.id(particle.sprite) {
+                items.push(((0, i16::MAX, -z), DrawItem::FireParticle(particles.len())));
+                particles.push((id, particle));
+            }
+        }
+        items.sort_by_key(|(key, _)| sort_key(*key));
+    }
     c.lights = items
         .iter()
         .filter_map(|(_, item)| fire_item(s, item))
@@ -1561,6 +1581,13 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Dog => draw_dog(c),
             DrawItem::LoosePart(i) => draw_loose_part(c, i),
             DrawItem::Deckhand(i) => draw_deckhand(c, i),
+            DrawItem::FireParticle(i) => {
+                let (id, p) = &particles[i];
+                let [x, y, _] = p.position;
+                let at = layer_to_screen(s, x, y, p.ratio);
+                let scale = p.size * PPU / f32::from(c.sheet.get(*id).w);
+                c.r.sprite(*id, at, Draw::tint(p.tint).scale(scale));
+            }
             DrawItem::Fire { .. } | DrawItem::Torch => {
                 if let Some((at, fire, sample)) = fire_item(s, &item) {
                     draw_fire(c, at, &fire, sample.elapsed);

@@ -7,6 +7,11 @@ use game::level::Object;
 use game::rng::Rng;
 use game::state::{GameState, TICK};
 
+use crate::{
+    fire_particles::{Emitters, FireParticlesDef, Sample, Source},
+    render::Color,
+};
+
 const NIGHT_DELAY: f32 = 5.0;
 const LIGHT_WAIT: f32 = 1.0;
 const LIGHT_RAMP: f32 = 1.0;
@@ -29,14 +34,16 @@ struct Fire {
     next_poll: u64,
     /// Fire's Invoke calls each have their own deadline and can coexist.
     pending: Vec<(u64, bool)>,
+    particles: Emitters,
 }
 
 impl Fire {
-    fn new(def: &FireDef, style: &FireStyleDef) -> Self {
+    fn new(def: &FireDef, style: &FireStyleDef, particles: Option<&FireParticlesDef>) -> Self {
         let strength = sample_keys(&style.strength, def.size.0.hypot(def.size.1));
         Self {
             strength,
             base_intensity: sample_keys(&style.intensity, strength),
+            particles: Emitters::new(particles, def.size),
             ..Self::default()
         }
     }
@@ -103,12 +110,18 @@ struct ObjectFires {
 }
 
 impl ObjectFires {
-    fn new(o: &Object, world: &WorldData, daytime: bool, tick: u64) -> Self {
+    fn new(
+        o: &Object,
+        world: &WorldData,
+        daytime: bool,
+        tick: u64,
+        particles: Option<&FireParticlesDef>,
+    ) -> Self {
         let attachments = world.protos[usize::from(o.proto)]
             .fires
             .iter()
             .map(|def| {
-                let mut fire = Fire::new(def, &world.fire);
+                let mut fire = Fire::new(def, &world.fire, particles);
                 if def.auto_start && (!def.night_only || !daytime) {
                     fire.start(tick);
                 }
@@ -147,6 +160,40 @@ impl ObjectFires {
             fire.step(tick, ambient, rng);
         }
     }
+
+    fn step_particles(
+        &mut self,
+        o: &Object,
+        world: &WorldData,
+        particles: &FireParticlesDef,
+        wind: f32,
+        rng: &mut Rng,
+    ) {
+        let layer = world.layer(o.layer);
+        let facing = if o.flip { -1.0 } else { 1.0 };
+        for (fire, def) in self
+            .attachments
+            .iter_mut()
+            .zip(&world.protos[o.proto as usize].fires)
+        {
+            let emitting = fire.started.is_some();
+            if !emitting && !def.auto_start && !def.night_only {
+                // Statue.SetFires deactivates the entire Fire GameObject.
+                fire.particles.clear();
+                continue;
+            }
+            let source = Source {
+                position: [
+                    o.x + facing * def.at.0,
+                    o.y + def.at.1,
+                    layer.z + o.z + def.at.2,
+                ],
+                ratio: layer.ratio,
+                facing,
+            };
+            fire.particles.step(particles, source, emitting, wind, rng);
+        }
+    }
 }
 
 pub(crate) struct Fires {
@@ -157,6 +204,7 @@ pub(crate) struct Fires {
     /// Changing mounts or rider model attaches a different torch.
     torch: Option<((u16, bool), Fire)>,
     rng: Rng,
+    particle_rng: Rng,
 }
 
 impl Fires {
@@ -168,10 +216,17 @@ impl Fires {
             scenery: BTreeMap::new(),
             torch: None,
             rng: Rng::new(seed ^ 0x46b7_13e9),
+            particle_rng: Rng::new(seed ^ 0xf50c_6c5e),
         }
     }
 
-    pub fn step(&mut self, world: &WorldData, game: &GameState) {
+    pub fn step(
+        &mut self,
+        world: &WorldData,
+        game: &GameState,
+        particles: Option<&FireParticlesDef>,
+        wind: f32,
+    ) {
         self.tick += 1;
         let tick = self.tick;
         let daytime = game.days.is_daytime;
@@ -188,9 +243,9 @@ impl Fires {
             let state = self
                 .objects
                 .entry(o.id)
-                .or_insert_with(|| ObjectFires::new(o, world, daytime, tick));
+                .or_insert_with(|| ObjectFires::new(o, world, daytime, tick, particles));
             if state.proto != o.proto {
-                *state = ObjectFires::new(o, world, daytime, tick);
+                *state = ObjectFires::new(o, world, daytime, tick, particles);
             }
             let charged = proto.statue.is_some()
                 && game
@@ -206,6 +261,9 @@ impl Fires {
                 ambient,
                 &mut self.rng,
             );
+            if let Some(particles) = particles {
+                state.step_particles(o, world, particles, wind, &mut self.particle_rng);
+            }
         }
         self.objects.retain(|_, o| o.tick == tick);
 
@@ -215,7 +273,7 @@ impl Fires {
             for o in &game.level.scenery {
                 if !world.protos[usize::from(o.proto)].fires.is_empty() {
                     self.scenery
-                        .insert(o.id, ObjectFires::new(o, world, daytime, tick));
+                        .insert(o.id, ObjectFires::new(o, world, daytime, tick, particles));
                 }
             }
         }
@@ -232,6 +290,9 @@ impl Fires {
                 ambient,
                 &mut self.rng,
             );
+            if let Some(particles) = particles {
+                state.step_particles(o, world, particles, wind, &mut self.particle_rng);
+            }
             true
         });
 
@@ -243,13 +304,33 @@ impl Fires {
             let owner = (game.steed, game.look.queen);
             let (current, torch) = self
                 .torch
-                .get_or_insert_with(|| (owner, Fire::new(def, &world.fire)));
+                .get_or_insert_with(|| (owner, Fire::new(def, &world.fire, particles)));
             if *current != owner {
                 *current = owner;
-                *torch = Fire::new(def, &world.fire);
+                *torch = Fire::new(def, &world.fire, particles);
             }
             torch.set_active(grayscale < world.fire.torch_threshold, tick);
             torch.step(tick, ambient, &mut self.rng);
+            if let Some(particles) = particles {
+                if torch.started.is_some() {
+                    let facing = f32::from(game.monarch.facing);
+                    let source = Source {
+                        position: [
+                            game.monarch.x + def.at.0 * facing,
+                            game::build::WALK_Y + def.at.1,
+                            crate::top::MONARCH_Z + def.at.2,
+                        ],
+                        ratio: 1.0,
+                        facing,
+                    };
+                    torch
+                        .particles
+                        .step(particles, source, true, wind, &mut self.particle_rng);
+                } else {
+                    // Player.Update disables the torch's parent GameObject.
+                    torch.particles.clear();
+                }
+            }
         } else {
             self.torch = None;
         }
@@ -267,6 +348,19 @@ impl Fires {
 
     pub fn torch(&self) -> Option<FireSample> {
         self.torch.as_ref()?.1.sample(self.tick)
+    }
+
+    pub fn particles<'a>(
+        &'a self,
+        def: &'a FireParticlesDef,
+        ambient: Color,
+    ) -> impl Iterator<Item = Sample<'a>> + 'a {
+        self.objects
+            .values()
+            .chain(self.scenery.values())
+            .flat_map(|o| &o.attachments)
+            .chain(self.torch.iter().map(|(_, fire)| fire))
+            .flat_map(move |fire| fire.particles.samples(def, ambient))
     }
 }
 
