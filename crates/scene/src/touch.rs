@@ -10,7 +10,7 @@ use game::rng::Rng;
 
 use crate::heraldry;
 use crate::render::{Color, Draw, Rect, Renderer};
-use crate::session::Session;
+use crate::session::{Session, SlotState};
 use crate::sheet::Sheet;
 use crate::text;
 use crate::top;
@@ -374,18 +374,26 @@ fn draw_pause(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
             16.0,
             color,
         );
-        let info = match &s.slots[i] {
-            Some(info) => format!(
-                "{} - DAY {} - {} COINS",
-                info.island.to_uppercase(),
-                info.day,
-                info.coins
+        let (info, load) = match &s.slots[i] {
+            SlotState::Saved(info) => (
+                format!(
+                    "{} - DAY {} - {} COINS",
+                    info.island.to_uppercase(),
+                    info.day,
+                    info.coins
+                ),
+                "LOAD",
             ),
-            None => "EMPTY".to_owned(),
+            SlotState::Empty => ("EMPTY".to_owned(), "NEW"),
+            SlotState::Protected => ("SAVE PROTECTED".to_owned(), "RETRY"),
         };
         text::draw(r, sheet, &info, row.x + 8.0, row.y + 34.0, 14.0, dim);
-        button(r, sheet, slot_save(i), "SAVE", Color::WHITE);
-        let load = if s.slots[i].is_some() { "LOAD" } else { "NEW" };
+        let save_color = if s.slots[i] == SlotState::Protected {
+            dim
+        } else {
+            Color::WHITE
+        };
+        button(r, sheet, slot_save(i), "SAVE", save_color);
         button(r, sheet, slot_load(i), load, Color::WHITE);
     }
     button(r, sheet, BANNER, "BANNER", Color::WHITE);

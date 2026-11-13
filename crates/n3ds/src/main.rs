@@ -21,7 +21,6 @@ use game::controls::RawInput;
 use game::data::WorldData;
 use game::save;
 use game::state::TICK;
-use platform::Storage;
 use scene::session::Session;
 use scene::sheet::Sheet;
 use scene::{top, touch};
@@ -92,21 +91,18 @@ fn main() {
 
     // Saves on the SD card. orig: PersistentManager's AUTO slot, UnlockManager's unlocks.
     let files = storage::SdCard::new();
-    let progress = files
-        .read(save::UNLOCKS_SLOT)
-        .and_then(|b| save::load_progress(&b).ok())
-        .unwrap_or_default();
+    let progress = Session::saved_progress(&files);
     let slot = Session::last_slot(&files);
-    let saved = files
-        .read(&save::game_slot(slot))
-        .and_then(|b| save::load_game(&b, world_id, &world).ok());
+    let saved = Session::saved_game(&files, slot, world_id, &world);
     let mut s = Session::new(world, 0, seed(), progress);
     s.storage = Some(Box::new(files));
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
-    if let Some(g) = saved {
-        s.resume(g);
+    match saved {
+        Ok(Some(game)) => s.resume(game),
+        Ok(None) => {}
+        Err(_) => s.protect_active_slot(),
     }
     let mut sound = audio::Audio::new(SD_DIR, &s.world.audio);
     s.warning = sound.files_problem().unwrap_or_default();

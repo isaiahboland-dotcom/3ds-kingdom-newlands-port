@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Protect unreadable and incompatible saves from automatic replacement or
+  deletion. The pause menu marks protected slots and lets the player retry
+  loading them or choose another slot.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added
