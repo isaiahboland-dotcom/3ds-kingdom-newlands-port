@@ -243,12 +243,25 @@ fn export_scenes(
         sprite_sizes,
         assets_dir: assets,
     })?;
+    let mut meshes = scene::cloud_mesh::CloudMeshes::default();
     for sprite in &mut sheet.sprites {
         if clouds.sprites.contains(&sprite.name) {
+            let (path, _) = sheet
+                .names_by_path
+                .iter()
+                .find(|(_, name)| **name == sprite.name)
+                .ok_or_else(|| format!("missing source path for cloud sprite {}", sprite.name))?;
+            meshes.entries.push((
+                sprite.name.clone(),
+                sprites::cloud_mesh(&assets.join(path))?,
+            ));
             sprites::bake_cloud_coverage(&mut sprite.img);
         }
     }
     pack::write_pages(sheet, &out.join("sprites"), &out.join("sprites.json"))?;
+    let mesh_bytes = meshes.encode(game::save::fingerprint(&bytes))?;
+    std::fs::write(out.join(scene::cloud_mesh::FILE_NAME), mesh_bytes)
+        .map_err(|e| e.to_string())?;
     let cloud_bytes = scene::cloud_data::encode(&clouds, game::save::fingerprint(&bytes))?;
     std::fs::write(out.join(scene::cloud_data::FILE_NAME), cloud_bytes)
         .map_err(|e| e.to_string())?;

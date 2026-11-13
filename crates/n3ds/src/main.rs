@@ -90,8 +90,35 @@ fn main() {
             return;
         }
     };
+    let mut sheet = sheet;
+    let cloud_path = format!("{ROMFS}/{}", scene::cloud_data::FILE_NAME);
+    let cloud_defs =
+        match scene::cloud_data::load(std::path::Path::new(&cloud_path), world_id, &sheet) {
+            Ok(def) => def,
+            Err(error) => {
+                eprintln!("ignoring {cloud_path}: {error}");
+                None
+            }
+        };
+    if let Some(def) = &cloud_defs {
+        let mesh_path = format!("{ROMFS}/{}", scene::cloud_mesh::FILE_NAME);
+        match read_file(&mesh_path) {
+            Ok(bytes) => {
+                if let Err(error) = sheet.link_cloud_meshes(&def.sprites, world_id, &bytes) {
+                    eprintln!("ignoring {mesh_path}: {error}");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("ignoring {mesh_path}: {error}"),
+        }
+    }
+    let cloud_ids: Vec<_> = cloud_defs
+        .iter()
+        .flat_map(|def| &def.sprites)
+        .filter_map(|name| sheet.id(name))
+        .collect();
     let sheet = Rc::new(sheet);
-    let mut gpu = match gpu::Gpu::new(sheet.clone(), ROMFS) {
+    let mut gpu = match gpu::Gpu::new(sheet.clone(), ROMFS, &cloud_ids) {
         Ok(g) => g,
         Err(e) => {
             fail(&gfx, &mut hid, &apt, &e);
@@ -114,11 +141,7 @@ fn main() {
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
-    let cloud_path = format!("{ROMFS}/{}", scene::cloud_data::FILE_NAME);
-    match scene::cloud_data::load(std::path::Path::new(&cloud_path), world_id, &sheet) {
-        Ok(def) => s.cloud_defs = def,
-        Err(error) => eprintln!("ignoring {cloud_path}: {error}"),
-    }
+    s.cloud_defs = cloud_defs;
     if let Some(g) = saved {
         s.resume(g);
     }

@@ -3,7 +3,9 @@
 //! by index. Desktop reads `tools/extract`'s JSON; the 3DS reads the packed
 //! `sheet.bin` that `pack3ds` writes (with recolour masks split out).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+use crate::cloud_mesh::{CloudMesh, CloudMeshes};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use serde::{Deserialize, Serialize};
@@ -146,6 +148,8 @@ pub struct Sheet {
     #[serde(skip)]
     index: Map<String, u32>,
     #[serde(skip)]
+    cloud_meshes: Map<u32, CloudMesh>,
+    #[serde(skip)]
     clip_index: Map<String, usize>,
     /// `WorldData::sprites` id → sprite here.
     #[serde(skip)]
@@ -228,6 +232,36 @@ impl Sheet {
             .map(|n| self.index.get(n).copied())
             .collect();
         self.glyph_index = self.font.glyphs.iter().map(|g| (g.0, (g.1, g.2))).collect();
+    }
+
+    /// Link the entire cloud geometry set, keeping the old geometry on error.
+    pub fn link_cloud_meshes(
+        &mut self,
+        names: &[String],
+        world_id: u32,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let meshes = CloudMeshes::decode(bytes, world_id)?;
+        let mut expected: HashSet<_> = names.iter().map(String::as_str).collect();
+        let mut linked = Map::default();
+        for (name, mesh) in meshes.entries {
+            let id = self
+                .id(&name)
+                .filter(|_| expected.remove(name.as_str()))
+                .ok_or_else(|| format!("unexpected cloud mesh sprite {name}"))?;
+            if !mesh.valid_for(self.get(id)) || linked.insert(id, mesh).is_some() {
+                return Err(format!("invalid cloud mesh geometry for {name}"));
+            }
+        }
+        if !expected.is_empty() {
+            return Err("cloud mesh data does not cover all authored variants".into());
+        }
+        self.cloud_meshes = linked;
+        Ok(())
+    }
+
+    pub fn cloud_mesh(&self, id: u32) -> Option<&CloudMesh> {
+        self.cloud_meshes.get(&id)
     }
 
     /// A character's sprite (none for spaces) and advance.

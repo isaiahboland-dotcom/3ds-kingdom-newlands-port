@@ -500,7 +500,9 @@ fn draw_list_with_clouds(
         }
     }
     for (i, cloud) in clouds.iter().enumerate() {
-        items.push(((0, 0, -cloud.sample.position[2]), DrawItem::Cloud(i)));
+        if cloud.visible {
+            items.push(((0, 0, -cloud.sample.position[2]), DrawItem::Cloud(i)));
+        }
     }
     // A stable sort on the tuple keys was over half of building the list.
     // Each key packs into one integer instead, with the push order as the
@@ -1777,6 +1779,8 @@ struct CloudDraw {
     sample: crate::clouds::CloudSample,
     id: u32,
     at: (f32, f32),
+    visible: bool,
+    shadow: Option<crate::cloud_shadow::Receiver>,
 }
 
 fn cloud_draws(s: &Session, sheet: &Sheet, light: &Light) -> Vec<CloudDraw> {
@@ -1790,13 +1794,66 @@ fn cloud_draws(s: &Session, sheet: &Sheet, light: &Light) -> Vec<CloudDraw> {
             let sprite = sheet.get(id);
             let extent = sprite.px.abs().max((f32::from(sprite.w) - sprite.px).abs());
             let [x, y, _] = sample.position;
-            (x.abs() * PPU <= W / 2.0 + extent * sample.scale[0] + 16.0).then(|| CloudDraw {
+            let visible = x.abs() * PPU <= W / 2.0 + extent * sample.scale[0] + 16.0;
+            Some(CloudDraw {
                 sample,
                 id,
+                visible,
+                shadow: None,
                 at: layer_to_screen(s, x, y, 0.0),
             })
         })
         .collect()
+}
+
+fn prepare_cloud_shadows(c: &mut Ctx<'_, impl Renderer>, draws: &mut [CloudDraw]) {
+    use crate::cloud_shadow::{Camera, Receiver, Sprite};
+    use crate::clouds::CloudKind;
+
+    let Some(def) = &c.s.cloud_defs else { return };
+    let mut sprites = Vec::new();
+    let mut receivers = 0;
+    for draw in draws.iter_mut() {
+        let p = draw.sample;
+        if draw.visible
+            && p.kind == CloudKind::Cumulus
+            && p.light.r.max(p.light.g).max(p.light.b) > 0.0
+        {
+            draw.shadow = Some(Receiver {
+                index: receivers,
+                position: p.position,
+            });
+            receivers += 1;
+        }
+        if draw.shadow.is_some() || p.tint.a >= 0.5 {
+            sprites.push(Sprite {
+                id: draw.id,
+                position: p.position,
+                scale: p.scale,
+                flip: p.flip,
+                opacity: p.tint.a,
+                screen: [draw.at.0, draw.at.1],
+                receiver: draw.shadow.map(|r| r.index),
+            });
+        }
+    }
+    if receivers > 0 {
+        let highest =
+            c.s.world
+                .celestials
+                .iter()
+                .map(|body| celestial_position(body, c.s.game.clock.time).1)
+                .fold(f32::NEG_INFINITY, f32::max);
+        if !highest.is_finite()
+            || !c
+                .r
+                .cloud_shadows(Camera::new(def.cumulus.origin, highest), &sprites)
+        {
+            for draw in draws {
+                draw.shadow = None;
+            }
+        }
+    }
 }
 
 fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
@@ -1818,7 +1875,8 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     c.r.rect(Rect::new(0.0, below, W, H - below), sky_bottom);
 
     let game_z = layer_z(&s.world);
-    let clouds = cloud_draws(s, c.sheet, &light);
+    let mut clouds = cloud_draws(s, c.sheet, &light);
+    prepare_cloud_shadows(c, &mut clouds);
     let items = draw_list_with_clouds(s, c.sheet, &clouds);
     c.lights = items
         .iter()
@@ -1872,6 +1930,7 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                     cloud.at,
                     Draw {
                         basis: Some([sample.scale[0], 0.0, 0.0, sample.scale[1]]),
+                        cloud_shadow: cloud.shadow,
                         ..draw
                     },
                 );

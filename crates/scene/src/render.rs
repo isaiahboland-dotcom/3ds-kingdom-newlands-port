@@ -62,6 +62,7 @@ pub struct Draw {
     pub basis: Option<[f32; 4]>,
     /// Add the highlight weighted by the inverse cloud texture coverage.
     pub cloud_light: Option<Color>,
+    pub cloud_shadow: Option<crate::cloud_shadow::Receiver>,
     pub tint: Color,
     pub scale: f32,
     /// Radians, clockwise on screen, around the pivot.
@@ -80,6 +81,7 @@ impl Draw {
             flip_y: false,
             basis: None,
             cloud_light: None,
+            cloud_shadow: None,
             tint,
             scale: 1.0,
             angle: 0.0,
@@ -154,6 +156,13 @@ pub fn sprite_corners(s: &crate::sheet::Sprite, at: (f32, f32), d: &Draw) -> [(f
 /// Calls arrive in painter's order.
 pub trait Renderer {
     fn clear(&mut self, c: Color);
+    fn cloud_shadows(
+        &mut self,
+        _camera: crate::cloud_shadow::Camera,
+        _clouds: &[crate::cloud_shadow::Sprite],
+    ) -> bool {
+        false
+    }
     /// Sprite `id` (in the backend's `Sheet`) with its pivot at `at`.
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw);
     /// 9-sliced into `dest`; `border` is (left, bottom, right, top) pixels.

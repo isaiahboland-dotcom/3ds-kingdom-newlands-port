@@ -171,6 +171,58 @@ fn inside(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
     !(neg && pos)
 }
 
+pub fn cloud_mesh(path: &Path) -> Result<scene::cloud_mesh::CloudMesh, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    parse_cloud_mesh(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_cloud_mesh(text: &str) -> Result<scene::cloud_mesh::CloudMesh, String> {
+    let (_, _, ppu, mesh) = parse_mesh(text)?;
+    let rd = &text[..text.find("m_AtlasRD:").unwrap_or(text.len())];
+    let uvt = field(rd, "uvTransform")
+        .and_then(|v| inline_map(v, &["x", "y", "z", "w"]))
+        .ok_or("bad cloud uvTransform")?;
+    let vertices = field(rd, "_typelessdata")
+        .and_then(hex_bytes)
+        .ok_or("bad cloud vertex buffer")?;
+    let (stream, tail) = vertices.as_chunks::<20>();
+    // These clouds have one triangle submesh with float3 position followed by
+    // a zeroed float2 UV channel. Unity derives their UVs via uvTransform.
+    if ppu != 32.0
+        || uvt[0] != ppu
+        || uvt[2] != ppu
+        || field(rd, "settingsRaw") != Some("65")
+        || field(rd, "firstByte") != Some("0")
+        || field(rd, "firstVertex") != Some("0")
+        || field(rd, "topology") != Some("0")
+        || field(rd, "m_CurrentChannels") != Some("9")
+        || field(rd, "indexCount").and_then(|v| v.parse::<usize>().ok())
+            != Some(mesh.tris.len() * 3)
+        || rd
+            .lines()
+            .filter(|line| line.trim_start().starts_with("firstByte:"))
+            .count()
+            != 1
+        || !tail.is_empty()
+        || stream.len() != mesh.verts.len()
+        || !stream.iter().all(|v| v[8..].iter().all(|&b| b == 0))
+    {
+        return Err("unsupported cloud mesh layout or UV transform".into());
+    }
+    let local = stream
+        .iter()
+        .map(|v| {
+            let x = f32::from_le_bytes(v[..4].try_into().unwrap());
+            let y = f32::from_le_bytes(v[4..8].try_into().unwrap());
+            [x * ppu, -y * ppu]
+        })
+        .collect();
+    Ok(scene::cloud_mesh::CloudMesh {
+        vertices: local,
+        indices: mesh.tris.into_iter().flatten().map(|i| i as u16).collect(),
+    })
+}
+
 fn cut(mesh: &Mesh, atlas: &Image) -> (Image, (f32, f32), (f32, f32)) {
     let min_x = mesh
         .verts

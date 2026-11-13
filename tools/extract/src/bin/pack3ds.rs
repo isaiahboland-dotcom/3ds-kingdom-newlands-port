@@ -169,6 +169,18 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         Err(e) => return Err(format!("{}: {e}", cloud_path.display())),
     };
 
+    let mesh_file = scene::cloud_mesh::FILE_NAME;
+    let meshes = match read_file(src.join(mesh_file)) {
+        Ok(bytes) => {
+            let mut names: Vec<_> = cloud_sprites.iter().cloned().collect();
+            names.sort();
+            out_sheet.link_cloud_meshes(&names, game::save::fingerprint(&world_bytes), &bytes)?;
+            Some(bytes)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{mesh_file}: {e}")),
+    };
+
     // Cut every sprite out; split off its recolour masks.
     let mut pieces: Vec<Piece> = Vec::new();
     let mut masks = 0;
@@ -258,6 +270,10 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     // Trim each piece to its visible pixels (masks especially are mostly
     // empty); the pivot moves with the trim.
     for p in &mut pieces {
+        // Tight meshes depend on the exact authored crop and pivot.
+        if out_sheet.cloud_mesh(p.sprite as u32).is_some() {
+            continue;
+        }
         let (w, h) = (p.img.w, p.img.h);
         let alpha = |x: u32, y: u32| p.img.px[((y * w + x) * 4 + 3) as usize] != 0;
         let rows: Vec<u32> = (0..h).filter(|&y| (0..w).any(|x| alpha(x, y))).collect();
@@ -431,6 +447,14 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     if let Some(bytes) = clouds {
         std::fs::write(clouds_out, bytes).map_err(|e| e.to_string())?;
     } else if let Err(e) = std::fs::remove_file(clouds_out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
+        }
+    }
+    let meshes_out = out.join(mesh_file);
+    if let Some(bytes) = meshes {
+        std::fs::write(meshes_out, bytes).map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(meshes_out) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(e.to_string());
         }
