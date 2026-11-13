@@ -63,6 +63,7 @@ pub struct Session {
     pub slot: usize,
     /// The active slot must be loaded successfully before this run may write to it.
     active_slot_protected: bool,
+    pub pending_new_slot: Option<usize>,
     /// What each slot holds, read when the pause menu opens.
     pub slots: [SlotState; save::SLOTS],
     /// The banner editor, open over the pause menu.
@@ -103,6 +104,7 @@ pub enum SlotState {
     #[default]
     Empty,
     Saved(SlotInfo),
+    Recovered(SlotInfo),
     Protected,
 }
 
@@ -110,6 +112,56 @@ pub enum SlotState {
 pub enum SavedGameError {
     Read,
     Invalid(save::LoadError),
+}
+
+struct Recovered<T> {
+    value: T,
+    backup: bool,
+    writable: bool,
+}
+
+fn read_record<T>(
+    storage: &dyn Storage,
+    slot: &str,
+    decode: impl Fn(&[u8]) -> Result<T, save::LoadError>,
+) -> Result<Option<Recovered<T>>, SavedGameError> {
+    let primary = storage
+        .read(slot)
+        .map_err(|_| SavedGameError::Read)
+        .and_then(|bytes| {
+            bytes
+                .as_deref()
+                .map(&decode)
+                .transpose()
+                .map_err(SavedGameError::Invalid)
+        });
+    if let Ok(Some(value)) = primary {
+        return Ok(Some(Recovered {
+            value,
+            backup: false,
+            writable: true,
+        }));
+    }
+    match storage
+        .read_backup(slot)
+        .map_err(|_| SavedGameError::Read)
+        .and_then(|bytes| {
+            bytes
+                .as_deref()
+                .map(decode)
+                .transpose()
+                .map_err(SavedGameError::Invalid)
+        }) {
+        Ok(Some(value)) => Ok(Some(Recovered {
+            value,
+            backup: true,
+            writable: !matches!(primary, Err(SavedGameError::Read)),
+        })),
+        backup => match primary {
+            Err(e) => Err(e),
+            _ => backup.map(|_| None),
+        },
+    }
 }
 
 impl SaveNotice {
@@ -147,6 +199,7 @@ impl Session {
             music_cues: Vec::new(),
             slot: 0,
             active_slot_protected: false,
+            pending_new_slot: None,
             slots: Default::default(),
             water_camera: camera_x,
             world_id: 0,
@@ -197,15 +250,23 @@ impl Session {
         if slot == self.slot && self.active_slot_protected {
             return Some(false);
         }
-        if self.read_game(slot).is_err() {
-            self.active_slot_protected |= slot == self.slot;
-            return Some(false);
-        }
+        let backup = match self.read_game(slot) {
+            Ok(None) => false,
+            Ok(Some(record)) if record.writable => record.backup,
+            _ => {
+                self.active_slot_protected |= slot == self.slot;
+                return Some(false);
+            }
+        };
         let bytes = save::save_game(&self.game, self.world_id);
         let st = self.storage.as_mut()?;
-        Some(
-            st.write(&save::game_slot(slot), &bytes) && st.write(save::CURRENT_SLOT, &[slot as u8]),
-        )
+        let name = save::game_slot(slot);
+        let ok = if backup {
+            st.write_preserving_backup(&name, &bytes)
+        } else {
+            st.write(&name, &bytes)
+        };
+        Some(ok && st.write(save::CURRENT_SLOT, &[slot as u8]))
     }
 
     /// Runs a save put off to this frame, and counts the notice down.
@@ -236,6 +297,9 @@ impl Session {
     /// Pauses or resumes; pausing reads the slots for the menu.
     pub fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
+        if !paused {
+            self.pending_new_slot = None;
+        }
         if paused {
             self.read_slots();
         } else {
@@ -266,23 +330,33 @@ impl Session {
 
     fn write_progress(&mut self) {
         if let Some(st) = &mut self.storage {
-            if Self::read_progress(st.as_ref()).is_ok() {
-                st.write(save::UNLOCKS_SLOT, &save::save_progress(&self.progress));
+            let bytes = save::save_progress(&self.progress);
+            match Self::read_progress(st.as_ref()) {
+                Ok(None) => {
+                    st.write(save::UNLOCKS_SLOT, &bytes);
+                }
+                Ok(Some(record)) if record.writable => {
+                    if record.backup {
+                        st.write_preserving_backup(save::UNLOCKS_SLOT, &bytes);
+                    } else {
+                        st.write(save::UNLOCKS_SLOT, &bytes);
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    fn read_progress(st: &dyn Storage) -> Result<Option<Progress>, SavedGameError> {
-        st.read(save::UNLOCKS_SLOT)
-            .map_err(|_| SavedGameError::Read)?
-            .as_deref()
-            .map(save::load_progress)
-            .transpose()
-            .map_err(SavedGameError::Invalid)
+    fn read_progress(st: &dyn Storage) -> Result<Option<Recovered<Progress>>, SavedGameError> {
+        read_record(st, save::UNLOCKS_SLOT, save::load_progress)
     }
 
     pub fn saved_progress(st: &dyn Storage) -> Progress {
-        Self::read_progress(st).ok().flatten().unwrap_or_default()
+        Self::read_progress(st)
+            .ok()
+            .flatten()
+            .map(|record| record.value)
+            .unwrap_or_default()
     }
 
     pub fn saved_game(
@@ -291,18 +365,31 @@ impl Session {
         world_id: u32,
         world: &WorldData,
     ) -> Result<Option<GameState>, SavedGameError> {
-        st.read(&save::game_slot(slot))
-            .map_err(|_| SavedGameError::Read)?
-            .as_deref()
-            .map(|bytes| save::load_game(bytes, world_id, world))
-            .transpose()
-            .map_err(SavedGameError::Invalid)
+        read_record(st, &save::game_slot(slot), |bytes| {
+            save::load_game(bytes, world_id, world)
+        })
+        .map(|record| record.map(|record| record.value))
     }
 
-    fn read_game(&self, slot: usize) -> Result<Option<GameState>, SavedGameError> {
+    fn read_game(&self, slot: usize) -> Result<Option<Recovered<GameState>>, SavedGameError> {
         self.storage.as_deref().map_or(Ok(None), |st| {
-            Self::saved_game(st, slot, self.world_id, &self.world)
+            read_record(st, &save::game_slot(slot), |bytes| {
+                save::load_game(bytes, self.world_id, &self.world)
+            })
         })
+    }
+
+    pub fn resume_saved_slot(&mut self) {
+        match self.read_game(self.slot) {
+            Ok(Some(record)) => {
+                self.resume(record.value);
+                if !record.writable {
+                    self.protect_active_slot();
+                }
+            }
+            Ok(None) => {}
+            Err(_) => self.protect_active_slot(),
+        }
     }
 
     fn read_slots(&mut self) {
@@ -312,15 +399,24 @@ impl Session {
                 continue;
             }
             self.slots[i] = match self.read_game(i) {
-                Ok(Some(g)) => SlotState::Saved(SlotInfo {
-                    island: self
-                        .world
-                        .levels
-                        .get(g.level_index)
-                        .map_or(String::new(), |l| l.name.clone()),
-                    day: g.days.day,
-                    coins: g.wallet.coins(),
-                }),
+                Ok(Some(record)) if record.writable => {
+                    let g = record.value;
+                    let info = SlotInfo {
+                        island: self
+                            .world
+                            .levels
+                            .get(g.level_index)
+                            .map_or(String::new(), |l| l.name.clone()),
+                        day: g.days.day,
+                        coins: g.wallet.coins(),
+                    };
+                    if record.backup {
+                        SlotState::Recovered(info)
+                    } else {
+                        SlotState::Saved(info)
+                    }
+                }
+                Ok(Some(_)) => SlotState::Protected,
                 Ok(None) => SlotState::Empty,
                 Err(_) => SlotState::Protected,
             };
@@ -356,13 +452,14 @@ impl Session {
             return;
         };
         self.slot = i;
-        self.active_slot_protected = false;
+        self.active_slot_protected = saved.as_ref().is_some_and(|record| !record.writable);
+        self.pending_new_slot = None;
         self.map = None;
         self.ended = None;
         self.won_for = 0.0;
         self.day_banner = None;
         match saved {
-            Some(g) => self.resume(g),
+            Some(record) => self.resume(record.value),
             None => {
                 let seed = self.game.rng.next_u32();
                 let g = GameState::start(&self.world, 0, seed, &self.progress, None);
@@ -373,10 +470,37 @@ impl Session {
                 self.save();
             }
         }
-        if let Some(st) = &mut self.storage {
-            st.write(save::CURRENT_SLOT, &[i as u8]);
+        if !self.active_slot_protected {
+            if let Some(st) = &mut self.storage {
+                st.write(save::CURRENT_SLOT, &[i as u8]);
+            }
         }
         self.paused = false;
+    }
+
+    pub fn confirm_new_game(&mut self) {
+        let Some(i) = self.pending_new_slot.take() else {
+            return;
+        };
+        // Only replace a rejected file. A slot restored during confirmation
+        // must be loaded through Retry instead.
+        if self.read_game(i).is_ok() {
+            self.read_slots();
+            return;
+        }
+        let mut rng = self.game.rng.clone();
+        let g = GameState::start(&self.world, 0, rng.next_u32(), &self.progress, None);
+        let bytes = save::save_game(&g, self.world_id);
+        let ok = self
+            .storage
+            .as_mut()
+            .is_some_and(|st| st.write_preserving_backup(&save::game_slot(i), &bytes));
+        self.save_notice = Some(SaveNotice::result(ok));
+        if ok {
+            self.load_from(i);
+        } else {
+            self.read_slots();
+        }
     }
 
     /// orig: `Game.EndGame()`: unlocks are settled and stored; a lost run's
@@ -402,7 +526,14 @@ impl Session {
         self.write_progress();
         if self.game.game_over
             && !self.active_slot_protected
-            && matches!(self.read_game(self.slot), Ok(Some(_)))
+            && matches!(
+                self.read_game(self.slot),
+                Ok(Some(Recovered {
+                    backup: false,
+                    writable: true,
+                    ..
+                }))
+            )
         {
             if let Some(st) = &mut self.storage {
                 st.delete(&save::game_slot(self.slot));
@@ -562,6 +693,8 @@ mod save_protection_tests {
     #[derive(Clone, Debug, Default, PartialEq)]
     struct Files {
         bytes: BTreeMap<String, Vec<u8>>,
+        backups: BTreeMap<String, Vec<u8>>,
+        archived: Vec<Vec<u8>>,
         unreadable: BTreeSet<String>,
     }
 
@@ -577,6 +710,21 @@ mod save_protection_tests {
 
         fn write(&mut self, slot: &str, data: &[u8]) -> bool {
             self.0.borrow_mut().bytes.insert(slot.into(), data.to_vec());
+            true
+        }
+
+        fn read_backup(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+            Ok(self.0.borrow().backups.get(slot).cloned())
+        }
+
+        fn write_preserving_backup(&mut self, slot: &str, data: &[u8]) -> bool {
+            let mut files = self.0.borrow_mut();
+            if files.unreadable.contains(slot) {
+                return false;
+            }
+            if let Some(old) = files.bytes.insert(slot.into(), data.to_vec()) {
+                files.archived.push(old);
+            }
             true
         }
 
@@ -717,5 +865,93 @@ mod save_protection_tests {
         assert!(!s.game.game_over);
         assert_eq!(s.game.wallet.coins(), 27);
         assert!(s.save());
+    }
+
+    #[test]
+    fn recovery_preserves_a_validated_backup_and_archives_rejected_bytes() {
+        let mut memory = Memory::default();
+        let mut s = session(&memory);
+        s.game.wallet.set(27);
+        let backup = save::save_game(&s.game, s.world_id);
+        memory
+            .0
+            .borrow_mut()
+            .backups
+            .insert(save::GAME_SLOT.into(), backup.clone());
+        memory.write(save::GAME_SLOT, b"corrupt primary");
+        s.game.wallet.set(5);
+        s.resume_saved_slot();
+        assert_eq!(s.game.wallet.coins(), 27);
+        s.set_paused(true);
+        assert!(matches!(s.slots[0], SlotState::Recovered(_)));
+
+        s.game.game_over = true;
+        s.end_run();
+        assert_eq!(
+            memory.read(save::GAME_SLOT).unwrap().unwrap(),
+            b"corrupt primary"
+        );
+        assert_eq!(
+            memory.read_backup(save::GAME_SLOT).unwrap(),
+            Some(backup.clone())
+        );
+        s.load_from(0);
+        assert!(s.save());
+        assert_eq!(memory.read_backup(save::GAME_SLOT).unwrap(), Some(backup));
+        assert_eq!(memory.0.borrow().archived, [b"corrupt primary".to_vec()]);
+    }
+
+    #[test]
+    fn unreadable_primary_recovers_read_only_and_failed_replacement_preserves_run() {
+        let mut memory = Memory::default();
+        let mut s = session(&memory);
+        s.game.wallet.set(27);
+        let backup = save::save_game(&s.game, s.world_id);
+        memory
+            .0
+            .borrow_mut()
+            .backups
+            .insert(save::GAME_SLOT.into(), backup.clone());
+        memory.write(save::GAME_SLOT, b"unreadable");
+        memory
+            .0
+            .borrow_mut()
+            .unreadable
+            .insert(save::GAME_SLOT.into());
+        s.game.wallet.set(5);
+        s.resume_saved_slot();
+        assert_eq!(s.game.wallet.coins(), 27);
+        assert!(!s.save());
+
+        let other = save::game_slot(1);
+        memory.write(&other, b"reject");
+        memory.0.borrow_mut().unreadable.insert(other.clone());
+        s.pending_new_slot = Some(1);
+        s.confirm_new_game();
+        assert_eq!(s.slot, 0);
+        assert_eq!(s.game.wallet.coins(), 27);
+        assert_eq!(memory.read_backup(save::GAME_SLOT).unwrap(), Some(backup));
+        assert_eq!(memory.0.borrow().bytes[&other], b"reject");
+    }
+
+    #[test]
+    fn replacement_requires_confirmation_and_keeps_the_rejected_file() {
+        let mut memory = Memory::default();
+        let mut s = session(&memory);
+        memory.write(save::GAME_SLOT, b"reject");
+        s.resume_saved_slot();
+        s.game.wallet.set(27);
+        let sheet = crate::sheet::Sheet::default();
+        let _ = crate::touch::tap(&mut s, &sheet, (100.0, 160.0));
+        assert_eq!(memory.read(save::GAME_SLOT).unwrap().unwrap(), b"reject");
+        s.pending_new_slot = Some(0);
+        let _ = crate::touch::tap(&mut s, &sheet, (80.0, 160.0));
+        assert!(s.pending_new_slot.is_none());
+        assert_eq!(memory.read(save::GAME_SLOT).unwrap().unwrap(), b"reject");
+        s.pending_new_slot = Some(0);
+        let _ = crate::touch::tap(&mut s, &sheet, (220.0, 160.0));
+        assert_eq!(s.game.wallet.coins(), 5);
+        assert_eq!(memory.0.borrow().archived, [b"reject".to_vec()]);
+        assert!(!s.paused);
     }
 }

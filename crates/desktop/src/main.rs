@@ -173,10 +173,8 @@ async fn main() {
     // --load reads the saved game even in screenshot runs (still never writing).
     let read_only = (storage.is_none() && !fresh && std::env::args().any(|a| a == "--load"))
         .then(storage::Files::new);
-    let saved = storage
+    let saved = read_only
         .as_ref()
-        .or(read_only.as_ref())
-        .filter(|_| !fresh)
         .map_or(Ok(None), |s| Session::saved_game(s, slot, world_id, &world));
     let record_progress = progress.clone();
     let mut app = Session::new(world, island, seed, progress);
@@ -232,14 +230,13 @@ async fn main() {
             ::scene::sound::Player::new(&app.world),
         )
     });
-    match saved {
-        Ok(Some(game)) => app.resume(game),
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("saved game protected ({e:?})");
-            if app.storage.is_some() {
-                app.protect_active_slot();
-            }
+    if !fresh && app.storage.is_some() {
+        app.resume_saved_slot();
+    } else {
+        match saved {
+            Ok(Some(game)) => app.resume(game),
+            Ok(None) => {}
+            Err(e) => eprintln!("saved game protected ({e:?})"),
         }
     }
     if let Some(coins) = std::env::args()

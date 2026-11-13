@@ -11,7 +11,6 @@
 
 mod audio;
 mod gpu;
-mod savefile;
 mod storage;
 
 use std::rc::Rc;
@@ -93,17 +92,12 @@ fn main() {
     let files = storage::SdCard::new();
     let progress = Session::saved_progress(&files);
     let slot = Session::last_slot(&files);
-    let saved = Session::saved_game(&files, slot, world_id, &world);
     let mut s = Session::new(world, 0, seed(), progress);
     s.storage = Some(Box::new(files));
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
-    match saved {
-        Ok(Some(game)) => s.resume(game),
-        Ok(None) => {}
-        Err(_) => s.protect_active_slot(),
-    }
+    s.resume_saved_slot();
     let mut sound = audio::Audio::new(SD_DIR, &s.world.audio);
     s.warning = sound.files_problem().unwrap_or_default();
     let mut player = scene::sound::Player::new(&s.world);

@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Recover validated save backups and archive rejected files before replacing a slot.
+
 - Protect unreadable and incompatible saves from automatic replacement or
   deletion. The pause menu marks protected slots and lets the player retry
   loading them or choose another slot.
