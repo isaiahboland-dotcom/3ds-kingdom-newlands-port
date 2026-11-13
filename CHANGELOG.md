@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Recover the 3DS music queue after a corrupt or unreadable stereo stream.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added
