@@ -66,8 +66,15 @@ fn read_input(bag_tap: bool) -> RawInput {
     }
 }
 
-fn target(w: f32, h: f32) -> RenderTarget {
-    let rt = render_target(w as u32, h as u32);
+fn target(w: f32, h: f32, depth: bool) -> RenderTarget {
+    let rt = render_target_ex(
+        w as u32,
+        h as u32,
+        RenderTargetParams {
+            depth,
+            ..Default::default()
+        },
+    );
     rt.texture.set_filter(FilterMode::Nearest);
     rt
 }
@@ -112,10 +119,10 @@ async fn main() {
         .nth(1)
         .and_then(|f| f.parse().ok())
         .unwrap_or(200);
-    let top_rt = target(TOP_W, TOP_H);
-    let bot_rt = target(BOT_W, BOT_H);
+    let top_rt = target(TOP_W, TOP_H, true);
+    let bot_rt = target(BOT_W, BOT_H, false);
     // Last frame's top screen, which the water reflects.
-    let previous_rt = target(TOP_W, TOP_H);
+    let previous_rt = target(TOP_W, TOP_H, false);
     let dir = std::env::var("KINGDOM_ASSETS").unwrap_or_else(|_| "assets".to_owned());
     let mut world_id = 0;
     let world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))
@@ -130,7 +137,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let mut assets = match Assets::load(std::path::Path::new(&dir), &world.sprites).await {
+    let mut assets = match Assets::load(std::path::Path::new(&dir), &world, world_id).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("could not load assets from {dir}/: {e}");
@@ -195,6 +202,8 @@ async fn main() {
         });
     let record_progress = progress.clone();
     let mut app = Session::new(world, island, seed, progress);
+    app.cloud_defs = assets.cloud_defs.take();
+    app.atmosphere = assets.atmosphere.take();
     app.debug = std::env::args().any(|a| a == "--debug");
     if let Some(h) = start_hour {
         app.game.clock.time = h;
@@ -513,7 +522,7 @@ async fn main() {
                 }
             }
             if frame == shot_frame && std::env::var_os("KINGDOM_DUMP").is_some() {
-                for (key, item) in draw_list(&app) {
+                for (key, item) in draw_list(&app, &sheet) {
                     if let DrawItem::Part(oi, pi) = item {
                         let o = &app.game.level.objects[oi];
                         let proto = &app.world.protos[o.proto as usize];

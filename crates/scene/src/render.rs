@@ -57,6 +57,12 @@ impl Rect {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Draw {
     pub flip: bool,
+    pub flip_y: bool,
+    /// Optional row-major affine basis in screen coordinates, about the pivot.
+    pub basis: Option<[f32; 4]>,
+    /// Add the highlight weighted by the inverse cloud texture coverage.
+    pub cloud_light: Option<Color>,
+    pub cloud_shadow: Option<crate::cloud_shadow::Receiver>,
     pub tint: Color,
     pub scale: f32,
     /// Radians, clockwise on screen, around the pivot.
@@ -64,6 +70,7 @@ pub struct Draw {
     /// orig: `SpriteFX` `recolorA` / `recolorB`.
     pub recolor: Option<(Color, Color)>,
     pub additive: bool,
+    pub depth_write: bool,
     /// Filtered smoothly when scaled (glows); everything else stays pixel-sharp.
     pub smooth: bool,
 }
@@ -72,11 +79,16 @@ impl Draw {
     pub fn tint(tint: Color) -> Draw {
         Draw {
             flip: false,
+            flip_y: false,
+            basis: None,
+            cloud_light: None,
+            cloud_shadow: None,
             tint,
             scale: 1.0,
             angle: 0.0,
             recolor: None,
             additive: false,
+            depth_write: false,
             smooth: false,
         }
     }
@@ -96,6 +108,11 @@ impl Draw {
         self
     }
 
+    pub fn cloud_light(mut self, light: Color) -> Draw {
+        self.cloud_light = Some(Color::new(light.r, light.g, light.b, 1.0));
+        self
+    }
+
     pub fn scale(mut self, scale: f32) -> Draw {
         self.scale = scale;
         self
@@ -112,12 +129,55 @@ impl Draw {
     }
 }
 
+/// Shared affine geometry, ordered top-left, top-right, bottom-right,
+/// bottom-left. Renderer flips change the pivot and UVs together.
+pub fn sprite_corners(s: &crate::sheet::Sprite, at: (f32, f32), d: &Draw) -> [(f32, f32); 4] {
+    let px = if d.flip { s.w as f32 - s.px } else { s.px };
+    let py = if d.flip_y { s.h as f32 - s.py } else { s.py };
+    let rel = [
+        (-px, -py),
+        (s.w as f32 - px, -py),
+        (s.w as f32 - px, s.h as f32 - py),
+        (-px, s.h as f32 - py),
+    ];
+    let [a, b, c, e] = d.basis.unwrap_or([1.0, 0.0, 0.0, 1.0]);
+    let (sin, cos) = d.angle.sin_cos();
+    let mut corners = rel.map(|(x, y)| {
+        let (x, y) = ((a * x + b * y) * d.scale, (c * x + e * y) * d.scale);
+        (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos)
+    });
+    if d.scale == 1.0 && d.angle == 0.0 && [a, b, c, e] == [1.0, 0.0, 0.0, 1.0] {
+        for p in &mut corners {
+            *p = (p.0.round(), p.1.round());
+        }
+    }
+    corners
+}
+
 /// Implemented by each backend (macroquad on desktop, citro3d on 3DS).
 /// Calls arrive in painter's order.
 pub trait Renderer {
     fn clear(&mut self, c: Color);
+    fn cloud_shadows(
+        &mut self,
+        _camera: crate::cloud_shadow::Camera,
+        _clouds: &[crate::cloud_shadow::Sprite],
+    ) -> bool {
+        false
+    }
     /// Sprite `id` (in the backend's `Sheet`) with its pivot at `at`.
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw);
+    /// Fog or mist with authored tight sprite geometry and optional vertex lighting.
+    fn atmosphere_sprite(
+        &mut self,
+        id: u32,
+        _mesh: &crate::cloud_mesh::CloudMesh,
+        at: (f32, f32),
+        draw: Draw,
+        _vertex_tints: Option<&[Color]>,
+    ) {
+        self.sprite(id, at, draw);
+    }
     /// 9-sliced into `dest`; `border` is (left, bottom, right, top) pixels.
     fn sliced(&mut self, id: u32, dest: Rect, border: (f32, f32, f32, f32), tint: Color);
     fn rect(&mut self, r: Rect, c: Color);
@@ -151,4 +211,6 @@ pub trait Renderer {
     /// Stereo depth of what's drawn next: 0 at the screen, 1 farthest
     /// behind it, negative in front. Backends without 3D ignore it.
     fn depth(&mut self, _d: f32) {}
+    /// Selects the ordered world depth pass. Negative infinity exits it.
+    fn world_depth(&mut self, _z: f32) {}
 }

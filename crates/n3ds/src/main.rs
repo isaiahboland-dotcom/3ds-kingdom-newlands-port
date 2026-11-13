@@ -22,6 +22,7 @@ use game::data::WorldData;
 use game::save;
 use game::state::TICK;
 use platform::Storage;
+use scene::authored::{read_file, FILENAME};
 use scene::session::Session;
 use scene::sheet::Sheet;
 use scene::{top, touch};
@@ -56,6 +57,14 @@ fn load() -> Result<(WorldData, u32, Sheet), String> {
         postcard::from_bytes(&sheet_bytes).map_err(|e| format!("sheet.bin: {e}"))?;
     sheet.validate()?;
     sheet.link(&world.sprites);
+    let authored_error = match read_file(format!("{ROMFS}/{FILENAME}")) {
+        Ok(bytes) => sheet.install_authored(&bytes, world_id, &world).err(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(e) = authored_error {
+        eprintln!("ignoring {FILENAME}: {e}");
+    }
     Ok((world, world_id, sheet))
 }
 
@@ -81,8 +90,46 @@ fn main() {
             return;
         }
     };
+    let mut sheet = sheet;
+    let cloud_path = format!("{ROMFS}/{}", scene::cloud_data::FILE_NAME);
+    let cloud_defs =
+        match scene::cloud_data::load(std::path::Path::new(&cloud_path), world_id, &sheet) {
+            Ok(def) => def,
+            Err(error) => {
+                eprintln!("ignoring {cloud_path}: {error}");
+                None
+            }
+        };
+    if let Some(def) = &cloud_defs {
+        let mesh_path = format!("{ROMFS}/{}", scene::cloud_mesh::FILE_NAME);
+        match read_file(&mesh_path) {
+            Ok(bytes) => {
+                if let Err(error) = sheet.link_cloud_meshes(&def.sprites, world_id, &bytes) {
+                    eprintln!("ignoring {mesh_path}: {error}");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("ignoring {mesh_path}: {error}"),
+        }
+    }
+    let atmosphere = match scene::atmosphere_data::AtmosphereDef::load(
+        std::path::Path::new(&format!("{ROMFS}/{}", scene::atmosphere_data::FILE_NAME)),
+        world_id,
+        &sheet,
+    ) {
+        Ok(def) => def,
+        Err(e) => {
+            eprintln!("ignoring fog and mist data ({e})");
+            None
+        }
+    };
+    let cloud_ids: Vec<_> = cloud_defs
+        .iter()
+        .flat_map(|def| &def.sprites)
+        .filter_map(|name| sheet.id(name))
+        .collect();
     let sheet = Rc::new(sheet);
-    let mut gpu = match gpu::Gpu::new(sheet.clone(), ROMFS) {
+    let mut gpu = match gpu::Gpu::new(sheet.clone(), ROMFS, &cloud_ids) {
         Ok(g) => g,
         Err(e) => {
             fail(&gfx, &mut hid, &apt, &e);
@@ -105,6 +152,8 @@ fn main() {
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
+    s.cloud_defs = cloud_defs;
+    s.atmosphere = atmosphere;
     if let Some(g) = saved {
         s.resume(g);
     }

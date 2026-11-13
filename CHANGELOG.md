@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Shade cloud highlights using the authored tight sprite meshes and the
+  original two-tap shadow depth comparison.
+- Light fog from nearby fires and apply covered fog depth across sorting layers on desktop and 3DS.
+- Render the authored fog and mist decks when the asset pack includes atmospheric data.
+- Prepare separate cloud shadow masks for the two eyes in 3DS stereo mode.
+
+- Render the authored stratus and cumulus decks with weather density, wind,
+  parallax, and red-moon color channels when an enhanced pack is installed.
+
+- Extract and draw authored sprite transforms and animation curves from an
+  optional animation pack extension. Existing world data, sheets, and
+  saves keep their formats.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added
