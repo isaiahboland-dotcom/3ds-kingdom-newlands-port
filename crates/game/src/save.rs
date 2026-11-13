@@ -35,8 +35,10 @@ pub fn game_slot(i: usize) -> alloc::string::String {
 /// Why a save couldn't be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadError {
-    /// Not a save, or from another version of the game.
+    /// Not a save at all (too short, or the wrong magic).
     Format,
+    /// A save from a version of the game this build can't read.
+    Version,
     /// Made with different game data (`world.bin`); ids wouldn't line up.
     World,
     /// Damaged. orig: "Save file corrupted".
@@ -68,7 +70,7 @@ fn body(bytes: &[u8], world: Option<u32>) -> Result<(u16, &[u8]), LoadError> {
     }
     let stored = u16::from_le_bytes([bytes[4], bytes[5]]);
     if stored == 0 || stored > VERSION {
-        return Err(LoadError::Format);
+        return Err(LoadError::Version);
     }
     let w = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
     if world.is_some_and(|x| x != w) {

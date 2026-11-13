@@ -4,9 +4,18 @@
 
 ### Fixed
 
-- Protect unreadable and incompatible saves from automatic replacement or
-  deletion. The pause menu marks protected slots and lets the player retry
-  loading them or choose another slot.
+- Saves are only written over or deleted without asking when they hold
+  exactly what the current run last loaded or saved. A save from other game
+  data or another version, a damaged save, a save that failed to read, and
+  another run's save are kept until the player chooses SAVE (overwrite) or
+  FIX → DELETE, each confirmed first. A failed read never locks a slot: the
+  next autosave checks again, and the run in memory is kept.
+- On 3DS, a damaged save whose backup still loads can be restored from the
+  pause menu (FIX → RESTORE); the damaged file is kept as `.sav.bad`.
+- A damaged or unreadable unlocks file is no longer silently skipped: the
+  touch screen warns, and the pause menu offers RETRY, RESTORE (3DS backup)
+  or REPLACE. Unlocks in a file that failed to read at startup are merged
+  in once it reads, never replaced by the defaults.
 
 ## 1.3.0 — 2026-11-08
 

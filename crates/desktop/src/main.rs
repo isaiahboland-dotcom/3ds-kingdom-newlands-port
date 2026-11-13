@@ -159,12 +159,13 @@ async fn main() {
     // unless --new or --island is given.
     let storage =
         (!shooting && !std::env::args().any(|a| a == "--no-save")).then(storage::Files::new);
+    let unlocks = storage.as_ref().map(|s| Session::saved_unlocks(s));
     let progress = if std::env::args().any(|a| a == "--unlocked") {
         Progress::everything()
     } else {
-        storage
+        unlocks
             .as_ref()
-            .map_or_else(Progress::default, |s| Session::saved_progress(s))
+            .map_or_else(Progress::default, |u| u.progress.clone())
     };
     // Input replay for the regression runner; always a fresh run.
     let record: Option<String> = arg("--record");
@@ -172,12 +173,10 @@ async fn main() {
     let slot = storage.as_ref().map_or(0, |s| Session::last_slot(s));
     // --load reads the saved game even in screenshot runs (still never writing).
     let read_only = (storage.is_none() && !fresh && std::env::args().any(|a| a == "--load"))
-        .then(storage::Files::new);
-    let saved = storage
-        .as_ref()
-        .or(read_only.as_ref())
-        .filter(|_| !fresh)
-        .map_or(Ok(None), |s| Session::saved_game(s, slot, world_id, &world));
+        .then(storage::Files::new)
+        .map_or(Ok(None), |s| {
+            Session::saved_game(&s, slot, world_id, &world)
+        });
     let record_progress = progress.clone();
     let mut app = Session::new(world, island, seed, progress);
     app.debug = std::env::args().any(|a| a == "--debug");
@@ -209,6 +208,14 @@ async fn main() {
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
     app.slot = slot;
+    if let Some(u) = unlocks {
+        if let Some(p) = &u.problem() {
+            eprintln!(
+                "the unlocks file can't be used ({p:?}); unlocks aren't saved until it's fixed"
+            );
+        }
+        app.use_unlocks(u);
+    }
     if std::env::args().any(|a| a == "--paused") {
         app.set_paused(true);
     }
@@ -232,14 +239,18 @@ async fn main() {
             ::scene::sound::Player::new(&app.world),
         )
     });
-    match saved {
-        Ok(Some(game)) => app.resume(game),
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("saved game protected ({e:?})");
-            if app.storage.is_some() {
-                app.protect_active_slot();
-            }
+    if app.storage.is_some() && !fresh {
+        if let Err(e) = app.open_saved() {
+            eprintln!(
+                "slot {} can't be loaded ({e:?}); it's kept as it is",
+                slot + 1
+            );
+        }
+    } else {
+        match read_only {
+            Ok(Some(game)) => app.resume(game),
+            Ok(None) => {}
+            Err(e) => eprintln!("ignoring the saved game ({e:?})"),
         }
     }
     if let Some(coins) = std::env::args()

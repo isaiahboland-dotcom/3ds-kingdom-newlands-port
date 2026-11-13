@@ -1731,6 +1731,7 @@ fn draw_save_notice<R: Renderer>(c: &mut Ctx<R>) {
         SaveNotice::Saving(..) => ("Saving", true, 1.0),
         SaveNotice::Saved(t) => ("Game saved", false, t),
         SaveNotice::Failed(t) => ("Save failed", false, t),
+        SaveNotice::Blocked(t) => ("Not saved - see menu", false, t),
     };
     let tint = Color::new(1.0, 1.0, 1.0, (left / 0.5).min(1.0));
     let (w, _) = crate::text::measure(c.sheet, text, 14.0);
@@ -1740,7 +1741,7 @@ fn draw_save_notice<R: Renderer>(c: &mut Ctx<R>) {
     } else {
         c.sheet.id("coin_spin_0")
     };
-    if matches!(notice, SaveNotice::Failed(_)) {
+    if matches!(notice, SaveNotice::Failed(_) | SaveNotice::Blocked(_)) {
         crate::text::draw(c.r, c.sheet, text, x - w, y, 14.0, tint);
         return;
     }

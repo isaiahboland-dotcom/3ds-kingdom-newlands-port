@@ -105,6 +105,28 @@ impl Progress {
         Some(list[rng.range_i32(0, list.len() as i32) as usize])
     }
 
+    /// Folds in unlocks kept elsewhere (a file this session couldn't read at
+    /// first), so neither side loses any: every unlock, the furthest
+    /// island, what's been finished, and this side's banner over theirs. The
+    /// forced recent unlock is whichever has more islands left to force it.
+    pub fn merge(&mut self, other: &Progress) {
+        for &u in &other.unlocked {
+            if !self.unlocked.contains(&u) {
+                self.unlocked.push(u);
+            }
+        }
+        if other.force_recent > self.force_recent {
+            (self.recent, self.force_recent) = (other.recent, other.force_recent);
+        }
+        self.land = self.land.max(other.land);
+        self.game_finished |= other.game_finished;
+        self.challenge_finished |= other.challenge_finished;
+        self.tutorial_done |= other.tutorial_done;
+        if self.chosen.is_none() {
+            self.chosen = other.chosen;
+        }
+    }
+
     /// orig: `UnlockAndQueueNextLand()` (called from `Game.EndGame`).
     pub fn finish(&mut self, e: Ending) -> Unveiled {
         let mut out = Unveiled::default();

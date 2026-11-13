@@ -91,19 +91,16 @@ fn main() {
 
     // Saves on the SD card. orig: PersistentManager's AUTO slot, UnlockManager's unlocks.
     let files = storage::SdCard::new();
-    let progress = Session::saved_progress(&files);
+    let unlocks = Session::saved_unlocks(&files);
     let slot = Session::last_slot(&files);
-    let saved = Session::saved_game(&files, slot, world_id, &world);
-    let mut s = Session::new(world, 0, seed(), progress);
+    let mut s = Session::new(world, 0, seed(), unlocks.progress.clone());
     s.storage = Some(Box::new(files));
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
-    match saved {
-        Ok(Some(game)) => s.resume(game),
-        Ok(None) => {}
-        Err(_) => s.protect_active_slot(),
-    }
+    s.use_unlocks(unlocks);
+    // A slot that can't be loaded is kept; the menu opens on what to do.
+    let _ = s.open_saved();
     let mut sound = audio::Audio::new(SD_DIR, &s.world.audio);
     s.warning = sound.files_problem().unwrap_or_default();
     let mut player = scene::sound::Player::new(&s.world);

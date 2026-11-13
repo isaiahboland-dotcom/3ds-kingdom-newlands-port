@@ -10,7 +10,7 @@ use game::rng::Rng;
 
 use crate::heraldry;
 use crate::render::{Color, Draw, Rect, Renderer};
-use crate::session::{Session, SlotState};
+use crate::session::{Choice, Incompatible, Problem, Prompt, Session, SlotInfo, SlotState};
 use crate::sheet::Sheet;
 use crate::text;
 use crate::top;
@@ -38,6 +38,12 @@ const SLOT_GAP: f32 = 48.0;
 pub const RESUME: Rect = Rect::new(110.0, 196.0, 100.0, 28.0);
 /// Opens the banner editor.
 const BANNER: Rect = Rect::new(10.0, 196.0, 92.0, 28.0);
+/// Shown while the unlocks file can't be used: what to do about it.
+const UNLOCKS: Rect = Rect::new(222.0, 8.0, 90.0, 26.0);
+/// A question over the pause menu, its buttons along the bottom.
+const PROMPT: Rect = Rect::new(8.0, 42.0, 304.0, 148.0);
+const PROMPT_BUTTON_H: f32 = 26.0;
+const WARN: Color = Color::new(1.0, 0.6, 0.4, 1.0);
 
 /// The banner editor: previews on the left, choices on the right, the
 /// color picker along the bottom.
@@ -248,7 +254,20 @@ pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
         tap_editor(s, p);
         return Tap::Nothing;
     }
+    if s.paused && s.prompt.is_some() {
+        if let Some(c) = prompt_buttons(s)
+            .into_iter()
+            .find_map(|(b, c)| b.contains(p).then_some(c))
+        {
+            s.choose_prompt(c);
+        }
+        return Tap::Nothing;
+    }
     if s.paused {
+        if s.unlocks.is_some() && UNLOCKS.contains(p) {
+            s.ask_unlocks();
+            return Tap::Nothing;
+        }
         if BANNER.contains(p) {
             s.editor = Some(Editor::default());
             return Tap::Nothing;
@@ -257,7 +276,11 @@ pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
             if slot_save(i).contains(p) {
                 s.save_to(i);
             } else if slot_load(i).contains(p) {
-                s.load_from(i);
+                if s.slots[i].protected() {
+                    s.prompt = Some(Prompt::Fix(i, s.slots[i].clone()));
+                } else {
+                    s.load_from(i);
+                }
             }
         }
         if RESUME.contains(p) {
@@ -298,19 +321,14 @@ pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
             Color::new(1.0, 0.85, 0.3, 1.0),
         );
     }
-    let lines = s.warning.lines().count() as f32;
-    for (i, l) in s.warning.lines().enumerate() {
+    let unlocks = (s.unlocks.is_some() && !s.paused)
+        .then_some("UNLOCKS ARE NOT BEING SAVED - SEE PAUSE MENU");
+    let warning: Vec<&str> = s.warning.lines().chain(unlocks).collect();
+    let lines = warning.len() as f32;
+    for (i, l) in warning.into_iter().enumerate() {
         let (w, _) = text::measure(sheet, l, 12.0);
         let y = H - 11.0 * (lines - i as f32);
-        text::draw(
-            r,
-            sheet,
-            l,
-            ((W - w) / 2.0).round(),
-            y,
-            12.0,
-            Color::new(1.0, 0.6, 0.4, 1.0),
-        );
+        text::draw(r, sheet, l, ((W - w) / 2.0).round(), y, 12.0, WARN);
     }
     // Pause button.
     r.rect_lines(PAUSE, 2.0, Color::WHITE);
@@ -374,30 +392,173 @@ fn draw_pause(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
             16.0,
             color,
         );
-        let (info, load) = match &s.slots[i] {
-            SlotState::Saved(info) => (
-                format!(
-                    "{} - DAY {} - {} COINS",
-                    info.island.to_uppercase(),
-                    info.day,
-                    info.coins
-                ),
-                "LOAD",
-            ),
+        let st = &s.slots[i];
+        let (info, load) = match st {
+            SlotState::Saved(info) => (summary(info), "LOAD"),
             SlotState::Empty => ("EMPTY".to_owned(), "NEW"),
-            SlotState::Protected => ("SAVE PROTECTED".to_owned(), "RETRY"),
+            _ => (status(st).to_owned(), "FIX"),
         };
-        text::draw(r, sheet, &info, row.x + 8.0, row.y + 34.0, 14.0, dim);
-        let save_color = if s.slots[i] == SlotState::Protected {
-            dim
-        } else {
-            Color::WHITE
-        };
+        let info_color = if st.protected() { WARN } else { dim };
+        text::draw(r, sheet, &info, row.x + 8.0, row.y + 34.0, 14.0, info_color);
+        let save_color = if st.protected() { dim } else { Color::WHITE };
         button(r, sheet, slot_save(i), "SAVE", save_color);
-        button(r, sheet, slot_load(i), load, Color::WHITE);
+        let load_color = if st.protected() { WARN } else { Color::WHITE };
+        button(r, sheet, slot_load(i), load, load_color);
     }
     button(r, sheet, BANNER, "BANNER", Color::WHITE);
     button(r, sheet, RESUME, "RESUME", GOLD);
+    if s.unlocks.is_some() {
+        button(r, sheet, UNLOCKS, "UNLOCKS", WARN);
+    }
+    if let Some(p) = &s.prompt {
+        draw_prompt(s, p, sheet, r);
+    }
+}
+
+fn summary(info: &SlotInfo) -> String {
+    format!(
+        "{} - DAY {} - {} COINS",
+        info.island.to_uppercase(),
+        info.day,
+        info.coins
+    )
+}
+
+/// A protected slot's line in the menu.
+fn status(st: &SlotState) -> &'static str {
+    match st {
+        SlotState::Incompatible(Incompatible::OtherData) => "SAVED WITH OTHER GAME DATA",
+        SlotState::Incompatible(Incompatible::OtherVersion) => "FROM ANOTHER GAME VERSION",
+        SlotState::Damaged(Some(_)) => "DAMAGED - BACKUP AVAILABLE",
+        SlotState::Damaged(None) => "DAMAGED",
+        SlotState::Unreadable(_) => "COULD NOT BE READ",
+        SlotState::Empty | SlotState::Saved(_) => "",
+    }
+}
+
+/// What the prompt says, in lines of text.
+fn prompt_text(p: &Prompt) -> Vec<String> {
+    let slot_lines = |i: usize, st: &SlotState| -> Vec<String> {
+        let n = i + 1;
+        let mut out = match st {
+            SlotState::Saved(info) => vec![format!("SLOT {n} HOLDS ANOTHER GAME:"), summary(info)],
+            SlotState::Empty => vec![format!("SLOT {n} IS EMPTY.")],
+            SlotState::Incompatible(Incompatible::OtherData) => vec![
+                format!("SLOT {n} WAS SAVED WITH OTHER GAME DATA."),
+                "THIS BUILD CANNOT LOAD IT. THE BUILD".into(),
+                "THAT MADE IT STILL CAN.".into(),
+            ],
+            SlotState::Incompatible(Incompatible::OtherVersion) => vec![
+                format!("SLOT {n} IS FROM ANOTHER VERSION"),
+                "OF THE GAME. THIS BUILD CANNOT LOAD IT.".into(),
+            ],
+            SlotState::Damaged(_) => vec![format!("SLOT {n} IS DAMAGED AND CANNOT LOAD.")],
+            SlotState::Unreadable(_) => vec![
+                format!("SLOT {n} COULD NOT BE READ."),
+                "IT MAY READ IF YOU RETRY.".into(),
+            ],
+        };
+        if let Some(b) = st.backup() {
+            out.push(format!("BACKUP: {}", summary(b)));
+        }
+        out
+    };
+    match p {
+        Prompt::Overwrite(i, st) => {
+            let mut out = slot_lines(*i, st);
+            out.push(String::new());
+            out.push(format!("SAVE THIS GAME OVER SLOT {}?", i + 1));
+            out.push(if st.backup().is_some() {
+                "THE SAVE AND ITS BACKUP ARE LOST.".into()
+            } else {
+                "WHAT IT HOLDS NOW IS LOST.".into()
+            });
+            out
+        }
+        Prompt::Fix(i, st) => {
+            let mut out = slot_lines(*i, st);
+            out.push(String::new());
+            out.push("TO USE THE SLOT AGAIN, DELETE IT HERE".into());
+            out.push("OR TAP ITS SAVE TO SAVE OVER IT.".into());
+            out
+        }
+        Prompt::Delete(i, st) => {
+            let mut out = slot_lines(*i, st);
+            out.push(String::new());
+            out.push(format!("DELETE SLOT {} FOR GOOD?", i + 1));
+            out
+        }
+        Prompt::Unlocks(u) | Prompt::ReplaceUnlocks(u) => {
+            let mut out = vec![
+                match u.kind {
+                    Problem::Unreadable => "THE UNLOCKS FILE COULD NOT BE READ.",
+                    Problem::Damaged => "THE UNLOCKS FILE IS DAMAGED.",
+                    Problem::OtherVersion => "THE UNLOCKS FILE IS FROM ANOTHER VERSION.",
+                }
+                .into(),
+                "UNLOCKS EARNED NOW ARE NOT SAVED".into(),
+                "UNTIL IT IS FIXED.".into(),
+            ];
+            if u.backup {
+                out.push("A BACKUP IS AVAILABLE.".into());
+            }
+            if matches!(p, Prompt::ReplaceUnlocks(_)) {
+                out.push(String::new());
+                out.push("REPLACE IT WITH THIS SESSION'S UNLOCKS?".into());
+                out.push("WHAT IT HOLDS NOW IS LOST.".into());
+            }
+            out
+        }
+    }
+}
+
+/// The prompt's buttons, left to right along its bottom.
+fn prompt_buttons(s: &Session) -> Vec<(Rect, Choice)> {
+    let Some(p) = &s.prompt else {
+        return Vec::new();
+    };
+    let choices = p.choices();
+    let n = choices.len() as f32;
+    let gap = 6.0;
+    let w = ((PROMPT.w - 16.0 - gap * (n - 1.0)) / n).floor();
+    let y = PROMPT.y + PROMPT.h - PROMPT_BUTTON_H - 8.0;
+    choices
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let x = PROMPT.x + 8.0 + i as f32 * (w + gap);
+            (Rect::new(x, y, w, PROMPT_BUTTON_H), c)
+        })
+        .collect()
+}
+
+fn draw_prompt(s: &Session, p: &Prompt, sheet: &Sheet, r: &mut impl Renderer) {
+    r.rect(PROMPT, BACKGROUND);
+    outline(r, PROMPT, 2.0, WARN);
+    for (i, l) in prompt_text(p).iter().enumerate() {
+        text::draw(
+            r,
+            sheet,
+            l,
+            PROMPT.x + 10.0,
+            PROMPT.y + 20.0 + i as f32 * 15.0,
+            14.0,
+            Color::WHITE,
+        );
+    }
+    for (b, c) in prompt_buttons(s) {
+        let destructive = matches!(c, Choice::Overwrite | Choice::Delete | Choice::Replace);
+        let confirm = matches!(
+            p,
+            Prompt::Overwrite(..) | Prompt::Delete(..) | Prompt::ReplaceUnlocks(_)
+        );
+        let color = if destructive && confirm {
+            WARN
+        } else {
+            Color::WHITE
+        };
+        button(r, sheet, b, c.label(), color);
+    }
 }
 
 /// The banner editor: the banner and the monarch as they'll look, king or
