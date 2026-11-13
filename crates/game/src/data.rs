@@ -1012,6 +1012,8 @@ pub struct WorldData {
     pub catapult_physics: Vec<(ProtoId, crate::siege::CatapultPhysics)>,
     #[cfg_attr(feature = "serde", serde(skip))]
     pub boss_throw: Option<BossThrowDef>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub boss_bash_impact: Option<f32>,
     /// Ground-relative local collider polygons for completed walls, keyed by prototype.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub boulder_walls: Vec<(ProtoId, Vec<BoulderWallPolygon>)>,

@@ -646,6 +646,10 @@ pub enum GreedEvent {
     BoulderThrown {
         x: f32,
     },
+    BossBashImpact {
+        x: f32,
+        y: f32,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2242,9 +2246,12 @@ fn update_boss_chase_or_attack(
     let in_front = |x: f32| (0.0..=boss::REACH).contains(&((x - boss_x) * dir));
     if let Some((bt, mut landed)) = t.bash {
         let bt = bt + dt;
-        let impact_at = boss::BASH_IMPACT;
+        let impact_at = ctx.world.boss_bash_impact.unwrap_or(boss::BASH_IMPACT);
         if !landed && bt >= impact_at {
             landed = true;
+            if ctx.world.boss_bash_impact.is_some() {
+                events(GreedEvent::BossBashImpact { x: t.x, y: t.y });
+            }
             let mut hits = Vec::new();
             for i in ctx.targets {
                 if in_front(i.x) {

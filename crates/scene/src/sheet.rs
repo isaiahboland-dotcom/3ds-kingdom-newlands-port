@@ -176,6 +176,11 @@ impl Sheet {
             .as_ref()
             .map_or_else(Vec::new, |a| a.catapults.clone());
         world.boss_throw = self.authored.as_ref().and_then(|a| a.boss_throw.clone());
+        world.boss_bash_impact = self
+            .authored
+            .as_ref()
+            .and_then(|a| a.clips.clip("boss_bash_right"))
+            .and_then(|clip| clip.first_event_time(game::animation::EventKind::BashImpact));
         world.boulder_walls = self
             .authored
             .as_ref()

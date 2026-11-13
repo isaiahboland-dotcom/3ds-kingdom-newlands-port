@@ -14,6 +14,7 @@
 
 mod audio;
 mod authored_clips;
+mod boulder_fx;
 mod clips;
 mod fonts;
 mod pack;
@@ -108,6 +109,13 @@ fn main() -> ExitCode {
         Err(e) => eprintln!("warning: font: {e}"),
     }
 
+    let boulder_effects = match boulder_fx::extract(&assets, &guids, &mut sheet) {
+        Ok(definition) => definition,
+        Err(e) => {
+            eprintln!("boulder effects: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(e) = pack::write_pages(&sheet, &out.join("sprites"), &out.join("sprites.json")) {
         eprintln!("packing: {e}");
         return ExitCode::FAILURE;
@@ -147,6 +155,7 @@ fn main() -> ExitCode {
         &sheet.names_by_path,
         &sizes,
         animations,
+        boulder_effects,
     ) {
         eprintln!("scenes: {e}");
         return ExitCode::FAILURE;
@@ -176,6 +185,7 @@ fn export_scenes(
     sprite_names: &HashMap<String, String>,
     sprite_sizes: &world::SpriteSizes,
     animations: game::animation::Library,
+    boulder_effects: scene::boulder_fx::BoulderFxDef,
 ) -> Result<(), String> {
     let r = scenes::Resolver::new(guids, assets);
     let main = scenes::export_file(&assets.join("main.unity"), &r)?;
@@ -257,6 +267,11 @@ fn export_scenes(
         boulder_walls,
     };
     let world_id = game::save::fingerprint(&bytes);
+    std::fs::write(
+        out.join(scene::boulder_fx::FILENAME),
+        boulder_effects.encode(world_id)?,
+    )
+    .map_err(|e| e.to_string())?;
     if let Some(camera) = world::camera_def(&main)? {
         std::fs::write(out.join(scene::camera::FILENAME), camera.encode(world_id)?)
             .map_err(|e| e.to_string())?;

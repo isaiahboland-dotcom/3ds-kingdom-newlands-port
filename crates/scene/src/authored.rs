@@ -193,6 +193,10 @@ impl AssetAnimation {
         world.catapult_physics = data.catapults;
         world.boss_throw = data.boss_throw;
         world.boulder_walls = data.boulder_walls;
+        world.boss_bash_impact = data
+            .clips
+            .clip("boss_bash_right")
+            .and_then(|clip| clip.first_event_time(game::animation::EventKind::BashImpact));
         Ok(())
     }
 

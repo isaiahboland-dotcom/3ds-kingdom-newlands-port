@@ -19,9 +19,9 @@ pub const H: f32 = 240.0;
 /// orig: `ScreenManager.PixelsPerUnit`.
 pub const PPU: f32 = 32.0;
 
-pub use game::build::WALK_Y;
 /// orig: Main Camera y. The view is centered here.
-pub const CAMERA_Y: f32 = 1.875;
+pub use crate::camera::CAMERA_Y;
+pub use game::build::WALK_Y;
 /// Depth of the monarch and coins in the game layer. orig: Player prefab z;
 /// `Droppable.Drop` puts coins 0.01 in front of the dropper.
 const MONARCH_Z: f32 = 1.0;
@@ -199,8 +199,8 @@ const GROUND_ALBEDO: [f32; 3] = [0.22, 0.14, 0.09];
 /// Screen pixel of a world point in a layer with parallax `ratio`.
 pub fn layer_to_screen(s: &Session, x: f32, y: f32, ratio: f32) -> (f32, f32) {
     (
-        ((x - ratio * s.camera_x) * PPU + W / 2.0).round(),
-        (H / 2.0 - (y - CAMERA_Y) * PPU).round(),
+        ((x - ratio * (s.camera_x + s.camera_shake_offset()[0])) * PPU + W / 2.0).round(),
+        world_row(s, y),
     )
 }
 
@@ -212,6 +212,10 @@ pub fn world_to_screen(s: &Session, x: f32, y: f32) -> (f32, f32) {
 /// Screen row of a world height.
 pub fn screen_y(y: f32) -> f32 {
     (H / 2.0 - (y - CAMERA_Y) * PPU).round()
+}
+
+fn world_row(s: &Session, y: f32) -> f32 {
+    screen_y(y - s.camera_shake_offset()[1])
 }
 
 fn offset(p: (f32, f32), dx: f32, dy: f32) -> (f32, f32) {
@@ -228,8 +232,15 @@ fn stereo_depth(z: f32) -> f32 {
 }
 
 /// Full-width vertical gradient between world heights. orig: `HorizontalGradient`.
-fn gradient(r: &mut impl Renderer, bottom_y: f32, top_y: f32, bottom: Color, top: Color) {
-    let (yb, yt) = (screen_y(bottom_y), screen_y(top_y));
+fn gradient(
+    s: &Session,
+    r: &mut impl Renderer,
+    bottom_y: f32,
+    top_y: f32,
+    bottom: Color,
+    top: Color,
+) {
+    let (yb, yt) = (world_row(s, bottom_y), world_row(s, top_y));
     r.gradient(Rect::new(0.0, yt, W, yb - yt), top, bottom);
 }
 
@@ -268,6 +279,7 @@ pub enum DrawItem {
     Chest(usize),
     Banker,
     Boulder(usize),
+    BoulderParticle(usize),
     Dog,
     Animal(usize),
     /// A boat part lying at the wharf (or flying into place).
@@ -660,7 +672,7 @@ const GROUND_FADE: f32 = 1.0 / 6.0;
 fn draw_ground_light<R: Renderer>(c: &mut Ctx<R>) {
     let s = c.s;
     let top = (world_to_screen(s, 0.0, 0.0).1 - 2.0).round();
-    let bottom = screen_y(s.world.water.top).round();
+    let bottom = world_row(s, s.world.water.top).round();
     if bottom <= top || c.lights.is_empty() {
         return;
     }
@@ -716,7 +728,7 @@ fn draw_fire_reflection<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &Fire
     let tint = Color::new(r * a, g * a, b * a, 1.0);
     // Mirrored from 0.25 units above the water's top, so it starts a few
     // pixels into the water and hangs down.
-    let y = screen_y(w.top) + 0.25 * PPU * w.reflection_scale;
+    let y = world_row(s, w.top) + 0.25 * PPU * w.reflection_scale;
     for i in 0..copies {
         let x = (at.0 + (i as f32 - (copies - 1) as f32 / 2.0) * 8.0).round();
         c.r.sprite(
@@ -1780,7 +1792,7 @@ fn draw_stars<R: Renderer>(c: &mut Ctx<R>) {
         if a <= 0.004 {
             continue;
         }
-        let (x, y) = (x.round(), y.round());
+        let (x, y) = (x.round(), y.round() + c.s.camera_shake_offset()[1] * PPU);
         c.r.rect(Rect::new(x, y, size, size), Color::new(1.0, 1.0, 1.0, a));
     }
 }
@@ -1830,12 +1842,39 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     // the water reflects the sky (approximated until the reflection pass).
     c.r.depth(1.0);
     c.r.clear(sky_top);
-    gradient(c.r, SKY.1, SKY.2, sky_bottom, sky_top);
-    let below = screen_y(SKY.1);
+    gradient(s, c.r, SKY.1, SKY.2, sky_bottom, sky_top);
+    let below = world_row(s, SKY.1);
     c.r.rect(Rect::new(0.0, below, W, H - below), sky_bottom);
 
     let game_z = layer_z(&s.world);
-    let items = draw_list(s, c.sheet);
+    let particles: Vec<_> = s
+        .boulder_effects
+        .iter()
+        .flat_map(|def| s.boulder_particles.samples(def))
+        .filter_map(|p| {
+            if (p.x - s.camera_x).abs() > W / PPU / 2.0 + 2.0 {
+                return None;
+            }
+            Some((c.sheet.id(p.sprite)?, p))
+        })
+        .collect();
+    let mut items = draw_list(s, c.sheet);
+    if !particles.is_empty() {
+        items.extend(
+            particles
+                .iter()
+                .enumerate()
+                .map(|(i, (_, p))| ((0, 0, -0.7 - p.z), DrawItem::BoulderParticle(i))),
+        );
+        items.sort_by(|a, b| {
+            let (layer_a, order_a, z_a) = a.0;
+            let (layer_b, order_b, z_b) = b.0;
+            layer_a
+                .cmp(&layer_b)
+                .then(order_a.cmp(&order_b))
+                .then(z_a.total_cmp(&z_b))
+        });
+    }
     c.lights = items
         .iter()
         .filter_map(|(_, item)| fire_item(s, item))
@@ -1856,6 +1895,7 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Coin(i) => draw_coin(c, i),
             DrawItem::Monarch => draw_monarch(c),
             DrawItem::Fill => gradient(
+                s,
                 c.r,
                 FILL.1,
                 FILL.2,
@@ -1870,7 +1910,7 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                 };
                 let haze = lit(Color::rgba(colors[color::HAZE]), &light);
                 if haze.a > 0.0 {
-                    gradient(c.r, b, t, haze, Color { a: 0.0, ..haze });
+                    gradient(s, c.r, b, t, haze, Color { a: 0.0, ..haze });
                 }
             }
             DrawItem::Water => draw_water(c),
@@ -1893,6 +1933,17 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                 if let Some((at, fire, seed)) = fire_item(s, &item) {
                     draw_fire(c, at, &fire, seed);
                 }
+            }
+            DrawItem::BoulderParticle(i) => {
+                let (sprite, p) = particles[i];
+                let at = world_to_screen(s, p.x, p.y);
+                c.sprite_lit(
+                    sprite,
+                    at,
+                    Draw::tint(c.lit(Color::rgba(p.color)))
+                        .scale(p.scale)
+                        .angle(p.angle),
+                );
             }
             DrawItem::Boulder(i) => {
                 draw_boulder(c, &s.game.siege.boulders[i]);
@@ -1940,7 +1991,7 @@ fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
     let w = &s.world.water;
     let colors = s.game.blender.state.colors;
     let water = Color::rgba(colors[color::WATER]);
-    let horizon = screen_y(w.top);
+    let horizon = world_row(s, w.top);
     let light = &s.game.blender.state;
     let wet = (light.floats[float::RAIN] + light.floats[float::SNOW]).clamp(0.0, 1.0);
     let mirror = 1.0 - 0.8 * wet;
@@ -1978,8 +2029,8 @@ fn draw_water<R: Renderer>(c: &mut Ctx<R>) {
     let (mw, mh) = (w.size.0 as f32, w.size.1 as f32);
     // Texel column under the screen's centre: the band is `repeat.0` maps wide.
     let band_px = mw * w.repeat.0;
-    let centre = band_px / 2.0;
-    let bottom = screen_y(w.bottom).min(H);
+    let centre = band_px / 2.0 + s.camera_shake_offset()[0] * (0.25 * mw);
+    let bottom = world_row(s, w.bottom).min(H);
     let squash = w.reflection_scale.max(0.1);
     let mut y = horizon;
     while y < bottom {

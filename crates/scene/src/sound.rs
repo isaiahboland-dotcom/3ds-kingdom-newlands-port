@@ -238,6 +238,13 @@ pub fn on_event(
             _ => {}
         },
         GameEvent::BoulderBurst { x, .. } => cue(w.audio.sound("Boulder.explosionSound"), Some(x)),
+        GameEvent::BoulderImpact {
+            x,
+            collision_sound: true,
+            ..
+        } => {
+            cue(w.audio.sound("Boulder.collisionSound"), Some(x));
+        }
         GameEvent::Catapult(game::siege::CatapultEvent::Fired { x, .. }) => {
             cue(w.audio.sound("Catapult.fireSound"), Some(x))
         }

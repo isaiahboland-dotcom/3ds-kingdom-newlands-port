@@ -224,6 +224,13 @@ async fn main() {
     }
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
+    match ::scene::boulder_fx::BoulderFxDef::read(
+        std::path::Path::new(&dir).join(::scene::boulder_fx::FILENAME),
+        world_id,
+    ) {
+        Ok(def) => app.boulder_effects = def,
+        Err(e) => eprintln!("ignoring Boulder effects: {e}"),
+    }
     match ::scene::camera::CameraDef::read_file(
         std::path::Path::new(&dir).join(::scene::camera::FILENAME),
         world_id,

@@ -116,6 +116,13 @@ fn main() {
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
+    match scene::boulder_fx::BoulderFxDef::read(
+        format!("{ROMFS}/{}", scene::boulder_fx::FILENAME),
+        world_id,
+    ) {
+        Ok(def) => s.boulder_effects = def,
+        Err(e) => eprintln!("ignoring Boulder effects: {e}"),
+    }
     match scene::camera::CameraDef::read_file(
         format!("{ROMFS}/{}", scene::camera::FILENAME),
         world_id,

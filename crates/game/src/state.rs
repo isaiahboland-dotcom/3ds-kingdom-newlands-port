@@ -79,6 +79,10 @@ pub enum GameEvent {
         side: i8,
         impact: bool,
     },
+    CameraShake {
+        x: f32,
+        y: f32,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2259,6 +2263,10 @@ impl GameState {
         let mut tool_removals: Vec<usize> = Vec::new();
         for e in out {
             match e {
+                GreedEvent::BossBashImpact { x, y } => {
+                    events.push(GameEvent::CameraShake { x, y });
+                    continue;
+                }
                 GreedEvent::Hit { by, target, damage } => {
                     let dir = self
                         .greed
@@ -2515,6 +2523,10 @@ impl GameState {
         if self.god || !self.has_crown {
             return;
         }
+        events.push(GameEvent::CameraShake {
+            x: self.monarch.x,
+            y: self.monarch_y,
+        });
         if self.passenger.is_some() {
             self.dump_passenger();
         } else {
@@ -3121,6 +3133,25 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, GameEvent::BoulderBurst { impact: true, .. })));
         }
+    }
+
+    #[test]
+    fn returned_boulder_shakes_only_on_admitted_player_damage() {
+        let world = fight_world();
+        let mut game = GameState::new(&world, 0, 7);
+        let mut events = Vec::new();
+        game.god = true;
+        game.hurt_monarch_heavy(1, 1.0, &mut events);
+        game.god = false;
+        game.has_crown = false;
+        game.hurt_monarch_heavy(1, 1.0, &mut events);
+        assert!(events.is_empty());
+        game.has_crown = true;
+        game.hurt_monarch_heavy(1, 1.0, &mut events);
+        assert!(
+            matches!(events.first(), Some(GameEvent::CameraShake { x, y })
+            if *x == game.monarch.x && *y == game.monarch_y)
+        );
     }
 
     #[cfg(feature = "save")]

@@ -1,6 +1,7 @@
 //! MainCamera.Update/SetTarget: anticipation, target seek and pixel snap.
 //! This is a presentation clock, advanced once per admitted simulation tick.
 use game::animation::{sample, Key, Tangent};
+use game::rng::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{self, Read},
@@ -9,7 +10,12 @@ use std::{
 
 pub const FILENAME: &str = "camera.bin";
 const MAGIC: [u8; 4] = *b"KNCA";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
+pub const CAMERA_Y: f32 = 1.875;
+const SHAKE_RADIUS: f32 = 6.0;
+const MAX_SHAKE_SEGMENTS: usize = 64;
+const SHAKE_SEED: u32 = 0x4d41_494e;
+
 const MAX_BYTES: u64 = 8192;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -18,6 +24,38 @@ pub struct CameraDef {
     pub max_lead_speed: f32,
     pub lead_over_time: Vec<Key>,
     pub seek_speed_by_distance: Vec<Key>,
+    #[serde(skip)]
+    pub shake: Option<CameraShakeDef>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct CameraShakeDef {
+    pub duration: f32,
+    pub strength: [f32; 2],
+    pub vibrato: u8,
+    pub randomness: f32,
+}
+
+impl Default for CameraShakeDef {
+    fn default() -> Self {
+        Self {
+            duration: 1.0,
+            strength: [0.1875; 2],
+            vibrato: 20,
+            randomness: 30.0,
+        }
+    }
+}
+
+impl CameraShakeDef {
+    pub fn valid(&self) -> bool {
+        (0.0..=5.0).contains(&self.duration)
+            && self.duration > 0.0
+            && self.strength.into_iter().all(|s| (0.0..=2.0).contains(&s))
+            && self.vibrato > 0
+            && self.duration * f32::from(self.vibrato) <= 64.0
+            && (0.0..=180.0).contains(&self.randomness)
+    }
 }
 
 impl CameraDef {
@@ -29,6 +67,7 @@ impl CameraDef {
         bytes.extend(VERSION.to_le_bytes());
         bytes.extend(world_id.to_le_bytes());
         bytes.extend(postcard::to_allocvec(self).map_err(|err| err.to_string())?);
+        bytes.extend(postcard::to_allocvec(&self.shake).map_err(|err| err.to_string())?);
         if bytes.len() as u64 > MAX_BYTES {
             return Err("camera data exceeds the size limit".into());
         }
@@ -52,21 +91,34 @@ impl CameraDef {
         if bytes.len() < 10
             || bytes.len() as u64 > MAX_BYTES
             || bytes[..4] != MAGIC
-            || bytes[4..6] != VERSION.to_le_bytes()
             || bytes[6..10] != world_id.to_le_bytes()
         {
             return Err("camera data header does not match this world".into());
         }
-        let (definition, rest): (Self, _) =
+        let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        let (mut definition, rest): (Self, _) =
             postcard::take_from_bytes(&bytes[10..]).map_err(|err| err.to_string())?;
-        if !rest.is_empty() || !definition.valid() {
+        match version {
+            1 if rest.is_empty() => {}
+            VERSION => {
+                let (shake, trailing) =
+                    postcard::take_from_bytes(rest).map_err(|err| err.to_string())?;
+                if !trailing.is_empty() {
+                    return Err("trailing camera data".into());
+                }
+                definition.shake = shake;
+            }
+            _ => return Err("unsupported camera data version".into()),
+        }
+        if !definition.valid() {
             return Err("invalid camera curves".into());
         }
         Ok(definition)
     }
 
     fn valid(&self) -> bool {
-        self.max_lead_speed.is_finite()
+        self.shake.as_ref().is_none_or(CameraShakeDef::valid)
+            && self.max_lead_speed.is_finite()
             && self.max_lead_speed >= 0.0
             && [&self.lead_over_time, &self.seek_speed_by_distance]
                 .into_iter()
@@ -118,6 +170,10 @@ pub struct Camera {
     lead_offset: f32,
     seek_offset: f32,
     pan: Option<(f32, f32)>,
+    shake: Option<Shake>,
+    snapped_shake: [f32; 2],
+    /// A presentation event cannot perturb the save's gameplay RNG stream.
+    shake_rng: Rng,
 }
 
 impl Camera {
@@ -132,11 +188,40 @@ impl Camera {
             lead_offset: 0.0,
             seek_offset: 0.0,
             pan: None,
+            shake: None,
+            snapped_shake: [0.0; 2],
+            shake_rng: Rng::new(SHAKE_SEED),
         }
     }
 
     pub fn position(&self) -> f32 {
         self.position
+    }
+
+    /// MainCamera.Shake tests the already published camera transform. Events
+    /// supply absolute world coordinates, including the walk plane's Y offset.
+    pub fn shake(&mut self, def: &CameraDef, origin: [f32; 2]) -> bool {
+        let Some(shake) = &def.shake else {
+            return false;
+        };
+        let [x, y] = self.shake_offset();
+        let dx = origin[0] - (self.position + x);
+        let dy = origin[1] - (CAMERA_Y + y);
+        let distance = (dx * dx + dy * dy).sqrt();
+        if !distance.is_finite() || distance >= SHAKE_RADIUS {
+            return false;
+        }
+        // Kill(false) leaves the child transform at its raw offset. DOTween
+        // captures it as the next shake's start before adding the waypoints.
+        let start = self.shake.as_ref().map_or([0.0; 2], Shake::offset);
+        self.shake = Some(Shake::new(shake, start, &mut self.shake_rng));
+        true
+    }
+
+    /// Snap the shake independently from the follow position as MainCamera
+    /// does, leaving seek, lead, audio pan and gameplay on the stable base.
+    pub fn shake_offset(&self) -> [f32; 2] {
+        self.snapped_shake
     }
 
     /// MainCamera.PanWithDuration; the game may explicitly take camera control.
@@ -154,6 +239,17 @@ impl Camera {
         if dt <= 0.0 || !dt.is_finite() {
             return self.position;
         }
+        let previous_view_x = self.position + self.snapped_shake[0];
+        if let Some(shake) = &mut self.shake {
+            shake.elapsed += f64::from(dt);
+            if shake.elapsed >= f64::from(shake.duration) {
+                self.shake = None; // MainCamera's OnComplete resets localPosition.
+                self.snapped_shake = [0.0; 2];
+            } else {
+                // Sample once per tick rather than at every world projection.
+                self.snapped_shake = shake.offset().map(snap);
+            }
+        }
         if (target.subject != self.subject || target.lead != self.use_lead)
             && target.subject != Subject::Inactive
         {
@@ -166,7 +262,7 @@ impl Camera {
             self.seek_offset = if target.subject == Subject::None {
                 0.0
             } else {
-                self.position - target.x
+                previous_view_x - target.x
             };
         }
         if let Some((to, speed)) = self.pan {
@@ -200,13 +296,107 @@ impl Camera {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ShakeSegment {
+    duration: f32,
+    target: [f32; 2],
+}
+
+#[derive(Clone, Debug)]
+struct Shake {
+    elapsed: f64,
+    duration: f32,
+    start: [f32; 2],
+    count: usize,
+    segments: [ShakeSegment; MAX_SHAKE_SEGMENTS],
+}
+
+impl Shake {
+    /// Vector-strength DOShakePosition with fadeOut=true. Shipped DOTween
+    /// 0x06000030 grows the segment lengths and reduces the magnitude at each
+    /// waypoint. SetShake (0x06000203) uses linear easing within a segment.
+    fn new(def: &CameraShakeDef, start: [f32; 2], rng: &mut Rng) -> Self {
+        let count = (f32::from(def.vibrato) * def.duration) as usize;
+        let count = count.clamp(2, MAX_SHAKE_SEGMENTS);
+        let mut segments = [ShakeSegment::default(); MAX_SHAKE_SEGMENTS];
+        let segments_in_use = &mut segments[..count];
+        let mut total = 0.0;
+        for (i, segment) in segments_in_use.iter_mut().enumerate() {
+            segment.duration = def.duration * (i + 1) as f32 / count as f32;
+            total += segment.duration;
+        }
+        let time_scale = def.duration / total;
+
+        let [x, y] = def.strength;
+        let mut strength = [x, y, 0.0];
+        let mut magnitude = (x * x + y * y).sqrt();
+        let fade_step = magnitude / count as f32;
+        let mut angle = rng.range(0.0, 360.0);
+        for (i, segment) in segments_in_use.iter_mut().enumerate() {
+            segment.duration *= time_scale;
+            segment.target = start;
+            if i + 1 == count {
+                break; // Last relative waypoint is zero, then OnComplete resets.
+            }
+            if i != 0 {
+                angle = angle - 180.0 + rng.range(-def.randomness, def.randomness);
+            }
+            let yaw = rng.range(-def.randomness, def.randomness).to_radians();
+            let (sin, cos) = angle.to_radians().sin_cos();
+            let x = cos * magnitude;
+            let mut point = [x * yaw.cos(), sin * magnitude, -x * yaw.sin()];
+            // The PC assigns the clamped components in order. The X clamp
+            // changes the vector magnitude used for the subsequent Y clamp.
+            point[0] = clamp_magnitude(point, strength[0])[0];
+            point[1] = clamp_magnitude(point, strength[1])[1];
+            segment.target = [start[0] + point[0], start[1] + point[1]];
+            magnitude = (magnitude - fade_step).max(0.0);
+            strength = clamp_magnitude(strength, magnitude);
+        }
+        Self {
+            elapsed: 0.0,
+            duration: def.duration,
+            start,
+            count,
+            segments,
+        }
+    }
+
+    fn offset(&self) -> [f32; 2] {
+        let mut from = self.start;
+        let mut remaining = self.elapsed as f32;
+        for segment in &self.segments[..self.count] {
+            if segment.duration > 0.0 && remaining <= segment.duration {
+                let t = remaining / segment.duration;
+                return [
+                    from[0] + (segment.target[0] - from[0]) * t,
+                    from[1] + (segment.target[1] - from[1]) * t,
+                ];
+            }
+            remaining -= segment.duration;
+            from = segment.target;
+        }
+        from
+    }
+}
+
+fn clamp_magnitude(v: [f32; 3], max: f32) -> [f32; 3] {
+    let len_sq = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    if len_sq > max * max {
+        let len = len_sq.sqrt();
+        v.map(|component| component / len * max)
+    } else {
+        v
+    }
+}
+
 fn snap(x: f32) -> f32 {
     // Mathf.Round uses ties-to-even, at the PC's 32 pixels per world unit.
     (x * 32.0).round_ties_even() / 32.0
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use game::animation::{Key, Tangent};
     fn key(time: f32, value: f32, input: f32, out: f32) -> Key {
@@ -217,7 +407,7 @@ mod tests {
             out_tangent: Tangent::Slope(out),
         }
     }
-    pub(super) fn definition() -> CameraDef {
+    pub(crate) fn definition() -> CameraDef {
         CameraDef {
             lead: true,
             max_lead_speed: 5.0,
@@ -232,6 +422,7 @@ mod tests {
                 key(5., 2.5, 0., 0.),
                 key(12., 30., 0., 0.),
             ],
+            shake: Some(CameraShakeDef::default()),
         }
     }
     fn target(x: f32, direction: f32) -> Target {
@@ -251,6 +442,109 @@ mod tests {
         assert!(CameraDef::decode(&bytes, 18).is_err());
         bytes.push(0);
         assert!(CameraDef::decode(&bytes, 17).is_err());
+    }
+
+    #[test]
+    fn camera_version_one_keeps_follow_curves_without_shake() {
+        let mut expected = definition();
+        let mut bytes = Vec::from(MAGIC);
+        bytes.extend(1u16.to_le_bytes());
+        bytes.extend(17u32.to_le_bytes());
+        bytes.extend(postcard::to_allocvec(&expected).unwrap());
+        expected.shake = None;
+        assert_eq!(CameraDef::decode(&bytes, 17).unwrap(), expected);
+        assert!(!Camera::new(target(0., 1.)).shake(&expected, [0., CAMERA_Y]));
+    }
+
+    #[test]
+    fn shake_uses_strict_xy_range_from_the_published_camera() {
+        let def = definition();
+        let t = target(0.0, 1.0);
+        let mut c = Camera::new(t);
+        assert!(!c.shake(&def, [6.0, CAMERA_Y]));
+        assert!(!c.shake(&def, [5.9, CAMERA_Y + 1.5]));
+        assert!(c.shake(&def, [5.8, CAMERA_Y + 1.5]));
+        c.step(&def, t, 1.0 / 60.0);
+        let [x, y] = c.shake_offset();
+        assert_eq!([x, y], [-2.0 / 32.0, 4.0 / 32.0]);
+        assert!(!c.shake(&def, [x + 6.0, CAMERA_Y + y]));
+        assert!(c.shake(&def, [x + 6.0 - 1.0 / 32.0, CAMERA_Y + y]));
+    }
+
+    #[test]
+    fn shake_follows_shipped_waypoint_timing_and_leaves_tracking_stable() {
+        let def = definition();
+        let t = target(0.0, 1.0);
+        let mut c = Camera::new(t);
+        let mut stable = c.clone();
+        assert!(c.shake(&def, [0.0, CAMERA_Y]));
+        // Independent translation of the shipped DOTween waypoint and linear
+        // segment math, seeded with the port's presentation RNG.
+        let samples = [
+            (0.005, [5, -4]),
+            (0.010, [1, 1]),
+            (0.025, [2, -2]),
+            (0.100, [1, 4]),
+            (0.250, [1, 1]),
+            (0.500, [2, 2]),
+            (0.750, [0, -1]),
+            (0.950, [0, 0]),
+            (1.001, [0, 0]),
+        ];
+        let mut before = 0.0;
+        for (time, pixels) in samples {
+            let moving = target(time * 3.25, -1.0);
+            assert_eq!(
+                c.step(&def, moving, time - before),
+                stable.step(&def, moving, time - before)
+            );
+            assert_eq!(c.shake_offset(), pixels.map(|v| v as f32 / 32.0), "{time}");
+            before = time;
+        }
+        assert!(c.shake.is_none());
+    }
+
+    #[test]
+    fn shake_restart_captures_raw_offset_and_waits_for_admitted_ticks() {
+        let def = definition();
+        let t = target(0.0, 1.0);
+        let mut c = Camera::new(t);
+        c.shake(&def, [0.0, CAMERA_Y]);
+        c.step(&def, t, 0.1);
+        let raw = c.shake.as_ref().unwrap().offset();
+        let snapped = c.shake_offset();
+        assert_ne!(raw, snapped);
+        assert!(c.shake(&def, [0.0, CAMERA_Y]));
+        let next = c.shake.as_ref().unwrap();
+        assert_eq!(next.start, raw);
+        assert_eq!(next.elapsed, 0.0);
+        assert_eq!(next.segments[next.count - 1].target, raw);
+        c.step(&def, target(100.0, 1.0), 0.0);
+        assert_eq!(c.shake_offset(), snapped);
+        assert_eq!(c.position(), 0.0);
+        c.step(&def, t, 0.9375);
+        assert!(c.shake.is_some(), "replacement gets a full duration");
+        c.step(&def, t, 0.0625);
+        assert_eq!(c.shake_offset(), [0.0; 2]);
+    }
+
+    #[test]
+    fn crown_target_switch_seeks_from_the_last_shaken_view() {
+        let mut def = definition();
+        def.seek_speed_by_distance = vec![key(0.0, 0.0, 0.0, 0.0)];
+        let t = target(0.0, 1.0);
+        let mut c = Camera::new(t);
+        assert!(c.shake(&def, [0.0, CAMERA_Y]));
+        c.step(&def, t, 0.005);
+        let previous_view_x = c.position() + c.shake_offset()[0];
+        assert_ne!(previous_view_x, 0.0);
+        let crown = Target {
+            subject: Subject::Crown,
+            x: 10.0,
+            lead: false,
+            ..t
+        };
+        assert_eq!(c.step(&def, crown, 1.0 / 60.0), previous_view_x);
     }
 
     #[test]

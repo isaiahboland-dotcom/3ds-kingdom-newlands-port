@@ -113,11 +113,35 @@ pub fn camera_def(main: &Value) -> Result<Option<scene::camera::CameraDef>, Stri
             })
             .collect()
     };
+    let number = |name: &str| {
+        fields
+            .get(name)
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
+            .ok_or_else(|| format!("missing MainCamera.{name}"))
+    };
+    let strength = |axis| {
+        fields
+            .get("shakeStrength")
+            .and_then(|strength| strength[axis].as_f64())
+            .map(|v| v as f32)
+            .ok_or_else(|| format!("missing MainCamera.shakeStrength.{axis}"))
+    };
     Ok(Some(scene::camera::CameraDef {
         lead: flag(fields, "lead"),
         max_lead_speed: num(fields, "maxLeadSpeed"),
         lead_over_time: keys("leadOverTime")?,
         seek_speed_by_distance: keys("seekSpeedByDistance")?,
+        shake: Some(scene::camera::CameraShakeDef {
+            duration: number("shakeDuration")?,
+            strength: [strength("x")?, strength("y")?],
+            vibrato: fields
+                .get("shakeVibrato")
+                .and_then(Value::as_u64)
+                .and_then(|v| u8::try_from(v).ok())
+                .ok_or("invalid shakeVibrato")?,
+            randomness: number("shakeRandomness")?,
+        }),
     }))
 }
 

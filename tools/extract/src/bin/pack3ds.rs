@@ -16,6 +16,7 @@
 //!
 //! `cargo run --release -p extract --bin pack3ds -- assets crates/n3ds/romfs`
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -143,6 +144,12 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         std::fs::read(src.join("world.bin")).map_err(|e| format!("world.bin: {e}"))?;
     let world_id = game::save::fingerprint(&world_bytes);
     let camera = scene::camera::CameraDef::read_file(src.join(scene::camera::FILENAME), world_id)?;
+    let boulder =
+        scene::boulder_fx::BoulderFxDef::read(src.join(scene::boulder_fx::FILENAME), world_id)?;
+    let boulder_sprites: HashSet<_> = boulder.iter().flat_map(|fx| fx.sprites()).collect();
+    if let Some(name) = boulder_sprites.iter().find(|name| sheet.id(name).is_none()) {
+        return Err(format!("missing Boulder particle tile {name}"));
+    }
     let mut out_sheet = sheet.clone();
     let authored = match read_file(src.join(FILENAME)) {
         Ok(bytes) => {
@@ -204,8 +211,11 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             }
             any.then_some(m)
         };
-        let a = split(KEY_A);
-        let b = split(KEY_B);
+        let (a, b) = if boulder_sprites.contains(sheet.names[i].as_str()) {
+            (None, None)
+        } else {
+            (split(KEY_A), split(KEY_B))
+        };
         for (k, m) in [a, b].into_iter().enumerate() {
             let Some(m) = m else { continue };
             let id = out_sheet.sprites.len();
@@ -409,6 +419,14 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     } else if let Err(e) = std::fs::remove_file(authored_out) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(format!("{FILENAME}: {e}"));
+        }
+    }
+    let boulder_out = out.join(scene::boulder_fx::FILENAME);
+    if let Some(def) = &boulder {
+        std::fs::write(boulder_out, def.encode(world_id)?).map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(boulder_out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
         }
     }
     let camera_out = out.join(scene::camera::FILENAME);

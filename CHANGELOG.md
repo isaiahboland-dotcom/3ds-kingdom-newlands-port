@@ -4,6 +4,8 @@
 
 ### Added
 
+- Play authored boulder dust and fragments and shake the camera on impact.
+
 - Use the original camera lead and target seek curves with enhanced asset packs.
 
 - Extract and draw authored sprite transforms and animation curves from an
