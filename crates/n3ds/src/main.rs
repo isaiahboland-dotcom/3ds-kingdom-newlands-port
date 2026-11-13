@@ -49,7 +49,7 @@ fn fail(gfx: &Gfx, hid: &mut Hid, apt: &Apt, msg: &str) {
 fn load() -> Result<(WorldData, u32, Sheet), String> {
     let bytes =
         std::fs::read(format!("{ROMFS}/world.bin")).map_err(|e| format!("world.bin: {e}"))?;
-    let world: WorldData = postcard::from_bytes(&bytes).map_err(|e| format!("world.bin: {e}"))?;
+    let mut world: WorldData = postcard::from_bytes(&bytes).map_err(|e| format!("world.bin: {e}"))?;
     let world_id = save::fingerprint(&bytes);
     let sheet_bytes =
         std::fs::read(format!("{ROMFS}/sheet.bin")).map_err(|e| format!("sheet.bin: {e}"))?;
@@ -65,6 +65,8 @@ fn load() -> Result<(WorldData, u32, Sheet), String> {
     if let Some(e) = authored_error {
         eprintln!("ignoring {FILENAME}: {e}");
     }
+    world.worker_hammer = sheet.authored()
+        .and_then(|authored| game::animation::HammerTiming::from_library(&authored.clips));
     Ok((world, world_id, sheet))
 }
 

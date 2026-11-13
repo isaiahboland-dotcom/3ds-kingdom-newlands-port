@@ -294,6 +294,54 @@ impl Clip {
     }
 }
 
+/// Animation data used by the worker simulation without loading render tracks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HammerTiming {
+    speed: f32,
+    length: f32,
+    looping: bool,
+    markers: Vec<f32>,
+}
+
+impl HammerTiming {
+    pub fn from_library(library: &Library) -> Option<Self> {
+        let clip = library.clip("worker_hammer")?;
+        let speed = library.state_speed("worker", "Hammer").unwrap_or(1.0);
+        if !speed.is_finite() || speed <= 0.0 || !clip.length.is_finite() || clip.length <= 0.0 {
+            return None;
+        }
+        let markers: Vec<_> = clip
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::HammerHit)
+            .filter_map(|event| {
+                (0.0..=clip.length)
+                    .contains(&event.time)
+                    .then_some(event.time)
+            })
+            .collect();
+        (!markers.is_empty()).then_some(Self {
+            speed,
+            length: clip.length,
+            looping: clip.looping,
+            markers,
+        })
+    }
+
+    pub(crate) fn advance(&self, elapsed: &mut f32, dt: f32, entered: bool) -> u32 {
+        let before = *elapsed;
+        if !entered {
+            *elapsed += dt * self.speed;
+        }
+        self.markers
+            .iter()
+            .map(|&time| {
+                event_occurrences(time, self.length, self.looping, before, *elapsed, entered)
+            })
+            .fold(0, u32::saturating_add)
+    }
+}
+
 /// Shared occurrence arithmetic for extracted markers and canonical fixture fallbacks.
 pub fn event_occurrences(
     at: f32,
