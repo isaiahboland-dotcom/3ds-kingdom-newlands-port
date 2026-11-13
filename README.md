@@ -37,6 +37,8 @@ Measured on an Old 3DS XL during the first days of a new game:
 
 To see these numbers yourself, tap **SELECT** during gameplay to open the debug overlay. Its first line shows the current FPS (averaged over 30 frames), the lowest and highest readings, and the longest single frame since you opened it. Close and reopen the overlay to reset them. The overlay times each game system while it's open, so the numbers are slightly lower than normal play.
 
+We may cap the Old 3DS at 30 FPS in a later version. 30 FPS is playable, but the frame rate currently swings between the 50s and about 30 as the island gets busy, and those swings feel worse than a steady 30. A cap would keep frame times even. Nothing is capped yet.
+
 ## Screenshots
 
 > **Note:** In each comparison, the **left** image is this Rust engine running on PC and the **right** image is the original PC version of the game. We're still working to get as close to the base game as we can without sacrificing playability on the 3DS, so expect some visual differences.

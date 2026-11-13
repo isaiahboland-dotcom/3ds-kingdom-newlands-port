@@ -159,3 +159,13 @@ integers are sorted unstably: sort 2.2 µs, list 5.0 µs per frame.
   0.15 s), the pile costs ~75–170 µs/tick on the host, most of it
   `bag_solve`. Only the Old 3DS can say what that is there; watch the
   overlay's `sim` while a big bag of coins drops in.
+- Autosave writes the SD card synchronously. On an Old 3DS XL with a 57 KB
+  save (2026-11-13), the write takes 119 ms (tmp file, fsync, FAT renames)
+  out of 125 ms per autosave, and that one frame pulls the 30-frame FPS
+  average down to about 24 at dawn. Possible fixes: write on a background
+  thread, or spread the steps over several frames. Any fix must keep a
+  readable copy at every step (`crates/n3ds/src/savefile.rs`).
+- Night runs slower than day. On the same console FPS was about 28 at
+  night (high 44.6) and rose steadily toward morning. The night lighting
+  (torch and campfire point lights, ground light columns) is the likely
+  cost; profile the render with the overlay at night.
