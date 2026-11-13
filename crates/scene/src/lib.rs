@@ -3,8 +3,14 @@
 //! backends only supply drawing, input, files and timing.
 
 pub mod adpcm;
+pub mod atmosphere_data;
+pub mod authored;
 #[cfg(feature = "clipfile")]
 pub mod clipfile;
+pub mod cloud_data;
+pub mod cloud_mesh;
+pub mod cloud_shadow;
+pub mod clouds;
 pub mod heraldry;
 pub mod render;
 pub mod session;

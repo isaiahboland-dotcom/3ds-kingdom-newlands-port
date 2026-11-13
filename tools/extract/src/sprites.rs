@@ -73,6 +73,39 @@ pub struct Sheet {
     pub skipped: usize,
 }
 
+/// ShadowReceiver discards source alpha below .01 and uses half of the
+/// remaining alpha range for coverage. Its inverse supplies the light rim.
+/// RGB remains the authored cloud art.
+pub fn bake_cloud_coverage(image: &mut Image) {
+    for pixel in image.px.as_chunks_mut::<4>().0 {
+        let alpha = u16::from(pixel[3]);
+        pixel[3] = if alpha < 3 {
+            0
+        } else {
+            ((alpha + 256) / 2) as u8
+        };
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn cloud_coverage_matches_discard_and_half_alpha_without_touching_rgb() {
+    let mut image = Image {
+        w: 7,
+        h: 1,
+        px: [0, 1, 2, 3, 127, 254, 255]
+            .into_iter()
+            .flat_map(|alpha| [13, 29, 97, alpha])
+            .collect(),
+    };
+    bake_cloud_coverage(&mut image);
+    let expected: Vec<_> = [0, 0, 0, 129, 191, 255, 255]
+        .into_iter()
+        .flat_map(|alpha| [13, 29, 97, alpha])
+        .collect();
+    assert_eq!(image.px, expected);
+}
+
 struct Mesh {
     /// Vertex positions in source-atlas pixels, y up from the bottom.
     verts: Vec<(f32, f32)>,
@@ -136,6 +169,58 @@ fn inside(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
     let neg = d1 < -eps || d2 < -eps || d3 < -eps;
     let pos = d1 > eps || d2 > eps || d3 > eps;
     !(neg && pos)
+}
+
+pub fn cloud_mesh(path: &Path) -> Result<scene::cloud_mesh::CloudMesh, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    parse_cloud_mesh(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_cloud_mesh(text: &str) -> Result<scene::cloud_mesh::CloudMesh, String> {
+    let (_, _, ppu, mesh) = parse_mesh(text)?;
+    let rd = &text[..text.find("m_AtlasRD:").unwrap_or(text.len())];
+    let uvt = field(rd, "uvTransform")
+        .and_then(|v| inline_map(v, &["x", "y", "z", "w"]))
+        .ok_or("bad cloud uvTransform")?;
+    let vertices = field(rd, "_typelessdata")
+        .and_then(hex_bytes)
+        .ok_or("bad cloud vertex buffer")?;
+    let (stream, tail) = vertices.as_chunks::<20>();
+    // These clouds have one triangle submesh with float3 position followed by
+    // a zeroed float2 UV channel. Unity derives their UVs via uvTransform.
+    if ppu != 32.0
+        || uvt[0] != ppu
+        || uvt[2] != ppu
+        || field(rd, "settingsRaw") != Some("65")
+        || field(rd, "firstByte") != Some("0")
+        || field(rd, "firstVertex") != Some("0")
+        || field(rd, "topology") != Some("0")
+        || field(rd, "m_CurrentChannels") != Some("9")
+        || field(rd, "indexCount").and_then(|v| v.parse::<usize>().ok())
+            != Some(mesh.tris.len() * 3)
+        || rd
+            .lines()
+            .filter(|line| line.trim_start().starts_with("firstByte:"))
+            .count()
+            != 1
+        || !tail.is_empty()
+        || stream.len() != mesh.verts.len()
+        || !stream.iter().all(|v| v[8..].iter().all(|&b| b == 0))
+    {
+        return Err("unsupported cloud mesh layout or UV transform".into());
+    }
+    let local = stream
+        .iter()
+        .map(|v| {
+            let x = f32::from_le_bytes(v[..4].try_into().unwrap());
+            let y = f32::from_le_bytes(v[4..8].try_into().unwrap());
+            [x * ppu, -y * ppu]
+        })
+        .collect();
+    Ok(scene::cloud_mesh::CloudMesh {
+        vertices: local,
+        indices: mesh.tris.into_iter().flatten().map(|i| i as u16).collect(),
+    })
 }
 
 fn cut(mesh: &Mesh, atlas: &Image) -> (Image, (f32, f32), (f32, f32)) {

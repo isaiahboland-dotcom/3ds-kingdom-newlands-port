@@ -20,12 +20,19 @@ pub mod color {
     pub const SUN_GLOW: usize = 9;
     pub const MOON_TINT: usize = 10;
     pub const MOON_GLOW: usize = 11;
+    pub const CLOUD_BASE: usize = 12;
+    pub const CLOUD_HIGHLIGHT: usize = 13;
+    pub const CLOUD_STRATUS: usize = 14;
     pub const FOG: usize = 15;
+    pub const MIST: usize = 16;
 }
 
 /// Indices into [`Light::floats`] (orig: `BlenderState.FloatField`).
 pub mod float {
+    pub const CLOUD_DENSITY: usize = 0;
+    pub const CLOUD_STRATUS_DENSITY: usize = 1;
     pub const FOG_DENSITY: usize = 2;
+    pub const MIST_DENSITY: usize = 3;
     pub const STARS: usize = 5;
     pub const RAIN: usize = 6;
     pub const SNOW: usize = 7;

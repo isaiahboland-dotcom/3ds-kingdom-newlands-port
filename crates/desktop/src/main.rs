@@ -130,7 +130,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let mut assets = match Assets::load(std::path::Path::new(&dir), &world.sprites).await {
+    let mut assets = match Assets::load(std::path::Path::new(&dir), &world, world_id).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("could not load assets from {dir}/: {e}");
@@ -195,6 +195,8 @@ async fn main() {
         });
     let record_progress = progress.clone();
     let mut app = Session::new(world, island, seed, progress);
+    app.cloud_defs = assets.cloud_defs.take();
+    app.atmosphere = assets.atmosphere.take();
     app.debug = std::env::args().any(|a| a == "--debug");
     if let Some(h) = start_hour {
         app.game.clock.time = h;
@@ -513,7 +515,7 @@ async fn main() {
                 }
             }
             if frame == shot_frame && std::env::var_os("KINGDOM_DUMP").is_some() {
-                for (key, item) in draw_list(&app) {
+                for (key, item) in draw_list(&app, &sheet) {
                     if let DrawItem::Part(oi, pi) = item {
                         let o = &app.game.level.objects[oi];
                         let proto = &app.world.protos[o.proto as usize];

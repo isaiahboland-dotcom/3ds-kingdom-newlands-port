@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use game::animation::Pose;
 use game::data::{
     BlockDef, BuildingDef, CampDef, DayDef, DirectorDef, FixedTransform, ForestItemDef, Kind,
     Layer, LayerDef, LevelConfigDef, LightPreset, Part, PayableDef, Placed, Proto, ProtoId,
@@ -13,6 +14,8 @@ use game::data::{
     UpgradeDef, WorldData, LIGHT_COLORS, LIGHT_FLOATS, TILE_SCATTER_FLAGS,
 };
 use game::data::{Curve, PortalDef, WallDef, WaveDef};
+use scene::authored::{PartVisual, PrefabVisual, TransformNode};
+use scene::cloud_data::{CloudLayerDef, CloudsDef};
 use serde_json::{Map, Value};
 
 /// Components deriving from `Payable` (for overlap regions and half widths).
@@ -97,6 +100,104 @@ fn asset_path(v: Option<&Value>) -> Option<&str> {
     v?.get("asset")?.as_str()
 }
 
+// Scaffold modules have their own draw path. Layer 29 is seen by the
+// water reflection camera, whose extra pass is outside these visual parts.
+fn skip_part_subtree(node: &Value) -> bool {
+    comp(node, "ScaffoldModule").is_some() || node["layer"].as_i64() == Some(29)
+}
+
+fn active_part_children(node: &Value) -> impl Iterator<Item = &Value> {
+    node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|child| child["active"] == true)
+}
+
+fn local_pose(node: &Value, renderer: Option<&Map<String, Value>>) -> Pose {
+    let mut pose = Pose {
+        position: vec3(&node["pos"]),
+        scale: [0, 1, 2].map(|i| node["scale"][i].as_f64().unwrap_or(1.0) as f32),
+        rotation: [0, 1, 2, 3].map(|i| {
+            node["rot"][i]
+                .as_f64()
+                .unwrap_or(if i == 3 { 1.0 } else { 0.0 }) as f32
+        }),
+        ..Default::default()
+    };
+    if let Some(renderer) = renderer {
+        pose.color = ["r", "g", "b", "a"].map(|channel| {
+            renderer
+                .get("m_Color")
+                .and_then(|color| color[channel].as_f64())
+                .unwrap_or(1.0) as f32
+        });
+        pose.visible = flag(renderer, "m_Enabled");
+    }
+    pose
+}
+
+/// Collect visual metadata independently of the legacy sprite interning and
+/// world fields. The part list follows the same active renderer traversal.
+fn authored_prefab(node: &Value, legacy_parts: usize) -> Result<PrefabVisual, String> {
+    fn collect(
+        node: &Value,
+        path: String,
+        parent: Option<u16>,
+        visual: &mut PrefabVisual,
+    ) -> Result<(), String> {
+        if skip_part_subtree(node) {
+            return Ok(());
+        }
+        let index = u16::try_from(visual.nodes.len())
+            .map_err(|_| format!("too many authored transform nodes at {path}"))?;
+        let renderer = comp(node, "SpriteRenderer");
+        let mut local = local_pose(node, renderer);
+        if parent.is_none() {
+            // Object placement and its facing own the root translation and
+            // X reflection. Keep the authored rotation and scale magnitudes.
+            local.position = [0.0; 3];
+            local.scale[0] = local.scale[0].abs();
+        }
+        let animator = comp(node, "Animator")
+            .filter(|animator| flag(animator, "m_Enabled"))
+            .and_then(|animator| asset_path(animator.get("m_Controller")))
+            .map(str::to_owned);
+        if let Some(renderer) = renderer.filter(|renderer| flag(renderer, "m_Enabled")) {
+            visual.parts.push(PartVisual {
+                node: index,
+                flip_x: flag(renderer, "m_FlipX"),
+                flip_y: flag(renderer, "m_FlipY"),
+            });
+        }
+        visual.nodes.push(TransformNode {
+            path,
+            parent,
+            local,
+            animator,
+        });
+        for child in active_part_children(node) {
+            let path = &visual.nodes[index as usize].path;
+            let name = child["name"].as_str().unwrap_or_default();
+            let child_path = if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path}/{name}")
+            };
+            collect(child, child_path, Some(index), visual)?;
+        }
+        Ok(())
+    }
+
+    let mut visual = PrefabVisual::default();
+    collect(node, String::new(), None, &mut visual)?;
+    if visual.parts.len() != legacy_parts {
+        let name = node["name"].as_str().unwrap_or_default();
+        return Err(format!("authored renderer count differs for {name}"));
+    }
+    Ok(visual)
+}
+
 /// Materials with the `Recolor` toggle on.
 fn recolor_materials(assets: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -122,6 +223,7 @@ fn recolor_materials(assets: &Path) -> HashSet<String> {
 struct Builder<'a> {
     inp: &'a Inputs<'a>,
     world: WorldData,
+    visuals: Vec<Result<PrefabVisual, String>>,
     sprite_ids: HashMap<String, SpriteId>,
     prefab_protos: HashMap<String, ProtoId>,
     recolor: HashSet<String>,
@@ -159,6 +261,7 @@ impl<'a> Builder<'a> {
     fn reserve(&mut self) -> ProtoId {
         let id = self.world.protos.len() as ProtoId;
         self.world.protos.push(Proto::default());
+        self.visuals.push(Ok(PrefabVisual::default()));
         id
     }
 
@@ -261,13 +364,7 @@ impl<'a> Builder<'a> {
         in_scaffold: bool,
     ) {
         let in_scaffold = in_scaffold || comp(node, "Scaffolding").is_some();
-        // Scaffold modules are exported separately (BuildingDef::scaffold).
-        if comp(node, "ScaffoldModule").is_some() {
-            return;
-        }
-        // Layer 29 is only seen by the water reflection camera (the boat's
-        // `Reflection`); the reflection pass isn't ported.
-        if node["layer"].as_i64() == Some(29) {
+        if skip_part_subtree(node) {
             return;
         }
         let mut me = parent;
@@ -329,10 +426,7 @@ impl<'a> Builder<'a> {
                 });
             }
         }
-        for child in node["children"].as_array().into_iter().flatten() {
-            if child["active"] != true {
-                continue;
-            }
+        for child in active_part_children(node) {
             let p = vec3(&child["pos"]);
             let s = vec3(&child["scale"]);
             let cat = [at[0] + scale.0 * p[0], at[1] + scale.1 * p[1], at[2] + p[2]];
@@ -360,6 +454,7 @@ impl<'a> Builder<'a> {
             &mut parts,
             &mut part_ids,
         );
+        self.visuals[id as usize] = authored_prefab(node, parts.len());
 
         let root_sprite = comp(node, "SpriteRenderer").and_then(|sr| {
             let r = sr.get("m_Sprite");
@@ -1737,6 +1832,342 @@ fn find_component<'v>(roots: &'v Value, ty: &str) -> Option<(&'v Value, &'v Map<
     roots["roots"].as_array()?.iter().find_map(|r| walk(r, ty))
 }
 
+pub fn clouds(inp: &Inputs<'_>) -> Result<CloudsDef, String> {
+    let (level, _) = find_component(inp.main, "Level").ok_or("main scene has no Level")?;
+    let (children, level_position) = cloud_parent(inp.main, level)?;
+    let (_, world) = find_component(inp.main, "World").ok_or("main scene has no World")?;
+    let mut sprites = Vec::new();
+    let mut layer = |name: &str, color, density, highlight| {
+        let node = cloud_child(children, name)?;
+        cloud_layer(
+            inp,
+            node,
+            color,
+            density,
+            highlight,
+            |dir, path| cloud_material(dir, path).map(|_| ()),
+            |reference| {
+                let name = inp.sprite_names.get(asset_path(Some(reference))?)?;
+                if let Some(index) = sprites.iter().position(|item| item == name) {
+                    return Some(index as SpriteId);
+                }
+                let id = u16::try_from(sprites.len()).ok()?;
+                sprites.push(name.clone());
+                Some(id)
+            },
+        )
+        .map_err(|e| format!("{name}: {e}"))
+    };
+    let mut stratus = layer(
+        "CloudsStratus",
+        "cloudStratusColor",
+        "cloudStratusDensity",
+        None,
+    )?;
+    let mut cumulus = layer(
+        "CloudsCumulus",
+        "cloudBaseColor",
+        "cloudDensity",
+        Some("cloudHighlightColor"),
+    )?;
+    for layer in [&mut stratus, &mut cumulus] {
+        for (axis, offset) in layer.origin.iter_mut().zip(level_position) {
+            *axis += offset;
+        }
+    }
+    let def = CloudsDef {
+        stratus,
+        cumulus,
+        wind_change_cooldown: cloud_number(world.get("windChangeCooldown"), "windChangeCooldown")?,
+        sprites,
+    };
+    if !def.valid() {
+        return Err("invalid sky cloud definition".into());
+    }
+    Ok(def)
+}
+
+fn cloud_layer(
+    inp: &Inputs<'_>,
+    node: &Value,
+    color: &str,
+    density: &str,
+    highlight: Option<&str>,
+    check_material: impl FnOnce(&Path, &str) -> Result<(), String>,
+    mut sprite_id: impl FnMut(&Value) -> Option<SpriteId>,
+) -> Result<CloudLayerDef, String> {
+    let controller = comp(node, "CloudController").ok_or("missing CloudController")?;
+    let parallax = comp(node, "Parallax2D").ok_or("missing parent Parallax2D")?;
+    let parameter = |key| {
+        controller
+            .get(key)
+            .and_then(|v| v["parameterName"].as_str())
+    };
+    if node["active"] != true
+        || !unrotated(node)
+        || !flag(controller, "m_Enabled")
+        || !flag(parallax, "m_Enabled")
+        || !parallax
+            .get("ratio")
+            .is_some_and(|r| r["x"] == 0 && r["y"] == 1)
+        || parameter("baseColor") != Some(color)
+        || parameter("density") != Some(density)
+        || parameter("highlightColor") != highlight
+        || !flag(controller, "useBlenderBaseColor")
+        || flag(controller, "useHighlight") != highlight.is_some()
+    {
+        return Err("unsupported CloudController transform, parallax, or lighting bindings".into());
+    }
+    let reference = controller.get("cloudPrefab").ok_or("missing cloudPrefab")?;
+    let path = asset_path(Some(reference)).ok_or("unlinked cloudPrefab")?;
+    let prefab = inp.prefabs.get(path).ok_or("missing cloud prefab")?;
+    let cloud = comp(prefab, "Cloud").ok_or("missing Cloud component")?;
+    let renderer = comp(prefab, "SpriteRenderer").ok_or("missing cloud SpriteRenderer")?;
+    let randomizer = comp(prefab, "RandomizeSprite").ok_or("missing cloud RandomizeSprite")?;
+    if !unrotated(prefab)
+        || reference["id"]
+            .as_i64()
+            .is_none_or(|id| comp_id(prefab, "Cloud") != Some(id))
+        || !flag(cloud, "m_Enabled")
+        || !flag(renderer, "m_Enabled")
+        || [
+            "m_SortingLayer",
+            "m_SortingLayerID",
+            "m_SortingOrder",
+            "m_FlipX",
+            "m_FlipY",
+            "m_DrawMode",
+            "m_MaskInteraction",
+        ]
+        .iter()
+        .any(|key| renderer.get(*key).and_then(Value::as_i64) != Some(0))
+        || !flag(randomizer, "m_Enabled")
+        || !flag(randomizer, "randomizeOnAwake")
+        || flag(randomizer, "matchParent")
+        || cloud_number(
+            randomizer.get("deactivationProbability"),
+            "deactivationProbability",
+        )? != 0.0
+        || cloud_number(randomizer.get("shiftX"), "shiftX")? != 0.0
+        || prefab["children"]
+            .as_array()
+            .is_some_and(|children| children.iter().any(|child| child["active"] == true))
+    {
+        return Err("unsupported cloud prefab, renderer, or randomization settings".into());
+    }
+    let material = renderer
+        .get("m_Materials")
+        .and_then(Value::as_array)
+        .filter(|materials| materials.len() == 1)
+        .and_then(|materials| asset_path(materials.first()))
+        .ok_or("cloud renderer must reference one material")?;
+    check_material(inp.assets_dir, material)?;
+    let sprites = randomizer
+        .get("sprites")
+        .and_then(Value::as_array)
+        .ok_or("missing cloud variants")?;
+    let sprites = sprites
+        .iter()
+        .map(|r| sprite_id(r).ok_or("unresolved cloud sprite"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let setting = |key| cloud_number(controller.get(key), key);
+    Ok(CloudLayerDef {
+        origin: vec3(&node["pos"]),
+        depth: setting("depth")?,
+        width: setting("width")?,
+        wind_multiplier: setting("windMultiplier")?,
+        lifetime: cloud_number(cloud.get("lifetime"), "lifetime")?,
+        fade_time: cloud_number(cloud.get("fadeTime"), "fadeTime")?,
+        vertical_motion: cloud_number(cloud.get("verticalMotion"), "verticalMotion")?,
+        max_clouds: controller
+            .get("maxClouds")
+            .and_then(Value::as_u64)
+            .and_then(|v| u16::try_from(v).ok())
+            .ok_or("invalid maxClouds")?,
+        sprites,
+        prefab_active: prefab["active"]
+            .as_bool()
+            .ok_or("missing cloud prefab active state")?,
+        allow_flip: flag(randomizer, "allowFlip"),
+        y_curve: cloud_curve(controller.get("yCurve"), "yCurve")?,
+        scale_curve: cloud_curve(controller.get("scaleCurve"), "scaleCurve")?,
+        parallax_curve: cloud_curve(controller.get("parallaxRatioCurve"), "parallaxRatioCurve")?,
+    })
+}
+
+fn unrotated(node: &Value) -> bool {
+    vec3(&node["scale"]) == [1.0; 3]
+        && [0.0, 0.0, 0.0, 1.0]
+            .into_iter()
+            .enumerate()
+            .all(|(i, v)| node["rot"][i].as_f64() == Some(v))
+}
+
+fn cloud_parent<'v>(main: &Value, level: &'v Value) -> Result<(&'v [Value], [f32; 3]), String> {
+    if !unrotated(level)
+        || !main["roots"]
+            .as_array()
+            .is_some_and(|roots| roots.iter().any(|root| root["id"] == level["id"]))
+    {
+        return Err("clouds require a scene-root Level without rotation or scale".into());
+    }
+    let children = level["children"]
+        .as_array()
+        .ok_or("Level has no children")?;
+    Ok((children, vec3(&level["pos"])))
+}
+
+fn cloud_child<'v>(children: &'v [Value], name: &str) -> Result<&'v Value, String> {
+    children
+        .iter()
+        .find(|child| child["name"] == name)
+        .ok_or_else(|| format!("Level has no {name}"))
+}
+
+pub fn atmosphere(inp: &Inputs<'_>) -> Result<scene::atmosphere_data::AtmosphereDef, String> {
+    let (level, _) = find_component(inp.main, "Level").ok_or("main scene has no Level")?;
+    let (children, level_position) = cloud_parent(inp.main, level)?;
+    let mut sprites = Vec::new();
+    let mut paths = Vec::new();
+    let mut sprite_id = |reference: &Value| {
+        let path = asset_path(Some(reference))?;
+        let name = inp.sprite_names.get(path)?;
+        let (_, _, ppu) = inp.sprite_sizes.get(name)?;
+        if *ppu != 32.0 {
+            return None;
+        }
+        if let Some(index) = sprites.iter().position(|sprite| sprite == name) {
+            return SpriteId::try_from(index).ok();
+        }
+        let id = SpriteId::try_from(sprites.len()).ok()?;
+        sprites.push(name.clone());
+        paths.push(path.to_owned());
+        Some(id)
+    };
+    let mut fog = cloud_layer(
+        inp,
+        cloud_child(children, "Fogs")?,
+        "fogColor",
+        "fogDensity",
+        None,
+        |dir, path| atmosphere_material(dir, path, "Shader/Custom_PowerSprite2.shader.meta", true),
+        &mut sprite_id,
+    )
+    .map_err(|e| format!("Fogs: {e}"))?;
+    let mut mist = cloud_layer(
+        inp,
+        cloud_child(children, "Mists")?,
+        "mistColor",
+        "mistDensity",
+        None,
+        |dir, path| {
+            atmosphere_material(
+                dir,
+                path,
+                "Shader/Custom_Blended Texture.shader.meta",
+                false,
+            )
+        },
+        &mut sprite_id,
+    )
+    .map_err(|e| format!("Mists: {e}"))?;
+    for layer in [&mut fog, &mut mist] {
+        for (axis, offset) in layer.origin.iter_mut().zip(level_position) {
+            *axis += offset;
+        }
+    }
+    let meshes = paths
+        .iter()
+        .map(|path| crate::sprites::cloud_mesh(&inp.assets_dir.join(path)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(scene::atmosphere_data::AtmosphereDef {
+        fog,
+        mist,
+        sprites,
+        meshes,
+    })
+}
+
+fn atmosphere_material(
+    dir: &Path,
+    path: &str,
+    shader: &str,
+    power_sprite: bool,
+) -> Result<(), String> {
+    use crate::yaml::{field, guid_of};
+
+    let read =
+        |path: &str| std::fs::read_to_string(dir.join(path)).map_err(|e| format!("{path}: {e}"));
+    let shader = read(shader)?;
+    let guid = field(&shader, "guid").ok_or("missing atmosphere shader GUID")?;
+    let material = read(path)?;
+    let ambient = if power_sprite {
+        field(&material, "_AmbientResponse").and_then(|value| value.parse::<f32>().ok())
+            == Some(1.0)
+    } else {
+        field(&material, "m_ShaderKeywords").is_some_and(|keywords| {
+            keywords
+                .split_whitespace()
+                .any(|keyword| keyword == "USEAMBIENT_ON")
+        })
+    };
+    if field(&material, "m_Shader").and_then(guid_of) != Some(guid) || !ambient {
+        return Err(format!("{path}: unsupported atmosphere shader"));
+    }
+    Ok(())
+}
+
+fn cloud_number(value: Option<&Value>, field: &str) -> Result<f32, String> {
+    value
+        .and_then(Value::as_f64)
+        .map(|n| n as f32)
+        .filter(|n| n.is_finite())
+        .ok_or_else(|| format!("invalid cloud {field}"))
+}
+
+fn cloud_curve(value: Option<&Value>, field: &str) -> Result<Curve, String> {
+    let value = value.ok_or_else(|| format!("missing cloud {field}"))?;
+    let keys = value["m_Curve"]
+        .as_array()
+        .ok_or_else(|| format!("missing cloud {field}"))?;
+    for key in keys {
+        for axis in ["time", "value"] {
+            cloud_number(key.get(axis), field)?;
+        }
+        for tangent in ["inSlope", "outSlope"] {
+            if !matches!(key[tangent].as_str(), Some("Infinity" | "-Infinity")) {
+                cloud_number(key.get(tangent), field)?;
+            }
+        }
+    }
+    Ok(curve(value))
+}
+
+fn cloud_material(dir: &Path, path: &str) -> Result<[f32; 4], String> {
+    use crate::yaml::{field, guid_of, inline_map};
+
+    let read =
+        |path: &str| std::fs::read_to_string(dir.join(path)).map_err(|e| format!("{path}: {e}"));
+    let shader = read("Shader/Custom_ShadowReceiver.shader.meta")?;
+    let guid = field(&shader, "guid").ok_or("missing Custom/ShadowReceiver GUID")?;
+    let material = read(path)?;
+    if field(&material, "m_Shader").and_then(guid_of) != Some(guid)
+        || !field(&material, "m_ShaderKeywords").is_some_and(|keywords| {
+            keywords
+                .split_whitespace()
+                .any(|keyword| keyword == "USEAMBIENT_ON")
+        })
+    {
+        return Err(format!(
+            "{path}: expected the ambient ShadowReceiver shader"
+        ));
+    }
+    field(&material, "_LightColor")
+        .and_then(|value| inline_map(value, &["r", "g", "b", "a"]))
+        .and_then(|values| values.try_into().ok())
+        .ok_or_else(|| format!("{path}: missing or invalid _LightColor"))
+}
+
 /// orig: `AnimationCurve` keys.
 fn curve(v: &Value) -> Curve {
     let f = |k: &Value| match k {
@@ -1844,11 +2275,12 @@ fn level_config(name: &str, f: &Map<String, Value>, waves: &HashMap<&str, u16>) 
     }
 }
 
-/// The world, and the asset path of each audio clip (`AudioDef::clips`).
-pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
+/// Legacy world data, audio clip source paths, and visual metadata by prototype ID.
+pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>, Vec<PrefabVisual>), String> {
     let mut b = Builder {
         inp,
         world: WorldData::default(),
+        visuals: Vec::new(),
         sprite_ids: HashMap::new(),
         prefab_protos: HashMap::new(),
         recolor: recolor_materials(inp.assets_dir),
@@ -2122,7 +2554,8 @@ pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
             .collect();
     }
     b.world.audio = found.audio;
-    Ok((b.world, found.clip_paths))
+    let visuals = b.visuals.into_iter().collect::<Result<_, _>>()?;
+    Ok((b.world, found.clip_paths, visuals))
 }
 
 /// Data assets of `ty`, sorted by path, as (path, fields).
@@ -2237,4 +2670,326 @@ fn lighting_and_days(world: &mut WorldData, inp: &Inputs) -> Result<(), String> 
             .collect(),
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use scene::authored::Affine2;
+    use serde_json::json;
+
+    fn extract(node: &Value) -> (Proto, PrefabVisual, Vec<String>) {
+        let empty = json!({});
+        let maps = Map::new();
+        let names = HashMap::from([
+            ("sprite".into(), "panel".into()),
+            ("other-sprite".into(), "trim".into()),
+        ]);
+        let sizes = HashMap::from([("panel".into(), (4, 4, 32.0))]);
+        let inp = Inputs {
+            main: &empty,
+            blocks: &empty,
+            loader: &empty,
+            prefabs: &maps,
+            data: &maps,
+            sprite_names: &names,
+            sprite_sizes: &sizes,
+            assets_dir: Path::new("."),
+        };
+        let mut builder = Builder {
+            inp: &inp,
+            world: WorldData::default(),
+            visuals: Vec::new(),
+            sprite_ids: HashMap::new(),
+            prefab_protos: HashMap::new(),
+            recolor: HashSet::new(),
+        };
+        let index = builder.proto(node) as usize;
+        (
+            builder.world.protos.remove(index),
+            builder.visuals.remove(index).unwrap(),
+            builder.world.sprites,
+        )
+    }
+
+    fn node(
+        name: &str,
+        pos: [f32; 3],
+        scale: [f32; 3],
+        rot: [f32; 4],
+        children: Vec<Value>,
+        sprite: bool,
+    ) -> Value {
+        json!({
+            "name": name, "active": true, "pos": pos, "scale": scale, "rot": rot, "layer": 0,
+            "components": if sprite { vec![json!({"id": 31, "type": "SpriteRenderer", "fields": {
+                "m_Enabled": 1, "m_Sprite": {"asset": "sprite"}, "m_FlipX": 1, "m_FlipY": 1
+            }})] } else { vec![] },
+            "children": children,
+        })
+    }
+
+    const IDENTITY_ROTATION: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    fn plain(name: &str, children: Vec<Value>, sprite: bool) -> Value {
+        node(
+            name,
+            [0.0; 3],
+            [1.0; 3],
+            IDENTITY_ROTATION,
+            children,
+            sprite,
+        )
+    }
+
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-5, "{a} != {b}");
+    }
+
+    fn composed(visual: &PrefabVisual, part: usize) -> Affine2 {
+        visual
+            .sampled_transform(visual.parts[part].node, |_, node| node.local)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn composed_parts_keep_nonrendered_parent_rotation_scale_and_renderer_flips() {
+        let c = core::f32::consts::FRAC_1_SQRT_2;
+        let panel = node(
+            "Panel",
+            [2.0, 0.0, 0.0],
+            [-1.0, 1.0, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let mut pivot = node(
+            "Pivot",
+            [1.0, 2.0, 0.0],
+            [1.0, 3.0, 1.0],
+            [
+                0.0,
+                0.0,
+                (core::f32::consts::PI / 8.0).sin(),
+                (core::f32::consts::PI / 8.0).cos(),
+            ],
+            vec![panel],
+            false,
+        );
+        pivot["components"] = json!([{"type": "Animator", "fields": {
+            "m_Enabled": 1, "m_Controller": {"asset": "AnimatorController/panel.controller"}
+        }}]);
+        let root = node(
+            "Root",
+            [7.0, 8.0, 0.0],
+            [-2.0, 1.0, 1.0],
+            [0.0, 0.0, c, c],
+            vec![pivot],
+            false,
+        );
+        let (legacy, visual, _) = extract(&root);
+        assert_eq!(
+            visual
+                .nodes
+                .iter()
+                .map(|node| node.path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "Pivot", "Pivot/Panel"]
+        );
+        assert_eq!(visual.nodes[2].parent, Some(1));
+        assert_eq!(
+            visual.nodes[1].animator.as_deref(),
+            Some("AnimatorController/panel.controller")
+        );
+        assert_eq!(visual.parts[0].node, 2);
+        assert!(visual.parts[0].flip_x && visual.parts[0].flip_y);
+        assert_eq!((legacy.parts[0].x, legacy.parts[0].y), (6.0, 2.0));
+        assert!(
+            !legacy.parts[0].flip,
+            "old pack keeps the folded reflection"
+        );
+        let transform = composed(&visual, 0);
+        close(transform.translation[0], -2.0 - 2.0 * c);
+        close(transform.translation[1], 2.0 + 4.0 * c);
+        for (actual, expected) in transform
+            .basis
+            .into_iter()
+            .zip([c, -3.0 * c, -2.0 * c, -6.0 * c])
+        {
+            close(actual, expected);
+        }
+    }
+
+    #[test]
+    fn visual_parts_match_legacy_indices_without_interning_sprites() {
+        let mut inactive = plain("Inactive", vec![plain("Sprite", vec![], true)], false);
+        inactive["active"] = false.into();
+        let mut reflection = plain("Reflection", vec![plain("Sprite", vec![], true)], false);
+        reflection["layer"] = 29.into();
+        let mut scaffold = plain("Scaffold", vec![plain("Sprite", vec![], true)], true);
+        scaffold["components"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "ScaffoldModule", "fields": {}}));
+        let mut child = plain("Child", vec![], true);
+        child["components"][0]["fields"]["m_Sprite"]["asset"] = "other-sprite".into();
+        let mut disabled = plain("Disabled", vec![child], true);
+        disabled["components"][0]["fields"]["m_Enabled"] = 0.into();
+        let root = plain(
+            "Root",
+            vec![
+                inactive,
+                reflection,
+                scaffold,
+                disabled,
+                plain("Normal", vec![], true),
+            ],
+            false,
+        );
+        let (legacy, visual, sprite_names) = extract(&root);
+        assert_eq!(sprite_names, ["trim", "panel"]);
+        assert_eq!(
+            legacy
+                .parts
+                .iter()
+                .map(|part| part.sprite)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            visual
+                .parts
+                .iter()
+                .map(|part| visual.nodes[part.node as usize].path.as_str())
+                .collect::<Vec<_>>(),
+            ["Disabled/Child", "Normal"]
+        );
+        assert!(!visual.nodes[1].local.visible);
+    }
+
+    #[test]
+    fn portal_surface_goo_and_catapult_rope_keep_authored_transform_magnitudes() {
+        let surface = node(
+            "Surface",
+            [0.0; 3],
+            [1.0, 1.5, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let goo = node(
+            "Goo Spin",
+            [0.0; 3],
+            [-1.3, 1.1, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let rope = node(
+            "Rope",
+            [0.0; 3],
+            [6.659998, 1.0, 1.0],
+            [0.0, 0.0, 0.36361992, 0.9315474],
+            vec![],
+            true,
+        );
+        let (_, visual, _) = extract(&plain("Root", vec![surface, goo, rope], false));
+        assert_eq!(composed(&visual, 0).basis, [1.0, 0.0, 0.0, 1.5]);
+        assert_eq!(composed(&visual, 1).basis, [-1.3, 0.0, 0.0, 1.1]);
+        let [a, b, c, d] = composed(&visual, 2).basis;
+        close((a * a + c * c).sqrt(), 6.659998);
+        close((b * b + d * d).sqrt(), 1.0);
+        assert!(c > 4.0 && b < -0.6, "rope rotation was discarded");
+    }
+}
+
+#[cfg(test)]
+mod atmosphere_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the user's private PC asset export; set KINGDOM_REFERENCE_ASSETS"]
+    fn local_reference_atmosphere_preserves_controller_layers_and_tight_meshes() {
+        let assets =
+            std::path::PathBuf::from(std::env::var_os("KINGDOM_REFERENCE_ASSETS").unwrap());
+        let guids = crate::guid_map(&assets);
+        let resolver = crate::scenes::Resolver::new(&guids, &assets);
+        let main = crate::scenes::export_file(&assets.join("main.unity"), &resolver).unwrap();
+        let prefabs = ["GameObject/Fog.prefab", "GameObject/Mist.prefab"]
+            .into_iter()
+            .map(|path| {
+                let file = crate::scenes::export_file(&assets.join(path), &resolver).unwrap();
+                (path.into(), file["roots"][0].clone())
+            })
+            .collect();
+        let sheet = crate::sprites::extract_all(&assets.join("Sprite"), &guids).unwrap();
+        let sizes = sheet
+            .sprites
+            .iter()
+            .map(|sprite| {
+                (
+                    sprite.name.clone(),
+                    (sprite.img.w, sprite.img.h, sprite.ppu),
+                )
+            })
+            .collect();
+        let unused = Value::Null;
+        let def = atmosphere(&Inputs {
+            main: &main,
+            blocks: &unused,
+            loader: &unused,
+            prefabs: &prefabs,
+            data: &Map::new(),
+            sprite_names: &sheet.names_by_path,
+            sprite_sizes: &sizes,
+            assets_dir: &assets,
+        })
+        .unwrap();
+        let fog = &def.fog;
+        let mist = &def.mist;
+        assert_eq!(fog.origin, [0.0, 1.0, -5.0]);
+        assert_eq!(mist.origin, [0.0, 0.5, 1.5]);
+        assert_eq!(
+            (
+                fog.max_clouds,
+                fog.lifetime,
+                fog.fade_time,
+                fog.wind_multiplier
+            ),
+            (30, 3600.0, 8.0, 1.0)
+        );
+        assert_eq!(
+            (
+                mist.max_clouds,
+                mist.lifetime,
+                mist.fade_time,
+                mist.wind_multiplier
+            ),
+            (25, 12.0, 2.0, 1.5)
+        );
+        assert_eq!(fog.parallax_curve.eval(0.65), 1.25);
+        assert_eq!(fog.parallax_curve.eval(0.65000004), 1.0);
+        assert_eq!(mist.parallax_curve.eval(0.49), 1.0);
+        assert_eq!(mist.parallax_curve.eval(0.5), 0.75);
+        assert_eq!(mist.vertical_motion, 0.1);
+        assert_eq!(fog.sprites, [0, 1, 2, 3]);
+        assert_eq!(mist.sprites, [4, 5, 6]);
+        assert_eq!(
+            def.sprites,
+            ["fog_01", "fog_02", "fog_03", "fog_04", "mist_0", "mist_1", "mist_2"]
+        );
+        assert_eq!(
+            def.meshes
+                .iter()
+                .map(|m| (m.vertices.len(), m.indices.len() / 3))
+                .collect::<Vec<_>>(),
+            [(14, 13), (8, 6), (16, 14), (7, 5), (7, 5), (7, 5), (11, 9)]
+        );
+        let bytes = def.encode(7).unwrap();
+        assert_eq!(
+            scene::atmosphere_data::AtmosphereDef::decode(&bytes, 7).unwrap(),
+            def
+        );
+    }
 }
