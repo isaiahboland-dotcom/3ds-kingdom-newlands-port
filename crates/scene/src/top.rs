@@ -65,6 +65,14 @@ struct PointLight {
     color: [f32; 3],
 }
 
+/// One entry of the PC LightFaker position/intensity array, in scene units.
+/// X is relative to the camera, like the fog vertices it lights.
+#[derive(Clone, Copy)]
+struct FogLight {
+    position: [f32; 3],
+    intensity: f32,
+}
+
 impl<R: Renderer> Ctx<'_, R> {
     fn named(&mut self, name: &str, at: (f32, f32), d: Draw) {
         if let Some(id) = self.sheet.id(name) {
@@ -486,8 +494,16 @@ fn draw_list_with_weather(
             items.push(((0, 0, -1.4), DrawItem::Tool(i)));
         }
     }
-    // Coin indicators float in front of the scene.
-    items.push(((0, 0, f32::INFINITY), DrawItem::PriceSlots));
+    if let Some(o) = g
+        .pay
+        .selected()
+        .and_then(|id| level.index_of(id.0))
+        .map(|i| &level.objects[i])
+    {
+        // Payable.AddCoinIndicators parents these just ahead of the payable.
+        let z = world.layer(o.layer).z + o.z - 0.005;
+        items.push(((0, 0, -z), DrawItem::PriceSlots));
+    }
     items.push(((0, 0, -FILL.0), DrawItem::Fill));
     items.push(((0, 0, -HAZE_FAR.0), DrawItem::HazeFar));
     items.push(((0, 0, -HAZE_NEAR.0), DrawItem::HazeNear));
@@ -1883,7 +1899,45 @@ fn atmosphere_material(sample: AtmosphereSample, light: &Light) -> Option<Draw> 
         }
         ambient.a = 1.0;
     }
-    Some(Draw::tint(sample.tint.times(ambient)))
+    Some(Draw {
+        depth_write: fog,
+        ..Draw::tint(sample.tint.times(ambient))
+    })
+}
+
+/// Pow-Diffuse adds nearby lights to ambient at the authored mesh vertices.
+/// The GPU interpolates the result through each triangle before applying coverage.
+fn fog_vertex_tints<'a>(
+    p: &AtmosphereDraw<'_>,
+    lights: &[FogLight],
+    tints: &'a mut Vec<Color>,
+) -> Option<&'a [Color]> {
+    if p.sample.kind != AtmosphereKind::Fog || lights.is_empty() {
+        return None;
+    }
+    let sample = p.sample;
+    let base = sample.tint;
+    let ambient = p.draw.tint;
+    tints.clear();
+    tints.extend(p.mesh.vertices.iter().map(|&local| {
+        let [x, y, z] =
+            crate::cloud_shadow::world_point(local, sample.position, sample.scale, sample.flip);
+        let amount: f32 = lights
+            .iter()
+            .filter_map(|light| {
+                let [lx, ly, lz] = light.position;
+                let dist_sq = (x - lx).powi(2) + (y - ly).powi(2) + (z - lz).powi(2);
+                (dist_sq < 9.0).then(|| (1.0 - dist_sq.sqrt() / 3.0) * light.intensity)
+            })
+            .sum();
+        Color::new(
+            ambient.r + base.r * 0.49 * amount,
+            ambient.g + base.g * 0.425 * amount,
+            ambient.b + base.b * 0.34 * amount,
+            ambient.a,
+        )
+    }));
+    tints.iter().any(|&tint| tint != ambient).then_some(tints)
 }
 
 fn atmosphere_draws<'a>(s: &'a Session, sheet: &Sheet, light: &Light) -> Vec<AtmosphereDraw<'a>> {
@@ -1944,13 +1998,42 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     prepare_cloud_shadows(c, &mut clouds);
     let atmosphere = atmosphere_draws(s, c.sheet, &light);
     let items = draw_list_with_weather(s, c.sheet, &clouds, &atmosphere);
+    let has_fog = atmosphere.iter().any(|p| p.draw.depth_write);
+    let mut fog_lights = Vec::new();
     c.lights = items
         .iter()
-        .filter_map(|(_, item)| fire_item(s, item))
-        .filter_map(|(at, fire, seed)| fire_light(s, at, &fire, seed))
+        .filter_map(|(key, item)| {
+            let (at, fire, seed) = fire_item(s, item)?;
+            if has_fog && fog_lights.len() < 50 {
+                let (strength, intensity, _) = fire_intensity(s, &fire, seed);
+                if intensity != 0.0 {
+                    let offset_z = -0.25 - 2.75 * strength.clamp(0.0, 1.0);
+                    let x = (at.0 - W / 2.0) / PPU;
+                    let y = CAMERA_Y + (H / 2.0 - at.1) / PPU;
+                    fog_lights.push(FogLight {
+                        position: [x, y, -key.2 + offset_z],
+                        intensity,
+                    });
+                }
+            }
+            fire_light(s, at, &fire, seed)
+        })
         .collect();
+    let mut vertex_tints = Vec::new();
+    let mut fog_depth_active = false;
     for (key, item) in items {
-        c.r.depth(stereo_depth(-key.2 - game_z));
+        if !fog_depth_active
+            && matches!(item, DrawItem::Atmosphere(i) if atmosphere[i].draw.depth_write)
+        {
+            c.r.depth(0.0);
+            draw_ground_light(c);
+            fog_depth_active = true;
+        }
+        let z = -key.2;
+        if fog_depth_active {
+            c.r.world_depth(z);
+        }
+        c.r.depth(stereo_depth(z - game_z));
         match item {
             DrawItem::Part(oi, pi) => draw_part(c, &s.game.level.objects[oi], pi),
             DrawItem::Scenery(oi, pi) => draw_part(c, &s.game.level.scenery[oi], pi),
@@ -1987,7 +2070,8 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Stars => draw_stars(c),
             DrawItem::Atmosphere(i) => {
                 let p = &atmosphere[i];
-                c.r.atmosphere_sprite(p.id, p.mesh, p.at, p.draw, None);
+                let tints = fog_vertex_tints(p, &fog_lights, &mut vertex_tints);
+                c.r.atmosphere_sprite(p.id, p.mesh, p.at, p.draw, tints);
             }
             DrawItem::Cloud(i) => {
                 let cloud = &clouds[i];
@@ -2033,8 +2117,12 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
         }
     }
 
-    c.r.depth(stereo_depth(0.0));
-    draw_ground_light(c);
+    if fog_depth_active {
+        c.r.world_depth(f32::NEG_INFINITY);
+    } else {
+        c.r.depth(stereo_depth(0.0));
+        draw_ground_light(c);
+    }
     c.r.depth(0.0);
     // The teleporter exit (placeholder rings until its sprites are drawn).
     if let Some(e) = s.game.teleports.exit {
@@ -2248,10 +2336,13 @@ mod tests {
     use super::sort_key;
 
     #[derive(Default)]
-    struct Capture(Vec<(u32, (f32, f32), super::Draw)>);
+    struct Capture(Vec<(u32, (f32, f32), super::Draw)>, Vec<(usize, f32)>);
 
     impl super::Renderer for Capture {
         fn clear(&mut self, _: super::Color) {}
+        fn world_depth(&mut self, z: f32) {
+            self.1.push((self.0.len(), z));
+        }
         fn sprite(&mut self, id: u32, at: (f32, f32), draw: super::Draw) {
             self.0.push((id, at, draw));
         }
@@ -2262,6 +2353,128 @@ mod tests {
         fn add(&mut self, _: super::Rect, _: super::Color) {}
         fn circle(&mut self, _: f32, _: f32, _: f32, _: super::Color) {}
         fn circle_lines(&mut self, _: f32, _: f32, _: f32, _: f32, _: super::Color) {}
+    }
+
+    #[test]
+    fn fog_keeps_sorting_order_and_uses_world_depth_for_later_layers() {
+        use crate::atmosphere_data::AtmosphereDef;
+        use crate::cloud_data::CloudLayerDef;
+        use crate::cloud_mesh::CloudMesh;
+        use crate::sheet::Sprite;
+        use game::data::{Curve, Layer};
+        use game::lighting::{color, float};
+
+        let mut world = animation_world();
+        world.sprites = vec!["background".into(), "late_far".into(), "late_near".into()];
+        let part = world.protos[0].parts[0].clone();
+        world.protos[0].parts = [(0, 0, 2.0), (1, 1, 2.0), (2, 1, -6.0)]
+            .map(|(id, layer, z)| game::data::Part {
+                sprite: Some(id),
+                sort_layer: layer,
+                z,
+                ..part.clone()
+            })
+            .into();
+        let game_z = super::layer_z(&world);
+        let mut s = super::Session::new(world, 0, 1, Default::default());
+        let object = game::level::instantiate(&s.world, 0, Layer::Game, 0.0, 1.0, 0.0, 1.0);
+        let payable = s.game.level.add(object);
+        let mut sheet = super::Sheet::default();
+        sheet.names = s.world.sprites.clone();
+        sheet.names.push("fog".into());
+        sheet.sprites = vec![
+            Sprite {
+                page: 0,
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 4,
+                px: 2.0,
+                py: 2.0,
+                masks: [None; 2],
+            };
+            4
+        ];
+        sheet.link(&s.world.sprites);
+        let constant = |v| Curve {
+            keys: vec![[0.0, v, 0.0, 0.0]],
+        };
+        let layer = CloudLayerDef {
+            origin: [0.0, 1.0, -4.0],
+            depth: 0.5,
+            width: 0.25,
+            wind_multiplier: 0.0,
+            lifetime: 60.0,
+            fade_time: 1.0,
+            vertical_motion: 0.0,
+            max_clouds: 1,
+            sprites: vec![0],
+            prefab_active: true,
+            allow_flip: false,
+            y_curve: constant(0.0),
+            scale_curve: constant(1.0),
+            parallax_curve: constant(1.0),
+        };
+        let def = AtmosphereDef {
+            fog: layer.clone(),
+            mist: layer,
+            sprites: vec!["fog".into()],
+            meshes: vec![CloudMesh {
+                vertices: vec![[-2.0, -2.0], [2.0, -2.0], [2.0, 2.0]],
+                indices: vec![0, 1, 2],
+            }],
+        };
+        let light = &mut s.game.blender.state;
+        light.colors[color::FOG] = [1.0; 4];
+        light.floats[float::FOG_DENSITY] = 1.0;
+        for _ in 0..3 {
+            s.clouds.step(None, Some(&def), light, 1.0, s.camera_x);
+        }
+        let fog_z = s
+            .clouds
+            .atmosphere_samples(&def, light)
+            .next()
+            .unwrap()
+            .position[2];
+        s.atmosphere = Some(def);
+        let mut fog = Capture::default();
+        super::draw(&s, &sheet, &mut fog);
+        assert_eq!(fog.0.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 3, 1, 2]);
+        assert!(fog.0[1].2.depth_write);
+        assert_eq!(
+            fog.1,
+            [
+                (1, fog_z),
+                (2, game_z + 2.0),
+                (3, game_z - 6.0),
+                (4, f32::NEG_INFINITY)
+            ]
+        );
+
+        s.game.blender.state.colors[color::FOG][3] = 0.0;
+        let mut clear = Capture::default();
+        super::draw(&s, &sheet, &mut clear);
+        assert_eq!(clear.0.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 1, 2]);
+        assert!(clear.1.is_empty());
+
+        use game::payment::{PayInput, PayableId, Target};
+        s.game.level.objects[0].z = 1.0;
+        s.game.pay.update(
+            &PayInput {
+                target: Some(Target {
+                    id: PayableId(payable),
+                    can_pay: true,
+                    price: 3,
+                }),
+                ..Default::default()
+            },
+            |_| {},
+        );
+        let (key, _) = super::draw_list(&s, &sheet)
+            .into_iter()
+            .find(|(_, item)| matches!(item, super::DrawItem::PriceSlots))
+            .unwrap();
+        assert_eq!(key, (0, 0, -(game_z + 1.0 - 0.005)));
     }
 
     fn animation_world() -> game::data::WorldData {
@@ -2612,5 +2825,68 @@ mod atmosphere_tests {
         let mist = atmosphere_material(sample, &light).unwrap();
         assert!(!mist.additive);
         assert_eq!(mist.tint, Color::new(0.25, 0.1875, 0.125, 0.005));
+    }
+    #[test]
+    fn fog_lights_at_flipped_scaled_vertices_in_three_dimensions() {
+        use super::{
+            atmosphere_material, color, fog_vertex_tints, AtmosphereDraw, AtmosphereKind,
+            AtmosphereSample, Color, FogLight, Light,
+        };
+        use crate::cloud_mesh::CloudMesh;
+
+        let mesh = CloudMesh {
+            vertices: vec![[0.0, -16.0], [32.0, 16.0], [-64.0, 0.0]],
+            indices: vec![0, 1, 2],
+        };
+        let mut light = Light::default();
+        light.colors[color::AMBIENT] = [0.0, 0.25, 0.5, 0.4];
+        let sample = AtmosphereSample {
+            kind: AtmosphereKind::Fog,
+            sprite: 0,
+            position: [4.0, 2.0, -3.0],
+            scale: [2.0, 3.0],
+            flip: true,
+            tint: Color::new(0.5, 0.75, 1.0, 0.6),
+        };
+        let mut p = AtmosphereDraw {
+            id: 0,
+            mesh: &mesh,
+            at: (0.0, 0.0),
+            sample,
+            draw: atmosphere_material(sample, &light).unwrap(),
+        };
+        let mut tints = Vec::new();
+        let behind = FogLight {
+            position: [2.0, 0.5, 0.0],
+            intensity: 1.0,
+        };
+        // A screen-aligned fire exactly three units back is outside the light.
+        assert!(fog_vertex_tints(&p, &[behind], &mut tints).is_none());
+        let near = FogLight {
+            position: [2.0, 0.5, -1.5],
+            intensity: 0.8,
+        };
+        let cancel = FogLight {
+            intensity: -0.2,
+            ..near
+        };
+        let colors = fog_vertex_tints(&p, &[behind, near, cancel], &mut tints).unwrap();
+        assert_eq!(colors.len(), mesh.vertices.len());
+        assert_eq!(colors[0], p.draw.tint);
+        assert_eq!(colors[2], p.draw.tint);
+        let expected = [
+            0.5 * 0.49 * 0.3,
+            0.75 * (0.25 + 0.425 * 0.3),
+            0.5 + 0.34 * 0.3,
+        ];
+        for (got, want) in [colors[1].r, colors[1].g, colors[1].b]
+            .into_iter()
+            .zip(expected)
+        {
+            assert!((got - want).abs() < 1e-6, "{got} != {want}");
+        }
+        assert!(colors.iter().all(|tint| tint.a == 0.6));
+        p.sample.kind = AtmosphereKind::Mist;
+        assert!(fog_vertex_tints(&p, &[near], &mut tints).is_none());
     }
 }

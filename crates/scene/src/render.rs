@@ -70,6 +70,7 @@ pub struct Draw {
     /// orig: `SpriteFX` `recolorA` / `recolorB`.
     pub recolor: Option<(Color, Color)>,
     pub additive: bool,
+    pub depth_write: bool,
     /// Filtered smoothly when scaled (glows); everything else stays pixel-sharp.
     pub smooth: bool,
 }
@@ -87,6 +88,7 @@ impl Draw {
             angle: 0.0,
             recolor: None,
             additive: false,
+            depth_write: false,
             smooth: false,
         }
     }
@@ -209,4 +211,6 @@ pub trait Renderer {
     /// Stereo depth of what's drawn next: 0 at the screen, 1 farthest
     /// behind it, negative in front. Backends without 3D ignore it.
     fn depth(&mut self, _d: f32) {}
+    /// Selects the ordered world depth pass. Negative infinity exits it.
+    fn world_depth(&mut self, _z: f32) {}
 }

@@ -41,6 +41,17 @@ static SHADER: &[u8] = citro3d_macros::include_shader!("../shaders/sprite.v.pica
 const MAX_QUADS: usize = 16384;
 /// Depth step between items in painter's order (24-bit depth buffer).
 const Z_STEP: f32 = 1.5e-5;
+const DRAW_ORDER_LIMIT: f32 = -0.75;
+
+/// The world-depth range sits entirely in front of the batched prefix.
+/// Keep equality for coplanar sprites and leave room for screen overlays.
+fn world_raster_z(z: f32) -> f32 {
+    if z == f32::NEG_INFINITY {
+        return 0.0;
+    }
+    -0.45 - 0.2 * (z / (z.abs() + 10.0))
+}
+
 /// The top screen's colour buffer: 240 x 400 (mounted sideways), RGBA8,
 /// in rows of 8x8 tiles. The reflection texture is 256 x 512.
 const TOP_TILE_ROW: u32 = 30 * 8 * 8 * 4;
@@ -74,15 +85,46 @@ struct State {
     smooth: bool,
     cloud_light: Option<u32>,
     cloud_shadow: bool,
+    depth: DepthMode,
 }
 
-/// A step of a screen's drawing, kept to replay for the right eye.
-#[derive(Clone, Copy)]
-enum Call {
-    /// Depth test for the opaque pass (`true`) or the translucent one.
-    Pass(bool),
-    Draw(State, usize, usize),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DepthMode {
+    Read,
+    Opaque,
+    WorldRead,
+    Fog,
 }
+
+impl DepthMode {
+    fn sprite(draw: &Draw) -> Self {
+        if draw.depth_write {
+            Self::Fog
+        } else {
+            Self::Read
+        }
+    }
+
+    fn tests(self, painter: bool) -> (ctru::GPU_TESTFUNC, ctru::GPU_WRITEMASK, i32) {
+        let (test, write, min_alpha) = match self {
+            Self::Read => (ctru::GPU_GREATER, ctru::GPU_WRITE_COLOR, 1),
+            Self::Opaque => (ctru::GPU_GREATER, ctru::GPU_WRITE_ALL, 1),
+            Self::WorldRead => (ctru::GPU_GEQUAL, ctru::GPU_WRITE_COLOR, 1),
+            // The 3DS uses reversed Z, so the PC material's LEqual is GEQUAL.
+            // Its .01 cutoff first passes at alpha 3/255.
+            Self::Fog => (ctru::GPU_GEQUAL, ctru::GPU_WRITE_ALL, 3),
+        };
+        if painter {
+            (ctru::GPU_ALWAYS, ctru::GPU_WRITE_COLOR, min_alpha)
+        } else {
+            (test, write, min_alpha)
+        }
+    }
+}
+
+/// A run's complete state and vertex range, kept to replay for the right eye.
+#[derive(Clone, Copy)]
+struct Call(State, usize, usize);
 
 pub struct Screen {
     target: *mut c3d::C3D_RenderTarget,
@@ -107,6 +149,7 @@ pub struct Gpu {
     pub stereo: f32,
     /// Depth given to quads from here on (see `Renderer::depth`).
     depth: f32,
+    world_z: Option<f32>,
     calls: Vec<Call>,
     pages: Vec<Box<c3d::C3D_Tex>>,
     page_size: Vec<(f32, f32)>,
@@ -134,6 +177,7 @@ pub struct Gpu {
     cloud_exposure: Option<Box<c3d::C3D_Tex>>,
     right_cloud_exposure: RightCloudExposure,
     bound_additive: Option<bool>,
+    bound_depth: Option<DepthMode>,
     /// Draw calls this frame.
     pub draws: u32,
     /// The page holding last frame's top screen, once one has been copied.
@@ -415,6 +459,7 @@ impl Gpu {
                 eye_loc,
                 stereo: 0.0,
                 depth: 0.0,
+                world_z: None,
                 calls: Vec::new(),
                 pages,
                 page_size,
@@ -434,6 +479,7 @@ impl Gpu {
                 cloud_exposure,
                 right_cloud_exposure: RightCloudExposure::Pending,
                 bound_additive: None,
+                bound_depth: None,
                 draws: 0,
                 reflection,
                 reflection_ready: false,
@@ -476,6 +522,7 @@ impl Gpu {
         self.bound_page = None;
         self.bound_textured = None;
         self.bound_additive = None;
+        self.bound_depth = None;
     }
 
     /// Vertices queued this frame.
@@ -491,6 +538,7 @@ impl Gpu {
         }
         self.on_top = top;
         self.depth = 0.0;
+        self.world_z = None;
         let s = if top { &self.top } else { &self.bottom };
         unsafe {
             c3d::C3D_RenderTargetClear(s.target, c3d::C3D_CLEAR_ALL, clear_color(Color::BLACK), 0);
@@ -536,36 +584,21 @@ impl Gpu {
                 false
             };
         self.unbind();
-        for &c in &calls {
-            match c {
-                Call::Pass(opaque) => self.depth_test(opaque),
-                Call::Draw(mut state, first, n) => unsafe {
-                    state.cloud_shadow &= has_exposure;
-                    self.bind(state);
-                    c3d::C3D_DrawElements(
-                        ctru::GPU_TRIANGLES,
-                        (n * 6) as i32,
-                        c3d::C3D_UNSIGNED_SHORT as i32,
-                        self.indices.add(first * 6) as *const _,
-                    );
-                    self.draws += 1;
-                },
+        for &Call(mut state, first, n) in &calls {
+            state.cloud_shadow &= has_exposure;
+            unsafe {
+                self.bind(state);
+                c3d::C3D_DrawElements(
+                    ctru::GPU_TRIANGLES,
+                    (n * 6) as i32,
+                    c3d::C3D_UNSIGNED_SHORT as i32,
+                    self.indices.add(first * 6) as *const _,
+                );
             }
+            self.draws += 1;
         }
         self.calls = calls;
         self.unbind();
-    }
-
-    fn depth_test(&mut self, opaque: bool) {
-        unsafe {
-            if self.painter {
-                c3d::C3D_DepthTest(false, ctru::GPU_ALWAYS, ctru::GPU_WRITE_COLOR);
-            } else if opaque {
-                c3d::C3D_DepthTest(true, ctru::GPU_GREATER, ctru::GPU_WRITE_ALL);
-            } else {
-                c3d::C3D_DepthTest(true, ctru::GPU_GREATER, ctru::GPU_WRITE_COLOR);
-            }
-        }
     }
 
     /// Queues a copy of the top screen, once drawn, into the reflection page.
@@ -615,6 +648,13 @@ impl Gpu {
 
     /// Sets the GPU up for `state` (only what changed).
     unsafe fn bind(&mut self, state: State) {
+        if self.bound_depth != Some(state.depth) {
+            let (test, write, min_alpha) = state.depth.tests(self.painter);
+            c3d::C3D_DepthTest(!self.painter, test, write);
+            c3d::C3D_AlphaTest(true, ctru::GPU_GEQUAL, min_alpha);
+            self.bound_depth = Some(state.depth);
+        }
+
         let mode = match state.page {
             None => Env::Solid,
             Some(p) if Some(p) == self.reflection => Env::Reflection,
@@ -776,14 +816,12 @@ impl Gpu {
             );
         }
         self.draws += 1;
-        self.calls.push(Call::Draw(state, first, n));
+        self.calls.push(Call(state, first, n));
     }
 
     /// Draws this screen's items: the opaque pass by page, then the rest in order.
     fn flush(&mut self) {
         self.calls.clear();
-        self.depth_test(true);
-        self.calls.push(Call::Pass(true));
         let solid = std::mem::take(&mut self.solid);
         self.draw(
             State {
@@ -792,6 +830,7 @@ impl Gpu {
                 smooth: false,
                 cloud_light: None,
                 cloud_shadow: false,
+                depth: DepthMode::Opaque,
             },
             &solid,
         );
@@ -806,15 +845,13 @@ impl Gpu {
                     smooth: false,
                     cloud_light: None,
                     cloud_shadow: false,
+                    depth: DepthMode::Opaque,
                 },
                 &quads,
             );
             self.opaque[p] = quads;
             self.opaque[p].clear();
         }
-        // The translucent rest: tested against the opaque pass, not written.
-        self.depth_test(false);
-        self.calls.push(Call::Pass(false));
         let runs = std::mem::take(&mut self.runs);
         for &(state, first, n) in &runs {
             self.draw_range(state, first, n);
@@ -830,13 +867,12 @@ impl Gpu {
     /// Queues a quad (corners clockwise from top-left) in its pass.
     fn quad(
         &mut self,
-        state: State,
+        mut state: State,
         corners: [(f32, f32); 4],
         uv: [(f32, f32); 4],
         colors: [Color; 4],
     ) {
-        let z = -0.999 + self.order as f32 * Z_STEP;
-        self.order += 1;
+        let z = self.next_raster_z(&mut state.depth);
         let q: Quad = [0, 1, 2, 3].map(|i| Vertex {
             pos: [corners[i].0, corners[i].1, z, self.depth],
             uv: [uv[i].0, uv[i].1],
@@ -846,6 +882,7 @@ impl Gpu {
         let opaque = !self.painter
             && !state.additive
             && state.cloud_light.is_none()
+            && state.depth == DepthMode::Read
             && colors.iter().all(|c| c.a >= 0.999)
             && state.page.is_none_or(|p| self.page_hard[p as usize]);
         if opaque {
@@ -856,6 +893,18 @@ impl Gpu {
             return;
         }
         self.translucent_quad(state, q);
+    }
+
+    fn next_raster_z(&mut self, mode: &mut DepthMode) -> f32 {
+        if let Some(z) = self.world_z {
+            if *mode == DepthMode::Read {
+                *mode = DepthMode::WorldRead;
+            }
+            return z;
+        }
+        let z = (-0.999 + self.order as f32 * Z_STEP).min(DRAW_ORDER_LIMIT);
+        self.order += 1;
+        z
     }
 
     fn translucent_quad(&mut self, state: State, q: Quad) {
@@ -876,7 +925,7 @@ impl Gpu {
     fn indexed_sprite(
         &mut self,
         id: u32,
-        mesh: Option<&scene::cloud_mesh::CloudMesh>,
+        mesh: Option<&CloudMesh>,
         at: (f32, f32),
         d: &Draw,
         tints: Option<&[Color]>,
@@ -897,15 +946,15 @@ impl Gpu {
                 mask.tile[1] as i16 - mask.origin[1] - ATLAS_HEIGHT as i16,
             ]
         });
-        let state = State {
+        let mut state = State {
             page: Some(sprite.page),
             additive: false,
             smooth: false,
             cloud_light: d.cloud_light.map(|light| u32::from_le_bytes(color(light))),
             cloud_shadow: mask.is_some(),
+            depth: DepthMode::sprite(d),
         };
-        let z = -0.999 + self.order as f32 * Z_STEP;
-        self.order += 1;
+        let z = self.next_raster_z(&mut state.depth);
         let (pw, ph) = self.page_size[sprite.page as usize];
         let depth = self.depth;
         let vertex = |index: u16| {
@@ -966,6 +1015,7 @@ impl Gpu {
             smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0 || authored),
             cloud_light: d.cloud_light.map(|light| u32::from_le_bytes(color(light))),
             cloud_shadow: false,
+            depth: DepthMode::Read,
         };
         self.quad(state, corners, uv, [tint; 4]);
     }
@@ -983,6 +1033,7 @@ impl Gpu {
             smooth: false,
             cloud_light: None,
             cloud_shadow: false,
+            depth: DepthMode::Read,
         };
         self.quad(state, corners, [(0.0, 0.0); 4], [top, top, bottom, bottom]);
     }
@@ -1049,7 +1100,7 @@ impl Renderer for Gpu {
     fn atmosphere_sprite(
         &mut self,
         id: u32,
-        mesh: &scene::cloud_mesh::CloudMesh,
+        mesh: &CloudMesh,
         at: (f32, f32),
         draw: Draw,
         tints: Option<&[Color]>,
@@ -1078,6 +1129,7 @@ impl Renderer for Gpu {
             smooth: false,
             cloud_light: None,
             cloud_shadow: false,
+            depth: DepthMode::Read,
         };
         for &(cx, cw, dx, dw) in &cols {
             for &(ry, rh, dy, dh) in &rows {
@@ -1132,6 +1184,7 @@ impl Renderer for Gpu {
             smooth: false,
             cloud_light: None,
             cloud_shadow: false,
+            depth: DepthMode::Read,
         };
         for i in 0..N {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
@@ -1153,6 +1206,7 @@ impl Renderer for Gpu {
             smooth: false,
             cloud_light: None,
             cloud_shadow: false,
+            depth: DepthMode::Read,
         };
         for i in 0..N {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
@@ -1169,6 +1223,10 @@ impl Renderer for Gpu {
 
     fn depth(&mut self, d: f32) {
         self.depth = d;
+    }
+
+    fn world_depth(&mut self, z: f32) {
+        self.world_z = Some(world_raster_z(z));
     }
 
     fn reflect(&mut self, dest: Rect, src: Rect, tint: Color) {
@@ -1198,6 +1256,7 @@ impl Renderer for Gpu {
             smooth: false,
             cloud_light: None,
             cloud_shadow: false,
+            depth: DepthMode::Read,
         };
         self.quad(
             state,

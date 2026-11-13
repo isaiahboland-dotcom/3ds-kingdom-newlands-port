@@ -66,8 +66,15 @@ fn read_input(bag_tap: bool) -> RawInput {
     }
 }
 
-fn target(w: f32, h: f32) -> RenderTarget {
-    let rt = render_target(w as u32, h as u32);
+fn target(w: f32, h: f32, depth: bool) -> RenderTarget {
+    let rt = render_target_ex(
+        w as u32,
+        h as u32,
+        RenderTargetParams {
+            depth,
+            ..Default::default()
+        },
+    );
     rt.texture.set_filter(FilterMode::Nearest);
     rt
 }
@@ -112,10 +119,10 @@ async fn main() {
         .nth(1)
         .and_then(|f| f.parse().ok())
         .unwrap_or(200);
-    let top_rt = target(TOP_W, TOP_H);
-    let bot_rt = target(BOT_W, BOT_H);
+    let top_rt = target(TOP_W, TOP_H, true);
+    let bot_rt = target(BOT_W, BOT_H, false);
     // Last frame's top screen, which the water reflects.
-    let previous_rt = target(TOP_W, TOP_H);
+    let previous_rt = target(TOP_W, TOP_H, false);
     let dir = std::env::var("KINGDOM_ASSETS").unwrap_or_else(|_| "assets".to_owned());
     let mut world_id = 0;
     let world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))

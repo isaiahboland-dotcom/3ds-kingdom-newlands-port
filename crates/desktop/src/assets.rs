@@ -10,15 +10,16 @@ use ::scene::render::{sprite_corners, Color, Draw, Rect, Renderer};
 use ::scene::sheet::Sheet;
 use game::data::WorldData;
 use macroquad::miniquad::{
-    BlendFactor, BlendState, BlendValue, Equation, TextureAccess, TextureFormat, TextureParams,
-    TextureSource,
+    gl::{glDepthMask, GL_FALSE, GL_TRUE},
+    BlendFactor, BlendState, BlendValue, Comparison, Equation, TextureAccess, TextureFormat,
+    TextureParams, TextureSource,
 };
 use macroquad::prelude as mq;
 use macroquad::prelude::{
     draw_circle, draw_circle_lines, draw_mesh, draw_rectangle, draw_rectangle_lines,
     draw_texture_ex, gl_use_default_material, gl_use_material, load_material, load_texture, vec2,
-    DrawTextureParams, FilterMode, Material, MaterialParams, Mesh, PipelineParams, ShaderSource,
-    Texture2D, UniformDesc, UniformType, Vertex,
+    vec3, DrawTextureParams, FilterMode, Mat4, Material, MaterialParams, Mesh, PipelineParams,
+    ShaderSource, Texture2D, UniformDesc, UniformType, Vertex,
 };
 
 pub struct Assets {
@@ -27,12 +28,15 @@ pub struct Assets {
     smooth: Vec<Texture2D>,
     pub sheet: Rc<Sheet>,
     /// Recolors sprite pixels keyed by alpha. See `RECOLOR_FS`.
-    recolor: Material,
+    recolor: DepthMaterials,
     /// Additive blending (glows, PostFX add color).
-    additive: Material,
+    additive: DepthMaterials,
     /// Water reflections (see `REFLECT_FS`).
-    reflect: Material,
-    cloud: Option<Material>,
+    reflect: DepthMaterials,
+    cloud: DepthMaterials,
+    fog: Material,
+    world_z: Option<f32>,
+    depth_write_mask: bool,
     cloud_pass: cloud_shadow::Pass,
     cloud_depth: Option<CloudDepth>,
     shadow_camera: Option<cloud_shadow::Camera>,
@@ -141,7 +145,7 @@ pub(crate) fn encode_depth(depth: &[f32], bytes: &mut [u8]) {
     }
 }
 
-pub(crate) const CLOUD_VS: &str = r#"#version 100
+const CLOUD_VS: &str = r#"#version 100
 attribute vec3 position;
 attribute vec2 texcoord;
 attribute vec4 color0;
@@ -220,6 +224,86 @@ void main() {
 }
 "#;
 
+fn world_clip_z(z: f32) -> f32 {
+    // Keep subpixel depth offsets distinct in the native fog range (-5..-2)
+    // on Macroquad's 16-bit attachment. Only fog writes in this range.
+    ((z + 3.5) * 0.2).clamp(-0.95, 0.95)
+}
+
+struct DepthMaterials {
+    painter: Material,
+    world: Material,
+}
+
+impl DepthMaterials {
+    fn load(
+        vertex: &str,
+        fragment: &str,
+        uniforms: &[UniformDesc],
+        textures: &[String],
+        dst: BlendFactor,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            painter: material(vertex, fragment, uniforms, textures, dst, false)?,
+            world: material(vertex, fragment, uniforms, textures, dst, true)?,
+        })
+    }
+
+    fn get(&self, world_z: Option<f32>) -> &Material {
+        if world_z.is_some() {
+            &self.world
+        } else {
+            &self.painter
+        }
+    }
+}
+
+fn material(
+    vertex: &str,
+    fragment: &str,
+    uniforms: &[UniformDesc],
+    textures: &[String],
+    dst: BlendFactor,
+    depth_test: bool,
+) -> Result<Material, String> {
+    load_material(
+        ShaderSource::Glsl { vertex, fragment },
+        MaterialParams {
+            uniforms: uniforms.to_vec(),
+            textures: textures.to_vec(),
+            pipeline_params: PipelineParams {
+                color_blend: Some(BlendState::new(
+                    Equation::Add,
+                    BlendFactor::Value(BlendValue::SourceAlpha),
+                    dst,
+                )),
+                // Miniquad's GL backend uses depth_write to enable the test.
+                // The separate GL depth mask controls actual depth writes.
+                depth_write: depth_test,
+                depth_test: Comparison::LessOrEqual,
+                ..Default::default()
+            },
+        },
+    )
+    .map_err(|e| e.to_string())
+}
+
+const FOG_FS: &str = r#"#version 100
+precision highp float;
+varying lowp vec2 uv;
+varying lowp vec4 color;
+uniform sampler2D Texture;
+uniform float FogAlpha;
+void main() {
+    vec4 art = texture2D(Texture, uv);
+    float coverage = art.a * FogAlpha;
+    if (coverage < 0.01) {
+        discard;
+    }
+    gl_FragColor = vec4(art.rgb * color.rgb, coverage);
+}
+"#;
+
 const RECOLOR_VS: &str = r#"#version 100
 attribute vec3 position;
 attribute vec2 texcoord;
@@ -236,14 +320,38 @@ void main() {
 "#;
 
 impl Assets {
+    fn depth_writes(&mut self, write: bool) {
+        if write != self.depth_write_mask {
+            // Macroquad queues geometry, but the GL mask applies when it runs.
+            // Submit the preceding draws before changing the mask.
+            unsafe {
+                mq::get_internal_gl().flush();
+                glDepthMask(if write { GL_TRUE } else { GL_FALSE } as u8);
+            }
+            self.depth_write_mask = write;
+        }
+    }
+
+    fn read_depth(&mut self) {
+        if self.world_z.is_some() {
+            self.depth_writes(false);
+        }
+    }
+
     fn indexed_sprite(
-        &self,
+        &mut self,
         id: u32,
         mesh: Option<&::scene::cloud_mesh::CloudMesh>,
         at: (f32, f32),
         d: &Draw,
         tints: Option<&[Color]>,
     ) {
+        let fog = d.depth_write && self.world_z.is_some();
+        if fog {
+            self.depth_writes(true);
+        } else {
+            self.read_depth();
+        }
         let s = self.sheet.get(id);
         let geometry = Geometry::new(s, mesh.or_else(|| self.sheet.cloud_mesh(id)));
         let texture = &self.pages[usize::from(s.page)];
@@ -277,7 +385,11 @@ impl Assets {
                 vertex
             })
             .collect();
-        if let Some((material, light)) = self.cloud.as_ref().zip(d.cloud_light) {
+        if fog {
+            gl_use_material(&self.fog);
+            self.fog.set_uniform("FogAlpha", d.tint.a);
+        } else if let Some(light) = d.cloud_light {
+            let material = self.cloud.get(self.world_z);
             gl_use_material(material);
             material.set_uniform("CloudLight", mc(light).to_vec());
         }
@@ -380,76 +492,48 @@ impl Assets {
             smooth.push(soft);
             pages.push(tex);
         }
-        let blend = |dst: BlendFactor| PipelineParams {
-            color_blend: Some(BlendState::new(
-                Equation::Add,
-                BlendFactor::Value(BlendValue::SourceAlpha),
-                dst,
-            )),
-            ..Default::default()
-        };
-        let recolor = load_material(
-            ShaderSource::Glsl {
-                vertex: RECOLOR_VS,
-                fragment: RECOLOR_FS,
-            },
-            MaterialParams {
-                uniforms: vec![
-                    UniformDesc::new("RecolorA", UniformType::Float4),
-                    UniformDesc::new("RecolorB", UniformType::Float4),
-                ],
-                pipeline_params: blend(BlendFactor::OneMinusValue(BlendValue::SourceAlpha)),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        let additive = load_material(
-            ShaderSource::Glsl {
-                vertex: RECOLOR_VS,
-                fragment: PLAIN_FS,
-            },
-            MaterialParams {
-                pipeline_params: blend(BlendFactor::One),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        let reflect = load_material(
-            ShaderSource::Glsl {
-                vertex: RECOLOR_VS,
-                fragment: REFLECT_FS,
-            },
-            MaterialParams {
-                pipeline_params: blend(BlendFactor::One),
-                ..Default::default()
-            },
-        )
-        .map_err(|e| e.to_string())?;
+        let alpha_blend = BlendFactor::OneMinusValue(BlendValue::SourceAlpha);
+        let recolor = DepthMaterials::load(
+            RECOLOR_VS,
+            RECOLOR_FS,
+            &[
+                UniformDesc::new("RecolorA", UniformType::Float4),
+                UniformDesc::new("RecolorB", UniformType::Float4),
+            ],
+            &[],
+            alpha_blend,
+        )?;
+        let cloud = DepthMaterials::load(
+            CLOUD_VS,
+            CLOUD_FS,
+            &[UniformDesc::new("CloudLight", UniformType::Float4)],
+            &["CloudDepth".into()],
+            alpha_blend,
+        )?;
+        let additive = DepthMaterials::load(RECOLOR_VS, PLAIN_FS, &[], &[], BlendFactor::One)?;
+        let reflect = DepthMaterials::load(RECOLOR_VS, REFLECT_FS, &[], &[], BlendFactor::One)?;
+        let fog = material(
+            RECOLOR_VS,
+            FOG_FS,
+            &[UniformDesc::new("FogAlpha", UniformType::Float1)],
+            &[],
+            alpha_blend,
+            true,
+        )?;
         let cloud_depth = cloud_defs.as_ref().map(|_| CloudDepth::new());
-        let cloud = if let Some(depth) = &cloud_depth {
-            let material = load_material(
-                ShaderSource::Glsl {
-                    vertex: CLOUD_VS,
-                    fragment: CLOUD_FS,
-                },
-                MaterialParams {
-                    uniforms: vec![UniformDesc::new("CloudLight", UniformType::Float4)],
-                    textures: vec!["CloudDepth".into()],
-                    pipeline_params: blend(BlendFactor::OneMinusValue(BlendValue::SourceAlpha)),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| e.to_string())?;
-            material.set_texture("CloudDepth", depth.texture.clone());
-            Some(material)
-        } else {
-            None
-        };
+        let texture = cloud_depth
+            .as_ref()
+            .map_or_else(Texture2D::empty, |map| map.texture.clone());
+        cloud.painter.set_texture("CloudDepth", texture.clone());
+        cloud.world.set_texture("CloudDepth", texture);
         Ok(Assets {
             cloud,
             cloud_pass,
             cloud_depth,
             shadow_camera: None,
+            fog,
+            world_z: None,
+            depth_write_mask: true,
             cloud_defs,
             atmosphere,
             pages,
@@ -480,7 +564,28 @@ fn gradient_mesh(r: Rect, top: Color, bottom: Color) {
 
 impl Renderer for Assets {
     fn clear(&mut self, c: Color) {
+        self.world_depth(f32::NEG_INFINITY);
         mq::clear_background(mc(c));
+    }
+
+    fn world_depth(&mut self, z: f32) {
+        let next = (z != f32::NEG_INFINITY).then(|| world_clip_z(z));
+        if self.world_z == next {
+            return;
+        }
+        if next.is_none() {
+            // Restore the write mask before another target or a depth clear.
+            self.depth_writes(true);
+        }
+        let gl = unsafe { mq::get_internal_gl() }.quad_gl;
+        if self.world_z.is_some() {
+            gl.pop_model_matrix();
+        }
+        if let Some(z) = next {
+            gl.push_model_matrix(Mat4::from_translation(vec3(0.0, 0.0, z)));
+        }
+        gl.depth_test(next.is_some());
+        self.world_z = next;
     }
 
     fn cloud_shadows(
@@ -501,17 +606,19 @@ impl Renderer for Assets {
     }
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
-        let s = *self.sheet.get(id);
         if d.cloud_light.is_some() {
             self.indexed_sprite(id, None, at, &d, None);
             return;
         }
+        self.read_depth();
+        let s = *self.sheet.get(id);
         if let Some((a, b)) = d.recolor {
-            gl_use_material(&self.recolor);
-            self.recolor.set_uniform("RecolorA", mc(a).to_vec());
-            self.recolor.set_uniform("RecolorB", mc(b).to_vec());
+            let material = self.recolor.get(self.world_z);
+            gl_use_material(material);
+            material.set_uniform("RecolorA", mc(a).to_vec());
+            material.set_uniform("RecolorB", mc(b).to_vec());
         } else if d.additive {
-            gl_use_material(&self.additive);
+            gl_use_material(self.additive.get(self.world_z));
         }
         let pages = if d.smooth { &self.smooth } else { &self.pages };
         let texture = &pages[s.page as usize];
@@ -572,6 +679,7 @@ impl Renderer for Assets {
 
     /// orig: `Image.Type.Sliced`.
     fn sliced(&mut self, id: u32, dest: Rect, border: (f32, f32, f32, f32), tint: Color) {
+        self.read_depth();
         let s = *self.sheet.get(id);
         let (l, b, r, t) = border;
         let (sx, sy, sw, sh) = (s.x as f32, s.y as f32, s.w as f32, s.h as f32);
@@ -606,40 +714,48 @@ impl Renderer for Assets {
     }
 
     fn rect(&mut self, r: Rect, c: Color) {
+        self.read_depth();
         draw_rectangle(r.x, r.y, r.w, r.h, mc(c));
     }
 
     fn rect_lines(&mut self, r: Rect, thickness: f32, c: Color) {
+        self.read_depth();
         draw_rectangle_lines(r.x, r.y, r.w, r.h, thickness, mc(c));
     }
 
     fn gradient(&mut self, r: Rect, top: Color, bottom: Color) {
+        self.read_depth();
         gradient_mesh(r, top, bottom);
     }
 
     fn add(&mut self, r: Rect, c: Color) {
-        gl_use_material(&self.additive);
+        self.read_depth();
+        gl_use_material(self.additive.get(self.world_z));
         draw_rectangle(r.x, r.y, r.w, r.h, mc(c));
         gl_use_default_material();
     }
 
     fn add_gradient(&mut self, r: Rect, top: Color, bottom: Color) {
-        gl_use_material(&self.additive);
+        self.read_depth();
+        gl_use_material(self.additive.get(self.world_z));
         gradient_mesh(r, top, bottom);
         gl_use_default_material();
     }
 
     fn circle(&mut self, x: f32, y: f32, radius: f32, c: Color) {
+        self.read_depth();
         draw_circle(x, y, radius, mc(c));
     }
 
     fn circle_lines(&mut self, x: f32, y: f32, radius: f32, thickness: f32, c: Color) {
+        self.read_depth();
         draw_circle_lines(x, y, radius, thickness, mc(c));
     }
 
     fn reflect(&mut self, dest: Rect, src: Rect, tint: Color) {
+        self.read_depth();
         let Some(t) = &self.previous else { return };
-        gl_use_material(&self.reflect);
+        gl_use_material(self.reflect.get(self.world_z));
         draw_texture_ex(
             t,
             dest.x,
@@ -658,5 +774,21 @@ impl Renderer for Assets {
             },
         );
         gl_use_default_material();
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_depth_keeps_near_far_and_coplanar_fog_distinct() {
+        let depth16 = |z| ((world_clip_z(z) * 0.5 + 0.5) * 65535.0).round() as u16;
+        for z in [-5.0, -3.5, -2.0] {
+            assert!(depth16(z - 0.001) < depth16(z));
+            assert!(depth16(z + 0.001) > depth16(z));
+        }
+        assert!(depth16(-100.0) < depth16(-5.0));
+        assert!(depth16(100.0) > depth16(-2.0));
     }
 }
