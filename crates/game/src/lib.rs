@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+pub mod animation;
 pub mod autopilot;
 pub mod bag;
 pub mod boat;
