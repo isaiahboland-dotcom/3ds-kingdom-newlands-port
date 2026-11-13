@@ -105,6 +105,15 @@ fn main() {
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
+    let particle_path = format!("{ROMFS}/{}", scene::fire_particles::FILE_NAME);
+    match scene::fire_particles::FireParticlesDef::load(
+        std::path::Path::new(&particle_path),
+        &sheet,
+        world_id,
+    ) {
+        Ok(def) => s.fire_particles = def,
+        Err(err) => eprintln!("ignoring fire particle data: {err}"),
+    }
     if let Some(g) = saved {
         s.resume(g);
     }

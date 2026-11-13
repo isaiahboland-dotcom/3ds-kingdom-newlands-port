@@ -24,7 +24,7 @@ pub use game::build::WALK_Y;
 pub const CAMERA_Y: f32 = 1.875;
 /// Depth of the monarch and coins in the game layer. orig: Player prefab z;
 /// `Droppable.Drop` puts coins 0.01 in front of the dropper.
-const MONARCH_Z: f32 = 1.0;
+pub(crate) const MONARCH_Z: f32 = 1.0;
 const COIN_Z: f32 = 0.99;
 
 /// Gradient quads of the main scene: (z, bottom y, top y), in world units.
@@ -282,6 +282,7 @@ pub enum DrawItem {
     },
     /// The monarch's torch.
     Torch,
+    FireParticle(usize),
 }
 
 fn layer_z(world: &game::data::WorldData) -> f32 {
@@ -444,7 +445,7 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
         }
     }
     items.push(((0, 0, -MONARCH_Z), DrawItem::Monarch));
-    if torch_lit(s) {
+    if s.fires.torch().is_some() {
         items.push(((0, 0, -(MONARCH_Z - 0.01)), DrawItem::Torch));
     }
     for (i, u) in g.population.units.iter().enumerate() {
@@ -515,19 +516,6 @@ fn sort_key((layer, order, z): (i16, i16, f32)) -> u64 {
     (flip(layer) << 48) | (flip(order) << 32) | u64::from(z)
 }
 
-/// Whether fire `f` burns now. orig: `Fire.Start` / `HandleOnDayEnd`:
-/// night-only fires burn from dusk to dawn; ones that don't start
-/// themselves (the statues') stay out.
-fn burning(s: &Session, f: &FireDef) -> bool {
-    f.auto_start && (!f.night_only || !s.game.days.is_daytime)
-}
-
-/// orig: `Player.Update`: the torch is lit when the ambient light is dim.
-fn torch_lit(s: &Session) -> bool {
-    s.world.steeds[s.game.steed as usize].torch.is_some()
-        && s.game.blender.state.ambient_grayscale() < s.world.fire.torch_threshold
-}
-
 /// Draw items for an object's burning fires, above its own parts.
 fn push_fires(
     items: &mut Vec<((i16, i16, f32), DrawItem)>,
@@ -543,55 +531,36 @@ fn push_fires(
     let layer = s.world.layer(o.layer);
     let top = proto.parts.iter().map(|p| p.sort_layer).max().unwrap_or(0);
     for (f, fire) in proto.fires.iter().enumerate() {
-        if burning(s, fire) {
+        if s.fires.object(o, f, scenery).is_some() {
             let z = layer.z + o.z + fire.at.2;
             items.push(((top, i16::MAX, -z), DrawItem::Fire { o: oi, f, scenery }));
         }
     }
 }
 
-/// A fire's strength, current intensity (flickering) and how far its light
-/// shows (1 in the dark, 0 by day). orig: `Fire.SlowUpdate`: intensity from
-/// strength, flickering by up to ±0.3 in the dark.
-fn fire_intensity(s: &Session, fire: &FireDef, seed: u32) -> (f32, f32, f32) {
-    let st = &s.world.fire;
-    let size = (fire.size.0 * fire.size.0 + fire.size.1 * fire.size.1).sqrt();
-    let strength = sample_keys(&st.strength, size);
-    let dark = sample_keys(&st.ambient, s.game.blender.state.ambient_grayscale());
-    // A smooth random flicker, stepping every 0.15 s like the original.
-    let k = s.t / 0.15 + seed as f32 * 0.37;
-    let noise = |i: f32| {
-        let h = ((i as u32).wrapping_mul(0x9E37_79B9) ^ seed.wrapping_mul(0x85EB_CA6B)) >> 9;
-        h as f32 / (1u32 << 23) as f32 * 2.0 - 1.0
-    };
-    let flicker = noise(k.floor()) + (noise(k.floor() + 1.0) - noise(k.floor())) * k.fract();
-    (
-        strength,
-        sample_keys(&st.intensity, strength) + flicker * 0.3 * dark,
-        dark,
-    )
-}
-
 /// A fire's point light. Every fire gets one, as on the PC's high quality
 /// (`FirePlaceholder`: `useRealLight = forceRealLight || highQuality`); the
 /// low-quality glow sprite washed the night sky and water warm grey.
-fn fire_light(s: &Session, at: (f32, f32), fire: &FireDef, seed: u32) -> Option<PointLight> {
+fn fire_light(s: &Session, at: (f32, f32), fire: crate::fires::FireSample) -> Option<PointLight> {
     let st = &s.world.fire;
-    let (strength, intensity, dark) = fire_intensity(s, fire, seed);
-    let k = intensity * POINT_LIGHT_K * dark;
+    let dark = sample_keys(&st.ambient, s.game.blender.state.ambient_grayscale());
+    let k = fire.intensity * POINT_LIGHT_K * dark;
     if k <= 0.01 {
         return None;
     }
     let [r, g, b] = st.light_color;
     Some(PointLight {
         at,
-        range: sample_keys(&st.range, strength) * PPU,
+        range: sample_keys(&st.range, fire.strength) * PPU,
         color: [r * k, g * k, b * k],
     })
 }
 
-/// Where fire item `item` burns on screen, its definition and flicker seed.
-fn fire_item(s: &Session, item: &DrawItem) -> Option<((f32, f32), FireDef, u32)> {
+/// Where the fire burns, its authored definition and current lamp sample.
+fn fire_item(
+    s: &Session,
+    item: &DrawItem,
+) -> Option<((f32, f32), FireDef, crate::fires::FireSample)> {
     match *item {
         DrawItem::Fire { o, f, scenery } => {
             let objs = if scenery {
@@ -608,14 +577,14 @@ fn fire_item(s: &Session, item: &DrawItem) -> Option<((f32, f32), FireDef, u32)>
                 o.y + fire.at.1,
                 s.world.layer(o.layer).ratio,
             );
-            Some((at, fire, o.id.wrapping_mul(7) + f as u32))
+            Some((at, fire, s.fires.object(o, f, scenery)?))
         }
         DrawItem::Torch => {
             let m = &s.game.monarch;
             let mut fire = s.world.steeds[s.game.steed as usize].torch?;
             fire.real_light = true;
             let at = world_to_screen(s, m.x + fire.at.0 * m.facing as f32, fire.at.1);
-            Some((at, fire, 1))
+            Some((at, fire, s.fires.torch()?))
         }
         _ => None,
     }
@@ -623,7 +592,7 @@ fn fire_item(s: &Session, item: &DrawItem) -> Option<((f32, f32), FireDef, u32)>
 
 /// A fire: its flame and its glint on the water. Its light is gathered up
 /// front (`fire_light`) and falls on the sprites around it.
-fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: u32) {
+fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, elapsed: f32) {
     let s = c.s;
     let st = &s.world.fire;
     // The flame: the prefab nearest in size that has a sprite animation.
@@ -633,12 +602,17 @@ fn draw_fire<R: Renderer>(c: &mut Ctx<R>, at: (f32, f32), fire: &FireDef, seed: 
         };
         d(a).total_cmp(&d(b))
     });
-    if let Some(name) = flame
-        .and_then(|f| f.1)
-        .map(|id| s.world.sprites[id as usize].as_str())
-    {
-        if let Some(sp) = flame_clip(c, name, s.t + seed as f32 * 0.13) {
-            c.r.sprite(sp, at, Draw::tint(WHITE).additive());
+    if s.fire_particles.as_ref().is_none_or(|def| {
+        def.nearest(fire.size)
+            .is_none_or(|i| def.variants[i].animated_sprite)
+    }) {
+        if let Some(name) = flame
+            .and_then(|f| f.1)
+            .map(|id| s.world.sprites[id as usize].as_str())
+        {
+            if let Some(sp) = flame_clip(c, name, elapsed) {
+                c.r.sprite(sp, at, Draw::tint(WHITE).additive());
+            }
         }
     }
     draw_fire_reflection(c, at, fire);
@@ -1539,11 +1513,25 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     c.r.rect(Rect::new(0.0, below, W, H - below), sky_bottom);
 
     let game_z = layer_z(&s.world);
-    let items = draw_list(s);
+    let mut items = draw_list(s);
+    let mut particles = Vec::new();
+    if let Some(def) = &s.fire_particles {
+        for particle in s.fires.particles(def, Color::rgba(colors[color::AMBIENT])) {
+            let [x, _, z] = particle.position;
+            if (x - particle.ratio * s.camera_x).abs() > W / PPU / 2.0 + 2.0 {
+                continue;
+            }
+            if let Some(id) = c.sheet.id(particle.sprite) {
+                items.push(((0, i16::MAX, -z), DrawItem::FireParticle(particles.len())));
+                particles.push((id, particle));
+            }
+        }
+        items.sort_by_key(|(key, _)| sort_key(*key));
+    }
     c.lights = items
         .iter()
         .filter_map(|(_, item)| fire_item(s, item))
-        .filter_map(|(at, fire, seed)| fire_light(s, at, &fire, seed))
+        .filter_map(|(at, _, fire)| fire_light(s, at, fire))
         .collect();
     for (key, item) in items {
         c.r.depth(stereo_depth(-key.2 - game_z));
@@ -1593,9 +1581,16 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Dog => draw_dog(c),
             DrawItem::LoosePart(i) => draw_loose_part(c, i),
             DrawItem::Deckhand(i) => draw_deckhand(c, i),
+            DrawItem::FireParticle(i) => {
+                let (id, p) = &particles[i];
+                let [x, y, _] = p.position;
+                let at = layer_to_screen(s, x, y, p.ratio);
+                let scale = p.size * PPU / f32::from(c.sheet.get(*id).w);
+                c.r.sprite(*id, at, Draw::tint(p.tint).scale(scale));
+            }
             DrawItem::Fire { .. } | DrawItem::Torch => {
-                if let Some((at, fire, seed)) = fire_item(s, &item) {
-                    draw_fire(c, at, &fire, seed);
+                if let Some((at, fire, sample)) = fire_item(s, &item) {
+                    draw_fire(c, at, &fire, sample.elapsed);
                 }
             }
             DrawItem::Boulder(i) => {

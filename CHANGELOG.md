@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Let live flame and smoke particles finish after a fire goes out.
+
+- Stagger night-only fires and delay the lamp fade independently of flame and glint.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added

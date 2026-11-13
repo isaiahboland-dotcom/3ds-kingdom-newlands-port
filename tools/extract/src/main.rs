@@ -14,6 +14,7 @@
 
 mod audio;
 mod clips;
+mod fire_particles;
 mod fonts;
 mod pack;
 mod scenes;
@@ -107,11 +108,6 @@ fn main() -> ExitCode {
         Err(e) => eprintln!("warning: font: {e}"),
     }
 
-    if let Err(e) = pack::write_pages(&sheet, &out.join("sprites"), &out.join("sprites.json")) {
-        eprintln!("packing: {e}");
-        return ExitCode::FAILURE;
-    }
-
     match clips::extract_all(&assets.join("AnimationClip"), &sheet.names_by_guid) {
         Ok(all) => {
             let json = serde_json::to_string(&all).expect("clips serialize");
@@ -127,12 +123,7 @@ fn main() -> ExitCode {
         }
     }
 
-    let sizes: world::SpriteSizes = sheet
-        .sprites
-        .iter()
-        .map(|s| (s.name.clone(), (s.img.w, s.img.h, s.ppu)))
-        .collect();
-    if let Err(e) = export_scenes(&assets, &guids, &out, &sheet.names_by_path, &sizes) {
+    if let Err(e) = export_scenes(&assets, &guids, &out, &mut sheet) {
         eprintln!("scenes: {e}");
         return ExitCode::FAILURE;
     }
@@ -158,8 +149,7 @@ fn export_scenes(
     assets: &Path,
     guids: &HashMap<String, PathBuf>,
     out: &Path,
-    sprite_names: &HashMap<String, String>,
-    sprite_sizes: &world::SpriteSizes,
+    sheet: &mut sprites::Sheet,
 ) -> Result<(), String> {
     let r = scenes::Resolver::new(guids, assets);
     let main = scenes::export_file(&assets.join("main.unity"), &r)?;
@@ -203,14 +193,19 @@ fn export_scenes(
         &serde_json::Value::Object(data.clone()),
     )?;
 
+    let sizes: world::SpriteSizes = sheet
+        .sprites
+        .iter()
+        .map(|s| (s.name.clone(), (s.img.w, s.img.h, s.ppu)))
+        .collect();
     let (mut world, clip_paths) = world::build(&world::Inputs {
         main: &main,
         blocks: &blocks,
         loader: &loader,
         prefabs: &prefabs,
         data: &data,
-        sprite_names,
-        sprite_sizes,
+        sprite_names: &sheet.names_by_path,
+        sprite_sizes: &sizes,
         assets_dir: assets,
     })?;
     audio::convert(assets, out, &mut world.audio, &clip_paths)?;
@@ -222,6 +217,11 @@ fn export_scenes(
         world.audio.refs.len()
     );
     let bytes = postcard::to_allocvec(&world).map_err(|e| e.to_string())?;
+    let fire = fire_particles::extract(assets, guids, &prefabs, sheet)?;
+    let encoded = fire.encode(game::save::fingerprint(&bytes))?;
+    pack::write_pages(sheet, &out.join("sprites"), &out.join("sprites.json"))?;
+    std::fs::write(out.join(scene::fire_particles::FILE_NAME), encoded)
+        .map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), &bytes).map_err(|e| e.to_string())?;
     println!(
         "world: {} blocks, {} protos, {} scatterables, {} islands, {} lights, {} days ({} KiB)",
