@@ -4,6 +4,8 @@
 
 ### Added
 
+- Synchronize the bear's gallop swipe with its authored animation marker.
+
 - Extract and draw authored sprite transforms and animation curves from an
   optional animation pack extension. Existing world data, sheets, and
   saves keep their formats.

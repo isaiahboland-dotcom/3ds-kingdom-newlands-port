@@ -1578,7 +1578,14 @@ fn draw_monarch<R: Renderer>(c: &mut Ctx<R>) {
         return;
     };
     let authored = sheet.authored().and_then(|a| a.clips.clip(&name));
-    let t = s.anim.1;
+    let t = if s.world.bear_gallop.is_some()
+        && s.world.steeds[steed as usize].attacks_while_running
+        && s.anim.0 == Action::Run
+    {
+        s.game.bear_gallop_time()
+    } else {
+        s.anim.1
+    };
     let position = |path: &str, fallback: (f32, f32)| {
         authored.map_or(fallback, |authored| {
             let rest = game::animation::Pose {

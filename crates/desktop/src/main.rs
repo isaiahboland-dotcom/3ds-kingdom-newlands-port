@@ -118,7 +118,7 @@ async fn main() {
     let previous_rt = target(TOP_W, TOP_H);
     let dir = std::env::var("KINGDOM_ASSETS").unwrap_or_else(|_| "assets".to_owned());
     let mut world_id = 0;
-    let world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))
+    let mut world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))
         .map_err(|e| e.to_string())
         .and_then(|b| {
             world_id = save::fingerprint(&b);
@@ -139,6 +139,10 @@ async fn main() {
         }
     };
     let sheet = assets.sheet.clone();
+    world.bear_gallop = assets
+        .sheet
+        .authored()
+        .and_then(|asset| game::animation::GallopAbility::from_library(&asset.clips));
     let seed = std::env::args()
         .skip_while(|a| a != "--seed")
         .nth(1)

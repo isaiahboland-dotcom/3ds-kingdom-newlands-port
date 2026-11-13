@@ -429,6 +429,34 @@ impl Library {
     }
 }
 
+/// Timing consumed by the bear ability and its visible gallop.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GallopAbility {
+    pub speed: f32,
+    pub duration: f32,
+    pub looping: bool,
+    pub marker: f32,
+}
+
+impl GallopAbility {
+    pub fn from_library(library: &Library) -> Option<Self> {
+        let clip = library.clip("player_bear_gallop")?;
+        let speed = library.state_speed("player_king", "Run").unwrap_or(1.0);
+        let marker = clip.first_event_time(EventKind::TriggerAbility)?;
+        (speed.is_finite()
+            && speed > 0.0
+            && clip.length.is_finite()
+            && clip.length > 0.0
+            && (0.0..=clip.length).contains(&marker))
+        .then_some(Self {
+            speed,
+            duration: clip.length,
+            looping: clip.looping,
+            marker,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
