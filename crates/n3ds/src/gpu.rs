@@ -69,6 +69,7 @@ struct State {
     additive: bool,
     /// Linear filtering (scaled glows).
     smooth: bool,
+    cloud_light: Option<u32>,
 }
 
 /// A step of a screen's drawing, kept to replay for the right eye.
@@ -118,7 +119,7 @@ pub struct Gpu {
     /// Plain painter's order, no depth (X).
     pub painter: bool,
     bound_page: Option<(u16, bool)>,
-    bound_textured: Option<Env>,
+    bound_textured: Option<(Env, Option<u32>)>,
     bound_additive: Option<bool>,
     /// Draw calls this frame.
     pub draws: u32,
@@ -481,7 +482,8 @@ impl Gpu {
             Some(p) if Some(p) == self.reflection => Env::Reflection,
             Some(_) => Env::Textured,
         };
-        if self.bound_textured != Some(mode) {
+        let material = (mode, state.cloud_light);
+        if self.bound_textured != Some(material) {
             let env = c3d::C3D_GetTexEnv(0);
             c3d::C3D_TexEnvInit(env);
             match mode {
@@ -512,7 +514,27 @@ impl Gpu {
                     c3d::C3D_TexEnvFunc(env, c3d::C3D_Both, ctru::GPU_REPLACE);
                 }
             }
-            self.bound_textured = Some(mode);
+            let env = c3d::C3D_GetTexEnv(1);
+            c3d::C3D_TexEnvInit(env);
+            if let Some(light) = state.cloud_light {
+                // Highlight × (1 − baked coverage) + the lit base.
+                c3d::C3D_TexEnvSrc(
+                    env,
+                    c3d::C3D_RGB,
+                    ctru::GPU_CONSTANT,
+                    ctru::GPU_TEXTURE0,
+                    ctru::GPU_PREVIOUS,
+                );
+                c3d::C3D_TexEnvOpRgb(
+                    env,
+                    ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                    ctru::GPU_TEVOP_RGB_ONE_MINUS_SRC_ALPHA,
+                    ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                );
+                c3d::C3D_TexEnvFunc(env, c3d::C3D_RGB, ctru::GPU_MULTIPLY_ADD);
+                c3d::C3D_TexEnvColor(env, light);
+            }
+            self.bound_textured = Some(material);
         }
         if let Some(p) = state.page {
             if self.bound_page != Some((p, state.smooth)) {
@@ -589,6 +611,7 @@ impl Gpu {
                 page: None,
                 additive: false,
                 smooth: false,
+                cloud_light: None,
             },
             &solid,
         );
@@ -601,6 +624,7 @@ impl Gpu {
                     page: Some(p as u16),
                     additive: false,
                     smooth: false,
+                    cloud_light: None,
                 },
                 &quads,
             );
@@ -639,6 +663,7 @@ impl Gpu {
         });
         let opaque = !self.painter
             && !state.additive
+            && state.cloud_light.is_none()
             && colors.iter().all(|c| c.a >= 0.999)
             && state.page.is_none_or(|p| self.page_hard[p as usize]);
         if opaque {
@@ -666,33 +691,40 @@ impl Gpu {
     fn sprite_part(&mut self, id: u32, at: (f32, f32), d: &Draw, tint: Color) {
         let s = *self.sheet.get(id);
         let (pw, ph) = self.page_size[s.page as usize];
-        let k = d.scale;
-        let px = if d.flip { s.w as f32 - s.px } else { s.px };
-        // Corners relative to the pivot, before rotation.
-        let (x0, y0) = (-px * k, -s.py * k);
-        let (x1, y1) = (x0 + s.w as f32 * k, y0 + s.h as f32 * k);
-        let rel = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
-        let corners = if d.angle == 0.0 {
-            let mut c = rel.map(|(x, y)| (at.0 + x, at.1 + y));
-            if k == 1.0 {
-                for p in &mut c {
-                    *p = (p.0.round(), p.1.round());
-                }
-            }
-            c
+        let authored = d.basis.is_some() || d.flip_y;
+        let corners = if authored {
+            scene::render::sprite_corners(&s, at, d)
         } else {
-            let (sin, cos) = d.angle.sin_cos();
-            rel.map(|(x, y)| (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos))
+            let k = d.scale;
+            let px = if d.flip { s.w as f32 - s.px } else { s.px };
+            // Corners relative to the pivot, before rotation.
+            let (x0, y0) = (-px * k, -s.py * k);
+            let (x1, y1) = (x0 + s.w as f32 * k, y0 + s.h as f32 * k);
+            let rel = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+            if d.angle == 0.0 {
+                let mut c = rel.map(|(x, y)| (at.0 + x, at.1 + y));
+                if k == 1.0 {
+                    for p in &mut c {
+                        *p = (p.0.round(), p.1.round());
+                    }
+                }
+                c
+            } else {
+                let (sin, cos) = d.angle.sin_cos();
+                rel.map(|(x, y)| (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos))
+            }
         };
         // Texture v runs bottom-up.
         let (u0, u1) = (s.x as f32 / pw, (s.x + s.w) as f32 / pw);
         let (v0, v1) = (1.0 - s.y as f32 / ph, 1.0 - (s.y + s.h) as f32 / ph);
         let (ul, ur) = if d.flip { (u1, u0) } else { (u0, u1) };
-        let uv = [(ul, v0), (ur, v0), (ur, v1), (ul, v1)];
+        let (vt, vb) = if d.flip_y { (v1, v0) } else { (v0, v1) };
+        let uv = [(ul, vt), (ur, vt), (ur, vb), (ul, vb)];
         let state = State {
             page: Some(s.page),
             additive: d.additive,
-            smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0),
+            smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0 || authored),
+            cloud_light: d.cloud_light.map(|light| u32::from_le_bytes(color(light))),
         };
         self.quad(state, corners, uv, [tint; 4]);
     }
@@ -708,6 +740,7 @@ impl Gpu {
             page: None,
             additive,
             smooth: false,
+            cloud_light: None,
         };
         self.quad(state, corners, [(0.0, 0.0); 4], [top, top, bottom, bottom]);
     }
@@ -722,6 +755,9 @@ impl Renderer for Gpu {
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
         let masks = self.sheet.get(id).masks;
         self.sprite_part(id, at, &d, d.tint);
+        if d.cloud_light.is_some() {
+            return;
+        }
         // orig: Custom/PowerSprite2's recolour: keyed pixels × recolorA / recolorB.
         let (a, b) = d.recolor.unwrap_or((Color::WHITE, Color::WHITE));
         for (m, c) in masks.into_iter().zip([a, b]) {
@@ -751,6 +787,7 @@ impl Renderer for Gpu {
             page: Some(s.page),
             additive: false,
             smooth: false,
+            cloud_light: None,
         };
         for &(cx, cw, dx, dw) in &cols {
             for &(ry, rh, dy, dh) in &rows {
@@ -803,6 +840,7 @@ impl Renderer for Gpu {
             page: None,
             additive: false,
             smooth: false,
+            cloud_light: None,
         };
         for i in 0..N {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
@@ -822,6 +860,7 @@ impl Renderer for Gpu {
             page: None,
             additive: false,
             smooth: false,
+            cloud_light: None,
         };
         for i in 0..N {
             let a0 = i as f32 / N as f32 * std::f32::consts::TAU;
@@ -865,6 +904,7 @@ impl Renderer for Gpu {
             page: Some(page),
             additive: true,
             smooth: false,
+            cloud_light: None,
         };
         self.quad(
             state,

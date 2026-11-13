@@ -8,16 +8,20 @@
 //!   run on the GPU: the keyed pixels of each sprite become two extra mask
 //!   sprites that the renderer tints separately.
 //! - Pages go through `tex3ds` into `.t3x`; the sheet (sprites, clips, font)
-//!   becomes `sheet.bin`; `world.bin` is copied as is.
+//!   becomes `sheet.bin`; `world.bin` and optional `animation.bin` are copied
+//!   as is. The base sprite IDs stay stable when recolour masks are appended.
 //! - The sound clips (`audio/*.adp`, ~100 MB) go on the SD card instead, so
 //!   the `.3dsx` stays small: into `sdcard/3ds/kingdom-3ds/audio` beside the
 //!   romfs folder, to copy onto the card's root once.
 //!
 //! `cargo run --release -p extract --bin pack3ds -- assets crates/n3ds/romfs`
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use game::data::WorldData;
+use scene::authored::{read_file, FILENAME};
 use scene::sheet::{Page, PageFormat, Sheet, Sprite};
 
 /// orig: the recolour keys (see the desktop's `RECOLOR_FS`): alpha 208 is
@@ -136,8 +140,36 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         .map(|p| load_png(&src.join(&p.file)))
         .collect::<Result<_, _>>()?;
 
-    // Cut every sprite out; split off its recolour masks.
+    let world_bytes =
+        std::fs::read(src.join("world.bin")).map_err(|e| format!("world.bin: {e}"))?;
     let mut out_sheet = sheet.clone();
+    let authored = match read_file(src.join(FILENAME)) {
+        Ok(bytes) => {
+            let world: WorldData =
+                postcard::from_bytes(&world_bytes).map_err(|e| format!("world.bin: {e}"))?;
+            out_sheet.link(&world.sprites);
+            out_sheet
+                .install_authored(&bytes, game::save::fingerprint(&world_bytes), &world)
+                .map_err(|e| format!("{FILENAME}: {e}"))?;
+            Some(bytes)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{FILENAME}: {e}")),
+    };
+
+    let cloud_path = src.join(scene::cloud_data::FILE_NAME);
+    let (clouds, cloud_sprites) = match read_file(&cloud_path) {
+        Ok(bytes) => {
+            let def =
+                scene::cloud_data::decode(&bytes, game::save::fingerprint(&world_bytes), &sheet)?;
+            let names: HashSet<String> = def.sprites.into_iter().collect();
+            (Some(bytes), names)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, HashSet::new()),
+        Err(e) => return Err(format!("{}: {e}", cloud_path.display())),
+    };
+
+    // Cut every sprite out; split off its recolour masks.
     let mut pieces: Vec<Piece> = Vec::new();
     let mut masks = 0;
     for i in 0..sheet.sprites.len() {
@@ -183,8 +215,12 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             }
             any.then_some(m)
         };
-        let a = split(KEY_A);
-        let b = split(KEY_B);
+        let cloud = cloud_sprites.contains(&sheet.names[i]);
+        let [a, b] = if cloud {
+            [None, None]
+        } else {
+            [split(KEY_A), split(KEY_B)]
+        };
         for (k, m) in [a, b].into_iter().enumerate() {
             let Some(m) = m else { continue };
             let id = out_sheet.sprites.len();
@@ -204,12 +240,13 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             });
             masks += 1;
         }
-        let soft = base
-            .px
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|p| p[3] != 0 && p[3] != 255);
+        let soft = cloud
+            || base
+                .px
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[3] != 0 && p[3] != 255);
         pieces.push(Piece {
             sprite: i,
             img: base,
@@ -381,8 +418,23 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     }
     let bin = postcard::to_allocvec(&out_sheet).map_err(|e| e.to_string())?;
     std::fs::write(out.join("sheet.bin"), bin).map_err(|e| e.to_string())?;
-    std::fs::copy(src.join("world.bin"), out.join("world.bin"))
-        .map_err(|e| format!("world.bin: {e}"))?;
+    std::fs::write(out.join("world.bin"), world_bytes).map_err(|e| format!("world.bin: {e}"))?;
+    let authored_out = out.join(FILENAME);
+    if let Some(bytes) = authored {
+        std::fs::write(authored_out, bytes).map_err(|e| format!("{FILENAME}: {e}"))?;
+    } else if let Err(e) = std::fs::remove_file(authored_out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("{FILENAME}: {e}"));
+        }
+    }
+    let clouds_out = out.join(scene::cloud_data::FILE_NAME);
+    if let Some(bytes) = clouds {
+        std::fs::write(clouds_out, bytes).map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(clouds_out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
+        }
+    }
     let sd = out
         .parent()
         .unwrap_or(Path::new("."))

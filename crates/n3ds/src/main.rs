@@ -22,6 +22,7 @@ use game::data::WorldData;
 use game::save;
 use game::state::TICK;
 use platform::Storage;
+use scene::authored::{read_file, FILENAME};
 use scene::session::Session;
 use scene::sheet::Sheet;
 use scene::{top, touch};
@@ -56,6 +57,14 @@ fn load() -> Result<(WorldData, u32, Sheet), String> {
         postcard::from_bytes(&sheet_bytes).map_err(|e| format!("sheet.bin: {e}"))?;
     sheet.validate()?;
     sheet.link(&world.sprites);
+    let authored_error = match read_file(format!("{ROMFS}/{FILENAME}")) {
+        Ok(bytes) => sheet.install_authored(&bytes, world_id, &world).err(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(e) = authored_error {
+        eprintln!("ignoring {FILENAME}: {e}");
+    }
     Ok((world, world_id, sheet))
 }
 
@@ -105,6 +114,11 @@ fn main() {
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
+    let cloud_path = format!("{ROMFS}/{}", scene::cloud_data::FILE_NAME);
+    match scene::cloud_data::load(std::path::Path::new(&cloud_path), world_id, &sheet) {
+        Ok(def) => s.cloud_defs = def,
+        Err(error) => eprintln!("ignoring {cloud_path}: {error}"),
+    }
     if let Some(g) = saved {
         s.resume(g);
     }

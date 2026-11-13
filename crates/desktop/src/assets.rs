@@ -4,8 +4,10 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use ::scene::render::{Color, Draw, Rect, Renderer};
+use ::scene::authored::{read_file, FILENAME};
+use ::scene::render::{sprite_corners, Color, Draw, Rect, Renderer};
 use ::scene::sheet::Sheet;
+use game::data::WorldData;
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation};
 use macroquad::prelude as mq;
 use macroquad::prelude::{
@@ -26,6 +28,8 @@ pub struct Assets {
     additive: Material,
     /// Water reflections (see `REFLECT_FS`).
     reflect: Material,
+    cloud: Option<Material>,
+    pub cloud_defs: Option<::scene::cloud_data::CloudsDef>,
     /// The previous frame's top screen, for `reflect`.
     pub previous: Option<Texture2D>,
 }
@@ -63,6 +67,19 @@ void main() {
 }
 "#;
 
+const CLOUD_FS: &str = r#"#version 100
+precision lowp float;
+varying vec2 uv;
+varying vec4 color;
+uniform sampler2D Texture;
+uniform vec4 CloudLight;
+void main() {
+    vec4 t = texture2D(Texture, uv);
+    if (t.a == 0.0) discard;
+    gl_FragColor = vec4(t.rgb * color.rgb + (1.0 - t.a) * CloudLight.rgb, t.a * color.a);
+}
+"#;
+
 /// The water's reflection: the texture's colour only (the previous frame's
 /// alpha is whatever its blending left), added over the water.
 const REFLECT_FS: &str = r#"#version 100
@@ -91,8 +108,7 @@ void main() {
 "#;
 
 impl Assets {
-    /// `world_sprites`: `WorldData::sprites`, so the sheet can map its ids.
-    pub async fn load(dir: &Path, world_sprites: &[String]) -> Result<Assets, String> {
+    pub async fn load(dir: &Path, world: &WorldData, world_id: u32) -> Result<Assets, String> {
         let read = |name: &str| {
             std::fs::read_to_string(dir.join(name))
                 .map_err(|e| format!("{}: {e}", dir.join(name).display()))
@@ -102,7 +118,16 @@ impl Assets {
             &read("clips.json")?,
             &read("font.json")?,
         )?;
-        sheet.link(world_sprites);
+        sheet.link(&world.sprites);
+        let authored_path = dir.join(FILENAME);
+        let authored_error = match read_file(&authored_path) {
+            Ok(bytes) => sheet.install_authored(&bytes, world_id, world).err(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(e) = authored_error {
+            eprintln!("ignoring {}: {e}", authored_path.display());
+        }
         let mut pages = Vec::new();
         let mut smooth = Vec::new();
         for p in &sheet.pages {
@@ -161,7 +186,35 @@ impl Assets {
             },
         )
         .map_err(|e| e.to_string())?;
+        let cloud_path = dir.join(::scene::cloud_data::FILE_NAME);
+        let cloud_defs = match ::scene::cloud_data::load(&cloud_path, world_id, &sheet) {
+            Ok(def) => def,
+            Err(error) => {
+                eprintln!("ignoring {}: {error}", cloud_path.display());
+                None
+            }
+        };
+        let cloud = if cloud_defs.is_some() {
+            Some(
+                load_material(
+                    ShaderSource::Glsl {
+                        vertex: RECOLOR_VS,
+                        fragment: CLOUD_FS,
+                    },
+                    MaterialParams {
+                        uniforms: vec![UniformDesc::new("CloudLight", UniformType::Float4)],
+                        pipeline_params: blend(BlendFactor::OneMinusValue(BlendValue::SourceAlpha)),
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| e.to_string())?,
+            )
+        } else {
+            None
+        };
         Ok(Assets {
+            cloud,
+            cloud_defs,
             pages,
             reflect,
             smooth,
@@ -195,36 +248,59 @@ impl Renderer for Assets {
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
         let s = *self.sheet.get(id);
-        if let Some((a, b)) = d.recolor {
+        let cloud = self.cloud.as_ref().zip(d.cloud_light);
+        if let Some((material, light)) = cloud {
+            gl_use_material(material);
+            material.set_uniform("CloudLight", mc(light).to_vec());
+        } else if let Some((a, b)) = d.recolor {
             gl_use_material(&self.recolor);
             self.recolor.set_uniform("RecolorA", mc(a).to_vec());
             self.recolor.set_uniform("RecolorB", mc(b).to_vec());
         } else if d.additive {
             gl_use_material(&self.additive);
         }
-        let px = if d.flip { s.w as f32 - s.px } else { s.px };
-        let (mut x, mut y) = (at.0 - px * d.scale, at.1 - s.py * d.scale);
-        if d.scale == 1.0 && d.angle == 0.0 {
-            (x, y) = (x.round(), y.round());
+        let pages = if d.smooth { &self.smooth } else { &self.pages };
+        let texture = &pages[s.page as usize];
+        if d.basis.is_some() || d.flip_y {
+            let (pw, ph) = (texture.width(), texture.height());
+            let (u0, u1) = (s.x as f32 / pw, (s.x + s.w) as f32 / pw);
+            let (v0, v1) = (s.y as f32 / ph, (s.y + s.h) as f32 / ph);
+            let (ul, ur) = if d.flip { (u1, u0) } else { (u0, u1) };
+            let (vt, vb) = if d.flip_y { (v1, v0) } else { (v0, v1) };
+            let vertices = sprite_corners(&s, at, &d)
+                .into_iter()
+                .zip([(ul, vt), (ur, vt), (ur, vb), (ul, vb)])
+                .map(|((x, y), (u, v))| Vertex::new(x, y, 0.0, u, v, mc(d.tint)))
+                .collect();
+            draw_mesh(&Mesh {
+                vertices,
+                indices: vec![0, 1, 2, 0, 2, 3],
+                texture: Some(texture.clone()),
+            });
+        } else {
+            let px = if d.flip { s.w as f32 - s.px } else { s.px };
+            let (mut x, mut y) = (at.0 - px * d.scale, at.1 - s.py * d.scale);
+            if d.scale == 1.0 && d.angle == 0.0 {
+                (x, y) = (x.round(), y.round());
+            }
+            draw_texture_ex(
+                texture,
+                x,
+                y,
+                mc(d.tint),
+                DrawTextureParams {
+                    source: Some(mq::Rect::new(
+                        s.x as f32, s.y as f32, s.w as f32, s.h as f32,
+                    )),
+                    dest_size: Some(vec2(s.w as f32 * d.scale, s.h as f32 * d.scale)),
+                    rotation: d.angle,
+                    pivot: (d.angle != 0.0).then_some(vec2(at.0, at.1)),
+                    flip_x: d.flip,
+                    ..Default::default()
+                },
+            );
         }
-        let page = if d.smooth { &self.smooth } else { &self.pages };
-        draw_texture_ex(
-            &page[s.page as usize],
-            x,
-            y,
-            mc(d.tint),
-            DrawTextureParams {
-                source: Some(mq::Rect::new(
-                    s.x as f32, s.y as f32, s.w as f32, s.h as f32,
-                )),
-                dest_size: Some(vec2(s.w as f32 * d.scale, s.h as f32 * d.scale)),
-                rotation: d.angle,
-                pivot: (d.angle != 0.0).then_some(vec2(at.0, at.1)),
-                flip_x: d.flip,
-                ..Default::default()
-            },
-        );
-        if d.recolor.is_some() || d.additive {
+        if cloud.is_some() || d.recolor.is_some() || d.additive {
             gl_use_default_material();
         }
     }

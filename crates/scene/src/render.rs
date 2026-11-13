@@ -57,6 +57,11 @@ impl Rect {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Draw {
     pub flip: bool,
+    pub flip_y: bool,
+    /// Optional row-major affine basis in screen coordinates, about the pivot.
+    pub basis: Option<[f32; 4]>,
+    /// Add the highlight weighted by the inverse cloud texture coverage.
+    pub cloud_light: Option<Color>,
     pub tint: Color,
     pub scale: f32,
     /// Radians, clockwise on screen, around the pivot.
@@ -72,6 +77,9 @@ impl Draw {
     pub fn tint(tint: Color) -> Draw {
         Draw {
             flip: false,
+            flip_y: false,
+            basis: None,
+            cloud_light: None,
             tint,
             scale: 1.0,
             angle: 0.0,
@@ -96,6 +104,11 @@ impl Draw {
         self
     }
 
+    pub fn cloud_light(mut self, light: Color) -> Draw {
+        self.cloud_light = Some(Color::new(light.r, light.g, light.b, 1.0));
+        self
+    }
+
     pub fn scale(mut self, scale: f32) -> Draw {
         self.scale = scale;
         self
@@ -110,6 +123,31 @@ impl Draw {
         self.smooth = true;
         self
     }
+}
+
+/// Shared affine geometry, ordered top-left, top-right, bottom-right,
+/// bottom-left. Renderer flips change the pivot and UVs together.
+pub fn sprite_corners(s: &crate::sheet::Sprite, at: (f32, f32), d: &Draw) -> [(f32, f32); 4] {
+    let px = if d.flip { s.w as f32 - s.px } else { s.px };
+    let py = if d.flip_y { s.h as f32 - s.py } else { s.py };
+    let rel = [
+        (-px, -py),
+        (s.w as f32 - px, -py),
+        (s.w as f32 - px, s.h as f32 - py),
+        (-px, s.h as f32 - py),
+    ];
+    let [a, b, c, e] = d.basis.unwrap_or([1.0, 0.0, 0.0, 1.0]);
+    let (sin, cos) = d.angle.sin_cos();
+    let mut corners = rel.map(|(x, y)| {
+        let (x, y) = ((a * x + b * y) * d.scale, (c * x + e * y) * d.scale);
+        (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos)
+    });
+    if d.scale == 1.0 && d.angle == 0.0 && [a, b, c, e] == [1.0, 0.0, 0.0, 1.0] {
+        for p in &mut corners {
+            *p = (p.0.round(), p.1.round());
+        }
+    }
+    corners
 }
 
 /// Implemented by each backend (macroquad on desktop, citro3d on 3DS).

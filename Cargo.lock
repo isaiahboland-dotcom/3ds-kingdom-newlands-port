@@ -997,6 +997,7 @@ dependencies = [
  "game",
  "lewton",
  "platform",
+ "postcard",
  "serde",
  "serde_json",
 ]
