@@ -37,6 +37,7 @@ pub struct Assets {
     cloud_depth: Option<CloudDepth>,
     shadow_camera: Option<cloud_shadow::Camera>,
     pub cloud_defs: Option<::scene::cloud_data::CloudsDef>,
+    pub atmosphere: Option<::scene::atmosphere_data::AtmosphereDef>,
     /// The previous frame's top screen, for `reflect`.
     pub previous: Option<Texture2D>,
 }
@@ -235,6 +236,59 @@ void main() {
 "#;
 
 impl Assets {
+    fn indexed_sprite(
+        &self,
+        id: u32,
+        mesh: Option<&::scene::cloud_mesh::CloudMesh>,
+        at: (f32, f32),
+        d: &Draw,
+        tints: Option<&[Color]>,
+    ) {
+        let s = self.sheet.get(id);
+        let geometry = Geometry::new(s, mesh.or_else(|| self.sheet.cloud_mesh(id)));
+        let texture = &self.pages[usize::from(s.page)];
+        let shadow = self.shadow_camera.zip(d.cloud_shadow);
+        let vertices = geometry
+            .vertices()
+            .iter()
+            .enumerate()
+            .map(|(index, &local)| {
+                let [x, y] = cloud_shadow::screen_point(local, at, d);
+                let u = (f32::from(s.x) + s.px + local[0]) / texture.width();
+                let v = (f32::from(s.y) + s.py + local[1]) / texture.height();
+                let mut vertex = Vertex::new(
+                    x,
+                    y,
+                    0.0,
+                    u,
+                    v,
+                    mc(tints.map_or(d.tint, |colors| colors[index])),
+                );
+                if let Some((camera, receiver)) = shadow {
+                    let affine = d.basis.unwrap_or([1.0, 0.0, 0.0, 1.0]);
+                    let scale = [affine[0] * d.scale, affine[3] * d.scale];
+                    let [x, y, z] =
+                        cloud_shadow::world_point(local, receiver.position, scale, d.flip);
+                    let [u, v, clip_z] = camera.project(x, y, z);
+                    vertex.normal = mq::vec4(u, v, clip_z, 1.0);
+                } else {
+                    vertex.normal = mq::Vec4::ZERO;
+                }
+                vertex
+            })
+            .collect();
+        if let Some((material, light)) = self.cloud.as_ref().zip(d.cloud_light) {
+            gl_use_material(material);
+            material.set_uniform("CloudLight", mc(light).to_vec());
+        }
+        draw_mesh(&Mesh {
+            vertices,
+            indices: geometry.indices().to_vec(),
+            texture: Some(texture.clone()),
+        });
+        gl_use_default_material();
+    }
+
     pub async fn load(dir: &Path, world: &WorldData, world_id: u32) -> Result<Assets, String> {
         let read = |name: &str| {
             std::fs::read_to_string(dir.join(name))
@@ -275,6 +329,17 @@ impl Assets {
                 Err(error) => eprintln!("ignoring {}: {error}", path.display()),
             }
         }
+        let atmosphere = match ::scene::atmosphere_data::AtmosphereDef::load(
+            &dir.join(::scene::atmosphere_data::FILE_NAME),
+            world_id,
+            &sheet,
+        ) {
+            Ok(def) => def,
+            Err(e) => {
+                eprintln!("ignoring fog and mist data ({e})");
+                None
+            }
+        };
         let cloud_ids: Vec<_> = cloud_defs
             .iter()
             .flat_map(|def| &def.sprites)
@@ -386,6 +451,7 @@ impl Assets {
             cloud_depth,
             shadow_camera: None,
             cloud_defs,
+            atmosphere,
             pages,
             reflect,
             smooth,
@@ -436,39 +502,8 @@ impl Renderer for Assets {
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
         let s = *self.sheet.get(id);
-        if let Some((material, light)) = self.cloud.as_ref().zip(d.cloud_light) {
-            let geometry = Geometry::new(&s, self.sheet.cloud_mesh(id));
-            let texture = &self.pages[usize::from(s.page)];
-            let shadow = self.shadow_camera.zip(d.cloud_shadow);
-            let vertices = geometry
-                .vertices()
-                .iter()
-                .map(|&local| {
-                    let [x, y] = cloud_shadow::screen_point(local, at, &d);
-                    let u = (f32::from(s.x) + s.px + local[0]) / texture.width();
-                    let v = (f32::from(s.y) + s.py + local[1]) / texture.height();
-                    let mut vertex = Vertex::new(x, y, 0.0, u, v, mc(d.tint));
-                    if let Some((camera, receiver)) = shadow {
-                        let affine = d.basis.unwrap_or([1.0, 0.0, 0.0, 1.0]);
-                        let scale = [affine[0] * d.scale, affine[3] * d.scale];
-                        let [x, y, z] =
-                            cloud_shadow::world_point(local, receiver.position, scale, d.flip);
-                        let [u, v, clip_z] = camera.project(x, y, z);
-                        vertex.normal = mq::vec4(u, v, clip_z, 1.0);
-                    } else {
-                        vertex.normal = mq::Vec4::ZERO;
-                    }
-                    vertex
-                })
-                .collect();
-            gl_use_material(material);
-            material.set_uniform("CloudLight", mc(light).to_vec());
-            draw_mesh(&Mesh {
-                vertices,
-                indices: geometry.indices().to_vec(),
-                texture: Some(texture.clone()),
-            });
-            gl_use_default_material();
+        if d.cloud_light.is_some() {
+            self.indexed_sprite(id, None, at, &d, None);
             return;
         }
         if let Some((a, b)) = d.recolor {
@@ -522,6 +557,17 @@ impl Renderer for Assets {
         if d.recolor.is_some() || d.additive {
             gl_use_default_material();
         }
+    }
+
+    fn atmosphere_sprite(
+        &mut self,
+        id: u32,
+        mesh: &::scene::cloud_mesh::CloudMesh,
+        at: (f32, f32),
+        draw: Draw,
+        tints: Option<&[Color]>,
+    ) {
+        self.indexed_sprite(id, Some(mesh), at, &draw, tints);
     }
 
     /// orig: `Image.Type.Sliced`.

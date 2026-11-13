@@ -873,10 +873,17 @@ impl Gpu {
         }
     }
 
-    fn indexed_cloud(&mut self, id: u32, at: (f32, f32), d: &Draw) {
+    fn indexed_sprite(
+        &mut self,
+        id: u32,
+        mesh: Option<&scene::cloud_mesh::CloudMesh>,
+        at: (f32, f32),
+        d: &Draw,
+        tints: Option<&[Color]>,
+    ) {
         let sheet = Rc::clone(&self.sheet);
         let sprite = sheet.get(id);
-        let geometry = cloud_shadow::Geometry::new(sprite, sheet.cloud_mesh(id));
+        let geometry = cloud_shadow::Geometry::new(sprite, mesh.or_else(|| sheet.cloud_mesh(id)));
         let triangles = geometry.indices().as_chunks::<3>().0;
         if triangles.len() > MAX_QUADS - self.quads {
             return;
@@ -901,7 +908,6 @@ impl Gpu {
         self.order += 1;
         let (pw, ph) = self.page_size[sprite.page as usize];
         let depth = self.depth;
-        let tint = color(d.tint);
         let vertex = |index: u16| {
             let local = geometry.vertices()[usize::from(index)];
             let [x, y] = cloud_shadow::screen_point(local, at, d);
@@ -911,7 +917,7 @@ impl Gpu {
                     (f32::from(sprite.x) + sprite.px + local[0]) / pw,
                     1.0 - (f32::from(sprite.y) + sprite.py + local[1]) / ph,
                 ],
-                color: tint,
+                color: color(tints.map_or(d.tint, |colors| colors[usize::from(index)])),
                 cloud_uv,
             }
         };
@@ -1025,7 +1031,7 @@ impl Renderer for Gpu {
 
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw) {
         if d.cloud_light.is_some() {
-            self.indexed_cloud(id, at, &d);
+            self.indexed_sprite(id, None, at, &d, None);
             return;
         }
         let masks = self.sheet.get(id).masks;
@@ -1038,6 +1044,17 @@ impl Renderer for Gpu {
                 self.sprite_part(m, at, &d, tint);
             }
         }
+    }
+
+    fn atmosphere_sprite(
+        &mut self,
+        id: u32,
+        mesh: &scene::cloud_mesh::CloudMesh,
+        at: (f32, f32),
+        draw: Draw,
+        tints: Option<&[Color]>,
+    ) {
+        self.indexed_sprite(id, Some(mesh), at, &draw, tints);
     }
 
     fn sliced(&mut self, id: u32, dest: Rect, border: (f32, f32, f32, f32), tint: Color) {

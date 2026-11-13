@@ -112,6 +112,17 @@ fn main() {
             Err(error) => eprintln!("ignoring {mesh_path}: {error}"),
         }
     }
+    let atmosphere = match scene::atmosphere_data::AtmosphereDef::load(
+        std::path::Path::new(&format!("{ROMFS}/{}", scene::atmosphere_data::FILE_NAME)),
+        world_id,
+        &sheet,
+    ) {
+        Ok(def) => def,
+        Err(e) => {
+            eprintln!("ignoring fog and mist data ({e})");
+            None
+        }
+    };
     let cloud_ids: Vec<_> = cloud_defs
         .iter()
         .flat_map(|def| &def.sprites)
@@ -142,6 +153,7 @@ fn main() {
     s.debug_lines = false;
     s.world_id = world_id;
     s.cloud_defs = cloud_defs;
+    s.atmosphere = atmosphere;
     if let Some(g) = saved {
         s.resume(g);
     }

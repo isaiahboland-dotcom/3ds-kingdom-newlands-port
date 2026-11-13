@@ -233,7 +233,7 @@ fn export_scenes(
     };
     let animation = authored.encode(game::save::fingerprint(&bytes))?;
     std::fs::write(out.join(scene::authored::FILENAME), animation).map_err(|e| e.to_string())?;
-    let clouds = world::clouds(&world::Inputs {
+    let cloud_inputs = world::Inputs {
         main: &main,
         blocks: &blocks,
         loader: &loader,
@@ -242,7 +242,17 @@ fn export_scenes(
         sprite_names: &sheet.names_by_path,
         sprite_sizes,
         assets_dir: assets,
-    })?;
+    };
+    let clouds = world::clouds(&cloud_inputs)?;
+    let atmosphere = world::atmosphere(&cloud_inputs)?;
+    let world_id = game::save::fingerprint(&bytes);
+    let atmosphere_bytes = atmosphere.encode(world_id)?;
+    scene::atmosphere_data::AtmosphereDef::decode(&atmosphere_bytes, world_id)?;
+    std::fs::write(
+        out.join(scene::atmosphere_data::FILE_NAME),
+        atmosphere_bytes,
+    )
+    .map_err(|e| e.to_string())?;
     let mut meshes = scene::cloud_mesh::CloudMeshes::default();
     for sprite in &mut sheet.sprites {
         if clouds.sprites.contains(&sprite.name) {

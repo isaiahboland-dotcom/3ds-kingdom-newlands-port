@@ -165,6 +165,17 @@ pub trait Renderer {
     }
     /// Sprite `id` (in the backend's `Sheet`) with its pivot at `at`.
     fn sprite(&mut self, id: u32, at: (f32, f32), d: Draw);
+    /// Fog or mist with authored tight sprite geometry and optional vertex lighting.
+    fn atmosphere_sprite(
+        &mut self,
+        id: u32,
+        _mesh: &crate::cloud_mesh::CloudMesh,
+        at: (f32, f32),
+        draw: Draw,
+        _vertex_tints: Option<&[Color]>,
+    ) {
+        self.sprite(id, at, draw);
+    }
     /// 9-sliced into `dest`; `border` is (left, bottom, right, top) pixels.
     fn sliced(&mut self, id: u32, dest: Rect, border: (f32, f32, f32, f32), tint: Color);
     fn rect(&mut self, r: Rect, c: Color);

@@ -25,6 +25,7 @@ pub struct Session {
     pub camera_x: f32,
     pub clouds: crate::clouds::Clouds,
     pub cloud_defs: Option<crate::cloud_data::CloudsDef>,
+    pub atmosphere: Option<crate::atmosphere_data::AtmosphereDef>,
     pub bag_bounce: f32,
     pub day_banner: Option<(u32, f32)>,
     /// Animator state for the monarch: current action and time in its clip.
@@ -123,6 +124,7 @@ impl Session {
             camera_x,
             clouds: crate::clouds::Clouds::new(seed, camera_x),
             cloud_defs: None,
+            atmosphere: None,
             bag_bounce: 0.0,
             day_banner: None,
             anim: (Action::Stand, 0.0),
@@ -418,7 +420,7 @@ impl Session {
                 (action, 0.0)
             };
             self.t += TICK;
-            if let Some(def) = &self.cloud_defs {
+            if self.cloud_defs.is_some() || self.atmosphere.is_some() {
                 let target = self.game.teleports.exit.map_or(
                     self.game.monarch.x + self.game.monarch.velocity * 0.5,
                     |e| e.x,
@@ -426,8 +428,13 @@ impl Session {
                 let camera = self.camera_x
                     + (target - self.camera_x)
                         * (1.0 - (-4.0 * TICK * (frame_tick + 1) as f32).exp());
-                self.clouds
-                    .step(def, &self.game.blender.state, TICK, camera);
+                self.clouds.step(
+                    self.cloud_defs.as_ref(),
+                    self.atmosphere.as_ref(),
+                    &self.game.blender.state,
+                    TICK,
+                    camera,
+                );
             }
         }
         // orig: MainCamera follows the monarch with a lead; plain follow for now.

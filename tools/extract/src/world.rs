@@ -2024,6 +2024,99 @@ fn cloud_child<'v>(children: &'v [Value], name: &str) -> Result<&'v Value, Strin
         .ok_or_else(|| format!("Level has no {name}"))
 }
 
+pub fn atmosphere(inp: &Inputs<'_>) -> Result<scene::atmosphere_data::AtmosphereDef, String> {
+    let (level, _) = find_component(inp.main, "Level").ok_or("main scene has no Level")?;
+    let (children, level_position) = cloud_parent(inp.main, level)?;
+    let mut sprites = Vec::new();
+    let mut paths = Vec::new();
+    let mut sprite_id = |reference: &Value| {
+        let path = asset_path(Some(reference))?;
+        let name = inp.sprite_names.get(path)?;
+        let (_, _, ppu) = inp.sprite_sizes.get(name)?;
+        if *ppu != 32.0 {
+            return None;
+        }
+        if let Some(index) = sprites.iter().position(|sprite| sprite == name) {
+            return SpriteId::try_from(index).ok();
+        }
+        let id = SpriteId::try_from(sprites.len()).ok()?;
+        sprites.push(name.clone());
+        paths.push(path.to_owned());
+        Some(id)
+    };
+    let mut fog = cloud_layer(
+        inp,
+        cloud_child(children, "Fogs")?,
+        "fogColor",
+        "fogDensity",
+        None,
+        |dir, path| atmosphere_material(dir, path, "Shader/Custom_PowerSprite2.shader.meta", true),
+        &mut sprite_id,
+    )
+    .map_err(|e| format!("Fogs: {e}"))?;
+    let mut mist = cloud_layer(
+        inp,
+        cloud_child(children, "Mists")?,
+        "mistColor",
+        "mistDensity",
+        None,
+        |dir, path| {
+            atmosphere_material(
+                dir,
+                path,
+                "Shader/Custom_Blended Texture.shader.meta",
+                false,
+            )
+        },
+        &mut sprite_id,
+    )
+    .map_err(|e| format!("Mists: {e}"))?;
+    for layer in [&mut fog, &mut mist] {
+        for (axis, offset) in layer.origin.iter_mut().zip(level_position) {
+            *axis += offset;
+        }
+    }
+    let meshes = paths
+        .iter()
+        .map(|path| crate::sprites::cloud_mesh(&inp.assets_dir.join(path)))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(scene::atmosphere_data::AtmosphereDef {
+        fog,
+        mist,
+        sprites,
+        meshes,
+    })
+}
+
+fn atmosphere_material(
+    dir: &Path,
+    path: &str,
+    shader: &str,
+    power_sprite: bool,
+) -> Result<(), String> {
+    use crate::yaml::{field, guid_of};
+
+    let read =
+        |path: &str| std::fs::read_to_string(dir.join(path)).map_err(|e| format!("{path}: {e}"));
+    let shader = read(shader)?;
+    let guid = field(&shader, "guid").ok_or("missing atmosphere shader GUID")?;
+    let material = read(path)?;
+    let ambient = if power_sprite {
+        field(&material, "_AmbientResponse").and_then(|value| value.parse::<f32>().ok())
+            == Some(1.0)
+    } else {
+        field(&material, "m_ShaderKeywords").is_some_and(|keywords| {
+            keywords
+                .split_whitespace()
+                .any(|keyword| keyword == "USEAMBIENT_ON")
+        })
+    };
+    if field(&material, "m_Shader").and_then(guid_of) != Some(guid) || !ambient {
+        return Err(format!("{path}: unsupported atmosphere shader"));
+    }
+    Ok(())
+}
+
 fn cloud_number(value: Option<&Value>, field: &str) -> Result<f32, String> {
     value
         .and_then(Value::as_f64)
@@ -2808,5 +2901,95 @@ mod transform_tests {
         close((a * a + c * c).sqrt(), 6.659998);
         close((b * b + d * d).sqrt(), 1.0);
         assert!(c > 4.0 && b < -0.6, "rope rotation was discarded");
+    }
+}
+
+#[cfg(test)]
+mod atmosphere_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the user's private PC asset export; set KINGDOM_REFERENCE_ASSETS"]
+    fn local_reference_atmosphere_preserves_controller_layers_and_tight_meshes() {
+        let assets =
+            std::path::PathBuf::from(std::env::var_os("KINGDOM_REFERENCE_ASSETS").unwrap());
+        let guids = crate::guid_map(&assets);
+        let resolver = crate::scenes::Resolver::new(&guids, &assets);
+        let main = crate::scenes::export_file(&assets.join("main.unity"), &resolver).unwrap();
+        let prefabs = ["GameObject/Fog.prefab", "GameObject/Mist.prefab"]
+            .into_iter()
+            .map(|path| {
+                let file = crate::scenes::export_file(&assets.join(path), &resolver).unwrap();
+                (path.into(), file["roots"][0].clone())
+            })
+            .collect();
+        let sheet = crate::sprites::extract_all(&assets.join("Sprite"), &guids).unwrap();
+        let sizes = sheet
+            .sprites
+            .iter()
+            .map(|sprite| {
+                (
+                    sprite.name.clone(),
+                    (sprite.img.w, sprite.img.h, sprite.ppu),
+                )
+            })
+            .collect();
+        let unused = Value::Null;
+        let def = atmosphere(&Inputs {
+            main: &main,
+            blocks: &unused,
+            loader: &unused,
+            prefabs: &prefabs,
+            data: &Map::new(),
+            sprite_names: &sheet.names_by_path,
+            sprite_sizes: &sizes,
+            assets_dir: &assets,
+        })
+        .unwrap();
+        let fog = &def.fog;
+        let mist = &def.mist;
+        assert_eq!(fog.origin, [0.0, 1.0, -5.0]);
+        assert_eq!(mist.origin, [0.0, 0.5, 1.5]);
+        assert_eq!(
+            (
+                fog.max_clouds,
+                fog.lifetime,
+                fog.fade_time,
+                fog.wind_multiplier
+            ),
+            (30, 3600.0, 8.0, 1.0)
+        );
+        assert_eq!(
+            (
+                mist.max_clouds,
+                mist.lifetime,
+                mist.fade_time,
+                mist.wind_multiplier
+            ),
+            (25, 12.0, 2.0, 1.5)
+        );
+        assert_eq!(fog.parallax_curve.eval(0.65), 1.25);
+        assert_eq!(fog.parallax_curve.eval(0.65000004), 1.0);
+        assert_eq!(mist.parallax_curve.eval(0.49), 1.0);
+        assert_eq!(mist.parallax_curve.eval(0.5), 0.75);
+        assert_eq!(mist.vertical_motion, 0.1);
+        assert_eq!(fog.sprites, [0, 1, 2, 3]);
+        assert_eq!(mist.sprites, [4, 5, 6]);
+        assert_eq!(
+            def.sprites,
+            ["fog_01", "fog_02", "fog_03", "fog_04", "mist_0", "mist_1", "mist_2"]
+        );
+        assert_eq!(
+            def.meshes
+                .iter()
+                .map(|m| (m.vertices.len(), m.indices.len() / 3))
+                .collect::<Vec<_>>(),
+            [(14, 13), (8, 6), (16, 14), (7, 5), (7, 5), (7, 5), (11, 9)]
+        );
+        let bytes = def.encode(7).unwrap();
+        assert_eq!(
+            scene::atmosphere_data::AtmosphereDef::decode(&bytes, 7).unwrap(),
+            def
+        );
     }
 }

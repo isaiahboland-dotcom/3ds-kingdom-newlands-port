@@ -9,6 +9,7 @@ use game::lighting::{celestial_position, celestial_up, color, float, Light};
 use game::monarch::Action;
 use game::units::{Anim, ShieldStatus};
 
+use crate::clouds::{AtmosphereKind, AtmosphereSample};
 use crate::heraldry;
 use crate::render::{Color, Draw, Rect, Renderer};
 use crate::session::Session;
@@ -259,6 +260,7 @@ pub enum DrawItem {
     /// The night star field (Heaven layer, behind the sun and moon).
     Stars,
     Cloud(usize),
+    Atmosphere(usize),
     /// A grass patch.
     Grass(usize),
     FreeSteed(usize),
@@ -292,13 +294,15 @@ fn layer_z(world: &game::data::WorldData) -> f32 {
 /// Painter's order: Unity sorts by sorting layer, then order, then distance.
 pub fn draw_list(s: &Session, sheet: &Sheet) -> Vec<((i16, i16, f32), DrawItem)> {
     let clouds = cloud_draws(s, sheet, &s.game.blender.state);
-    draw_list_with_clouds(s, sheet, &clouds)
+    let atmosphere = atmosphere_draws(s, sheet, &s.game.blender.state);
+    draw_list_with_weather(s, sheet, &clouds, &atmosphere)
 }
 
-fn draw_list_with_clouds(
+fn draw_list_with_weather(
     s: &Session,
     sheet: &Sheet,
     clouds: &[CloudDraw],
+    atmosphere: &[AtmosphereDraw<'_>],
 ) -> Vec<((i16, i16, f32), DrawItem)> {
     let world = &s.world;
     let g = &s.game;
@@ -426,6 +430,9 @@ fn draw_list_with_clouds(
     }
     for i in 0..g.siege.boulders.len() {
         items.push(((0, 0, -0.7), DrawItem::Boulder(i)));
+    }
+    for (i, cloud) in atmosphere.iter().enumerate() {
+        items.push(((0, 0, -cloud.sample.position[2]), DrawItem::Atmosphere(i)));
     }
     for i in 0..g.greed.bolts.len() {
         items.push(((0, 0, -0.7), DrawItem::Bolt(i)));
@@ -1775,6 +1782,14 @@ pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
     draw_overlays(&mut c);
 }
 
+struct AtmosphereDraw<'a> {
+    id: u32,
+    mesh: &'a crate::cloud_mesh::CloudMesh,
+    at: (f32, f32),
+    sample: AtmosphereSample,
+    draw: Draw,
+}
+
 struct CloudDraw {
     sample: crate::clouds::CloudSample,
     id: u32,
@@ -1857,6 +1872,55 @@ fn prepare_cloud_shadows(c: &mut Ctx<'_, impl Renderer>, draws: &mut [CloudDraw]
     }
 }
 
+fn atmosphere_material(sample: AtmosphereSample, light: &Light) -> Option<Draw> {
+    let mut ambient = Color::rgba(light.colors[color::AMBIENT]);
+    let fog = sample.kind == AtmosphereKind::Fog;
+    if fog {
+        // Pow-Diffuse cuts fragments below .01. The fog sprites have binary
+        // alpha, so the instance alpha alone decides whether anything survives.
+        if sample.tint.a < 0.01 {
+            return None;
+        }
+        ambient.a = 1.0;
+    }
+    Some(Draw::tint(sample.tint.times(ambient)))
+}
+
+fn atmosphere_draws<'a>(s: &'a Session, sheet: &Sheet, light: &Light) -> Vec<AtmosphereDraw<'a>> {
+    let Some(def) = &s.atmosphere else {
+        return Vec::new();
+    };
+    s.clouds
+        .atmosphere_samples(def, light)
+        .filter_map(|sample| {
+            let sprite = usize::from(sample.sprite);
+            let id = sheet.id(&def.sprites[sprite])?;
+            let art = sheet.get(id);
+            let [x, y, _] = sample.position;
+            let extent = art.px.abs().max((f32::from(art.w) - art.px).abs());
+            if x.abs() * PPU > W / 2.0 + extent * sample.scale[0] + 16.0 {
+                return None;
+            }
+            let at = layer_to_screen(s, x, y, 0.0);
+            let top = at.1 - art.py * sample.scale[1];
+            if top >= H || top + f32::from(art.h) * sample.scale[1] <= 0.0 {
+                return None;
+            }
+            let draw = Draw {
+                basis: Some([sample.scale[0], 0.0, 0.0, sample.scale[1]]),
+                ..atmosphere_material(sample, light)?.flip(sample.flip)
+            };
+            Some(AtmosphereDraw {
+                id,
+                mesh: &def.meshes[sprite],
+                at,
+                sample,
+                draw,
+            })
+        })
+        .collect()
+}
+
 fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     let s = c.s;
     let light = s.game.blender.state;
@@ -1878,7 +1942,8 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     let game_z = layer_z(&s.world);
     let mut clouds = cloud_draws(s, c.sheet, &light);
     prepare_cloud_shadows(c, &mut clouds);
-    let items = draw_list_with_clouds(s, c.sheet, &clouds);
+    let atmosphere = atmosphere_draws(s, c.sheet, &light);
+    let items = draw_list_with_weather(s, c.sheet, &clouds, &atmosphere);
     c.lights = items
         .iter()
         .filter_map(|(_, item)| fire_item(s, item))
@@ -1920,6 +1985,10 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
             DrawItem::Celestial(i) => draw_celestial(c, i),
             DrawItem::Glow(i, j) => draw_celestial_glow(c, i, j),
             DrawItem::Stars => draw_stars(c),
+            DrawItem::Atmosphere(i) => {
+                let p = &atmosphere[i];
+                c.r.atmosphere_sprite(p.id, p.mesh, p.at, p.draw, None);
+            }
             DrawItem::Cloud(i) => {
                 let cloud = &clouds[i];
                 let sample = cloud.sample;
@@ -2515,5 +2584,33 @@ mod tests {
                 assert_eq!(sort_key(*a).cmp(&sort_key(*b)), old, "{a:?} vs {b:?}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod atmosphere_tests {
+    #[test]
+    fn only_covered_fog_blends_with_depth_writes() {
+        use super::{atmosphere_material, color, AtmosphereKind, AtmosphereSample, Color, Light};
+
+        let mut light = Light::default();
+        light.colors[color::AMBIENT] = [0.5, 0.25, 0.125, 0.5];
+        let mut sample = AtmosphereSample {
+            kind: AtmosphereKind::Fog,
+            sprite: 0,
+            position: [0.0; 3],
+            scale: [1.0; 2],
+            flip: false,
+            tint: Color::new(0.5, 0.75, 1.0, 0.009),
+        };
+        assert_eq!(atmosphere_material(sample, &light), None);
+        sample.tint.a = 0.01;
+        let fog = atmosphere_material(sample, &light).unwrap();
+        assert!(!fog.additive);
+        assert_eq!(fog.tint, Color::new(0.25, 0.1875, 0.125, 0.01));
+        sample.kind = AtmosphereKind::Mist;
+        let mist = atmosphere_material(sample, &light).unwrap();
+        assert!(!mist.additive);
+        assert_eq!(mist.tint, Color::new(0.25, 0.1875, 0.125, 0.005));
     }
 }

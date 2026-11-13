@@ -181,6 +181,20 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         Err(e) => return Err(format!("{mesh_file}: {e}")),
     };
 
+    let atmosphere_file = scene::atmosphere_data::FILE_NAME;
+    let (atmosphere, atmosphere_sprites) = match read_file(src.join(atmosphere_file)) {
+        Ok(bytes) => {
+            let def = scene::atmosphere_data::AtmosphereDef::decode(
+                &bytes,
+                game::save::fingerprint(&world_bytes),
+            )?;
+            def.validate_sheet(&sheet)?;
+            (Some(bytes), def.sprites.into_iter().collect::<HashSet<_>>())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, HashSet::new()),
+        Err(e) => return Err(format!("{atmosphere_file}: {e}")),
+    };
+
     // Cut every sprite out; split off its recolour masks.
     let mut pieces: Vec<Piece> = Vec::new();
     let mut masks = 0;
@@ -228,7 +242,7 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             any.then_some(m)
         };
         let cloud = cloud_sprites.contains(&sheet.names[i]);
-        let [a, b] = if cloud {
+        let [a, b] = if cloud || atmosphere_sprites.contains(&sheet.names[i]) {
             [None, None]
         } else {
             [split(KEY_A), split(KEY_B)]
@@ -271,7 +285,9 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     // empty); the pivot moves with the trim.
     for p in &mut pieces {
         // Tight meshes depend on the exact authored crop and pivot.
-        if out_sheet.cloud_mesh(p.sprite as u32).is_some() {
+        if out_sheet.cloud_mesh(p.sprite as u32).is_some()
+            || atmosphere_sprites.contains(&out_sheet.names[p.sprite])
+        {
             continue;
         }
         let (w, h) = (p.img.w, p.img.h);
@@ -455,6 +471,14 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     if let Some(bytes) = meshes {
         std::fs::write(meshes_out, bytes).map_err(|e| e.to_string())?;
     } else if let Err(e) = std::fs::remove_file(meshes_out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
+        }
+    }
+    let atmosphere_out = out.join(atmosphere_file);
+    if let Some(bytes) = atmosphere {
+        std::fs::write(atmosphere_out, bytes).map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(atmosphere_out) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(e.to_string());
         }
