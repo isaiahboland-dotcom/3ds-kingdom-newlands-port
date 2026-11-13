@@ -154,6 +154,16 @@ pub fn sprite_corners(s: &crate::sheet::Sprite, at: (f32, f32), d: &Draw) -> [(f
     corners
 }
 
+/// Stereo replay must sample the same eye's previous reflection. If a right
+/// capture is unavailable, omit water reflection instead of borrowing left.
+pub fn reflection_page_for_right(page: u16, pages: [u16; 2], right_ready: bool) -> Option<u16> {
+    if page == pages[0] {
+        right_ready.then_some(pages[1])
+    } else {
+        Some(page)
+    }
+}
+
 /// Implemented by each backend (macroquad on desktop, citro3d on 3DS).
 /// Calls arrive in painter's order.
 pub trait Renderer {
@@ -213,4 +223,15 @@ pub trait Renderer {
     fn depth(&mut self, _d: f32) {}
     /// Selects the ordered world depth pass. Negative infinity exits it.
     fn world_depth(&mut self, _z: f32) {}
+}
+
+#[cfg(test)]
+mod reflection_tests {
+    use super::*;
+    #[test]
+    fn stereo_reflection_replay_never_samples_the_other_eyes_capture() {
+        assert_eq!(reflection_page_for_right(7, [7, 8], true), Some(8));
+        assert_eq!(reflection_page_for_right(7, [7, 8], false), None);
+        assert_eq!(reflection_page_for_right(3, [7, 8], false), Some(3));
+    }
 }

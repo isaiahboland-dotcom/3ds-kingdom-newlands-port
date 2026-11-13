@@ -146,6 +146,8 @@ pub struct Sheet {
     #[serde(skip)]
     authored: Option<crate::authored::AssetAnimation>,
     #[serde(skip)]
+    pub reflections: Option<crate::reflection_data::ReflectionParts>,
+    #[serde(skip)]
     index: Map<String, u32>,
     #[serde(skip)]
     cloud_meshes: Map<u32, CloudMesh>,

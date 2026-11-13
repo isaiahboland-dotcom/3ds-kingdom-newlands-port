@@ -181,8 +181,9 @@ pub struct Gpu {
     /// Draw calls this frame.
     pub draws: u32,
     /// The page holding last frame's top screen, once one has been copied.
-    reflection: Option<u16>,
-    reflection_ready: bool,
+    reflection: Option<[u16; 2]>,
+    reflection_ready: [bool; 2],
+    reflection_scratch: Option<Screen>,
     /// Drawing the top screen.
     on_top: bool,
     /// How screen pixels map to reflection texels (Y cycles them, in case
@@ -210,6 +211,23 @@ fn clear_color(c: Color) -> u32 {
 }
 
 impl Screen {
+    unsafe fn offscreen(w: f32, h: f32) -> Option<Screen> {
+        let target = c3d::C3D_RenderTargetCreate(
+            h as i32,
+            w as i32,
+            ctru::GPU_RB_RGBA8,
+            c3d::C3D_DEPTHTYPE {
+                __e: ctru::GPU_RB_DEPTH24,
+            },
+        );
+        if target.is_null() {
+            return None;
+        }
+        let mut projection = std::mem::zeroed();
+        c3d::Mtx_OrthoTilt(&mut projection, 0.0, w, h, 0.0, 1.0, -1.0, true);
+        Some(Screen { target, projection })
+    }
+
     unsafe fn new(screen: ctru::gfxScreen_t, side: ctru::gfx3dSide_t, w: f32, h: f32) -> Screen {
         // The screens are mounted sideways: targets are 240 wide.
         let target = c3d::C3D_RenderTargetCreate(
@@ -418,20 +436,39 @@ impl Gpu {
                 }
                 new_cloud_exposure()
             };
-            // The reflection: one more page, in VRAM where the copy lands.
-            let mut tex: Box<c3d::C3D_Tex> = Box::new(std::mem::zeroed());
-            let reflection = if c3d::C3D_TexInitVRAM(tex.as_mut(), 256, 512, ctru::GPU_RGBA8) {
+            // Separate retained captures for each eye; never reuse the left
+            // image for right-eye water. A failed allocation disables reflections.
+            let mut reflection_textures = Vec::new();
+            for _ in 0..2 {
+                let mut tex: Box<c3d::C3D_Tex> = Box::new(std::mem::zeroed());
+                if !c3d::C3D_TexInitVRAM(tex.as_mut(), 256, 512, ctru::GPU_RGBA8) {
+                    break;
+                }
                 c3d::C3D_TexSetFilter(tex.as_mut(), ctru::GPU_NEAREST, ctru::GPU_NEAREST);
                 c3d::C3D_TexSetWrap(
                     tex.as_mut(),
                     ctru::GPU_CLAMP_TO_EDGE,
                     ctru::GPU_CLAMP_TO_EDGE,
                 );
-                pages.push(tex);
-                page_size.push((256.0, 512.0));
-                page_hard.push(true);
-                Some((pages.len() - 1) as u16)
+                reflection_textures.push(tex);
+            }
+            let mut reflection_scratch = Screen::offscreen(400.0, 240.0);
+            let reflection = if reflection_textures.len() == 2 && reflection_scratch.is_some() {
+                let ids = [pages.len() as u16, pages.len() as u16 + 1];
+                for tex in reflection_textures {
+                    pages.push(tex);
+                    page_size.push((256.0, 512.0));
+                    page_hard.push(true);
+                }
+                Some(ids)
             } else {
+                for mut tex in reflection_textures {
+                    c3d::C3D_TexDelete(tex.as_mut());
+                }
+                if let Some(scratch) = reflection_scratch.take() {
+                    c3d::C3D_RenderTargetDelete(scratch.target);
+                }
+                eprintln!("water reflections disabled: insufficient render-target memory");
                 None
             };
 
@@ -482,7 +519,8 @@ impl Gpu {
                 bound_depth: None,
                 draws: 0,
                 reflection,
-                reflection_ready: false,
+                reflection_ready: [false; 2],
+                reflection_scratch,
                 on_top: false,
                 reflect_mode: 0,
             })
@@ -585,6 +623,14 @@ impl Gpu {
             };
         self.unbind();
         for &Call(mut state, first, n) in &calls {
+            if let (Some(page), Some(pages)) = (state.page, self.reflection) {
+                let Some(page) =
+                    scene::render::reflection_page_for_right(page, pages, self.reflection_ready[1])
+                else {
+                    continue;
+                };
+                state.page = Some(page);
+            }
             state.cloud_shadow &= has_exposure;
             unsafe {
                 self.bind(state);
@@ -601,28 +647,93 @@ impl Gpu {
         self.unbind();
     }
 
-    /// Queues a copy of the top screen, once drawn, into the reflection page.
-    fn capture_top(&mut self) {
-        let Some(p) = self.reflection else { return };
+    fn submit_before_copy(&self) {
         unsafe {
-            // Publish vertices before the split submits their draw commands.
             let _ = ctru::GSPGPU_FlushDataCache(
                 self.verts as *const _,
                 (self.quads * 4 * std::mem::size_of::<Vertex>()) as u32,
             );
-            // Submit the top screen's commands so the copy runs after them.
             c3d::C3D_FrameSplit(GX_CMDLIST_FLUSH);
-            let dim = |line: u32, gap: u32| ((gap / 16) << 16) | (line / 16);
-            let _ = ctru::GX_TextureCopy(
-                (*self.top.target).frameBuf.colorBuf as *mut u32,
-                dim(TOP_TILE_ROW, 0),
-                self.pages[p as usize].__bindgen_anon_1.data as *mut u32,
-                dim(TOP_TILE_ROW, REFLECTION_TILE_ROW - TOP_TILE_ROW),
-                TOP_TILE_ROW * TOP_TILE_ROWS,
-                c3d::GX_TRANSFER_RAW_COPY(true),
-            );
         }
-        self.reflection_ready = true;
+    }
+
+    /// PC MainCamera.OnPostRender: copy the visible scene, then render the
+    /// reflection camera's extra layer. The visible framebuffer is untouched.
+    pub fn capture_reflections(&mut self, extras: impl FnMut(&mut Self)) {
+        if !self.on_top {
+            return;
+        }
+        self.flush(); // includes right-eye replay while on_top is true
+        self.capture_reflections_after_flush(extras);
+    }
+
+    fn capture_reflections_after_flush(&mut self, mut extras: impl FnMut(&mut Self)) {
+        self.on_top = false;
+        let (Some(pages), Some(scratch)) = (self.reflection, &self.reflection_scratch) else {
+            return;
+        };
+        let scratch_target = scratch.target;
+        let projection = scratch.projection;
+        let dim = |line: u32, gap: u32| ((gap / 16) << 16) | (line / 16);
+        let eyes = if self.stereo > 0.0 { 2 } else { 1 };
+        if eyes == 1 {
+            self.reflection_ready[1] = false;
+        }
+        for (eye, page) in pages.into_iter().enumerate().take(eyes) {
+            self.reflection_ready[eye] = false;
+            let source = if eye == 0 {
+                self.top.target
+            } else {
+                self.right.target
+            };
+            unsafe {
+                c3d::C3D_RenderTargetClear(scratch_target, c3d::C3D_CLEAR_DEPTH, 0, 0);
+                self.submit_before_copy();
+                let result = ctru::GX_TextureCopy(
+                    (*source).frameBuf.colorBuf as *mut u32,
+                    dim(TOP_TILE_ROW, 0),
+                    (*scratch_target).frameBuf.colorBuf as *mut u32,
+                    dim(TOP_TILE_ROW, 0),
+                    TOP_TILE_ROW * TOP_TILE_ROWS,
+                    c3d::GX_TRANSFER_RAW_COPY(true),
+                );
+                if result < 0 {
+                    continue;
+                }
+                c3d::C3D_FrameDrawOn(scratch_target);
+                c3d::C3D_FVUnifMtx4x4(ctru::GPU_VERTEX_SHADER, self.projection_loc, &projection);
+                let shift = if eye == 0 {
+                    -self.stereo / 2.0
+                } else {
+                    self.stereo / 2.0
+                };
+                c3d::C3D_FVUnifSet(ctru::GPU_VERTEX_SHADER, self.eye_loc, shift, 0.0, 0.0, 0.0);
+            }
+            self.depth = 0.0;
+            self.world_z = None;
+            self.unbind();
+            extras(self);
+            self.flush();
+            self.submit_before_copy();
+            let result = unsafe {
+                ctru::GX_TextureCopy(
+                    (*scratch_target).frameBuf.colorBuf as *mut u32,
+                    dim(TOP_TILE_ROW, 0),
+                    self.pages[page as usize].__bindgen_anon_1.data as *mut u32,
+                    dim(TOP_TILE_ROW, REFLECTION_TILE_ROW - TOP_TILE_ROW),
+                    TOP_TILE_ROW * TOP_TILE_ROWS,
+                    c3d::GX_TRANSFER_RAW_COPY(true),
+                )
+            };
+            self.reflection_ready[eye] = result >= 0;
+        }
+        self.unbind();
+    }
+
+    fn capture_top(&mut self) {
+        // screen()/end() have already flushed. Repeating flush here would
+        // replay an empty right-eye list and clear its finished framebuffer.
+        self.capture_reflections_after_flush(|_| {});
     }
 
     /// GPU time of the last finished frame, in ms.
@@ -657,7 +768,7 @@ impl Gpu {
 
         let mode = match state.page {
             None => Env::Solid,
-            Some(p) if Some(p) == self.reflection => Env::Reflection,
+            Some(p) if self.reflection.is_some_and(|pages| pages.contains(&p)) => Env::Reflection,
             Some(_) => Env::Textured,
         };
         let material = (mode, state.cloud_light, state.cloud_shadow);
@@ -1230,7 +1341,7 @@ impl Renderer for Gpu {
     }
 
     fn reflect(&mut self, dest: Rect, src: Rect, tint: Color) {
-        let Some(page) = self.reflection.filter(|_| self.reflection_ready) else {
+        let Some([page, _]) = self.reflection.filter(|_| self.reflection_ready[0]) else {
             return;
         };
         // The copy is the colour buffer as is: sideways, screen column x in

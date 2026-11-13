@@ -1786,6 +1786,62 @@ fn draw_dog<R: Renderer>(c: &mut Ctx<R>) {
     }
 }
 
+/// Composite the reflection camera's extra layer into the copied color target.
+pub fn draw_reflection_extras(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
+    let Some(reflections) = &sheet.reflections else {
+        return;
+    };
+    let mut items = Vec::new();
+    let view = W / PPU / 2.0 + 12.0;
+    for (scenery, objects) in [
+        (false, &s.game.level.objects),
+        (true, &s.game.level.scenery),
+    ] {
+        for o in objects {
+            let layer = s.world.layer(o.layer);
+            if (o.x - layer.ratio * s.camera_x).abs() > view {
+                continue;
+            }
+            let building = !scenery && under_construction(&s.world, o);
+            for part in reflections.for_proto(o.proto) {
+                if part.scaffold != building {
+                    continue;
+                }
+                let z = layer.z + o.z + part.position[2];
+                items.push(((part.sort_layer, part.sort_order, -z), o, layer.ratio, part));
+            }
+        }
+    }
+    items.sort_by_key(|&(key, ..)| sort_key(key));
+    let game_z = layer_z(&s.world);
+    let light = &s.game.blender.state;
+    for (key, o, ratio, part) in items {
+        let Some(id) = sheet.id(&part.sprite) else {
+            continue;
+        };
+        let [x, y, _] = part.position;
+        let dir = if o.flip { -1.0 } else { 1.0 };
+        let at = layer_to_screen(s, o.x + x * dir, o.y + y, ratio);
+        let basis = crate::authored::Affine2 {
+            basis: part.basis,
+            translation: [x, y],
+        }
+        .screen_basis(o.flip);
+        let tint = Color::rgba(part.tint);
+        let tint = if part.lit { lit(tint, light) } else { tint };
+        r.depth(stereo_depth(-key.2 - game_z));
+        r.sprite(
+            id,
+            at,
+            Draw {
+                basis: Some(basis),
+                flip_y: part.flip_y,
+                ..Draw::tint(tint).flip(part.flip_x)
+            },
+        );
+    }
+}
+
 /// Everything on the top screen.
 pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
     let mut c = Ctx {
@@ -2475,6 +2531,72 @@ mod tests {
             .find(|(_, item)| matches!(item, super::DrawItem::PriceSlots))
             .unwrap();
         assert_eq!(key, (0, 0, -(game_z + 1.0 - 0.005)));
+    }
+
+    #[test]
+    fn reflected_parts_are_drawn_only_in_the_capture_and_follow_facing() {
+        use crate::reflection_data::{ReflectionPart, ReflectionParts};
+        use crate::sheet::Sprite;
+        use game::data::Layer;
+
+        let mut world = animation_world();
+        world.protos[0].parts.clear();
+        let mut s = super::Session::new(world, 0, 1, Default::default());
+        let o = game::level::instantiate(&s.world, 0, Layer::Game, 0.0, 1.0, 0.0, 1.0);
+        s.game.level.add(o);
+        let mut sheet = super::Sheet::default();
+        sheet.names = vec!["reflection".into()];
+        sheet.sprites = vec![Sprite {
+            page: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            px: 2.0,
+            py: 2.0,
+            masks: [None; 2],
+        }];
+        sheet.link(&s.world.sprites);
+        let legacy = postcard::to_allocvec(&sheet).unwrap();
+        let def = ReflectionParts {
+            entries: vec![(
+                0,
+                vec![ReflectionPart {
+                    sprite: "reflection".into(),
+                    basis: [1.0, 0.25, 0.0, 1.0],
+                    position: [1.0, 2.0, -0.5],
+                    tint: [1.0; 4],
+                    flip_x: true,
+                    flip_y: false,
+                    sort_layer: 0,
+                    sort_order: 0,
+                    lit: false,
+                    scaffold: false,
+                }],
+            )],
+        };
+        let bytes = def.encode(7).unwrap();
+        assert!(ReflectionParts::decode(&bytes, 8, 1).is_err());
+        assert!(ReflectionParts::decode(&bytes, 7, 0).is_err());
+        let loaded = ReflectionParts::decode(&bytes, 7, 1).unwrap();
+        loaded.validate_sheet(&sheet).unwrap();
+        sheet.reflections = Some(loaded);
+        assert_eq!(postcard::to_allocvec(&sheet).unwrap(), legacy);
+
+        let mut main = Capture::default();
+        super::draw(&s, &sheet, &mut main);
+        assert!(main.0.is_empty());
+        let mut reflected = Capture::default();
+        super::draw_reflection_extras(&s, &sheet, &mut reflected);
+        assert_eq!(reflected.0.len(), 1);
+        assert_eq!(reflected.0[0].1, super::layer_to_screen(&s, 1.0, 3.0, 1.0));
+        assert_eq!(reflected.0[0].2.basis, Some([1.0, -0.25, 0.0, 1.0]));
+        assert!(reflected.0[0].2.flip);
+        s.game.level.objects[0].flip = true;
+        let mut mirrored = Capture::default();
+        super::draw_reflection_extras(&s, &sheet, &mut mirrored);
+        assert_eq!(mirrored.0[0].1, super::layer_to_screen(&s, -1.0, 3.0, 1.0));
+        assert_eq!(mirrored.0[0].2.basis, Some([-1.0, 0.25, 0.0, 1.0]));
     }
 
     fn animation_world() -> game::data::WorldData {

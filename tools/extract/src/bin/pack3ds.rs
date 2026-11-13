@@ -450,7 +450,7 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     }
     let bin = postcard::to_allocvec(&out_sheet).map_err(|e| e.to_string())?;
     std::fs::write(out.join("sheet.bin"), bin).map_err(|e| e.to_string())?;
-    std::fs::write(out.join("world.bin"), world_bytes).map_err(|e| format!("world.bin: {e}"))?;
+    std::fs::write(out.join("world.bin"), &world_bytes).map_err(|e| format!("world.bin: {e}"))?;
     let authored_out = out.join(FILENAME);
     if let Some(bytes) = authored {
         std::fs::write(authored_out, bytes).map_err(|e| format!("{FILENAME}: {e}"))?;
@@ -458,6 +458,29 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(format!("{FILENAME}: {e}"));
         }
+    }
+    let reflection_file = scene::reflection_data::FILE_NAME;
+    let reflection_out = out.join(reflection_file);
+    match read_file(src.join(reflection_file)) {
+        Ok(bytes) => {
+            let world: WorldData =
+                postcard::from_bytes(&world_bytes).map_err(|e| format!("world.bin: {e}"))?;
+            let parts = scene::reflection_data::ReflectionParts::decode(
+                &bytes,
+                game::save::fingerprint(&world_bytes),
+                world.protos.len(),
+            )?;
+            parts.validate_sheet(&sheet)?;
+            std::fs::write(reflection_out, bytes).map_err(|e| e.to_string())?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(e) = std::fs::remove_file(reflection_out) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e.to_string());
+                }
+            }
+        }
+        Err(e) => return Err(format!("{reflection_file}: {e}")),
     }
     let clouds_out = out.join(scene::cloud_data::FILE_NAME);
     if let Some(bytes) = clouds {

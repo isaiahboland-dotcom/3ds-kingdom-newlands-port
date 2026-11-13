@@ -470,6 +470,7 @@ async fn main() {
         top::draw(&app, &sheet, &mut assets);
         set_camera(&camera_for(&previous_rt, TOP_W, TOP_H));
         draw_texture(&top_rt.texture, 0.0, 0.0, WHITE);
+        top::draw_reflection_extras(&app, &sheet, &mut assets);
         assets.previous = Some(previous_rt.texture.clone());
         set_camera(&camera_for(&bot_rt, BOT_W, BOT_H));
         touch::draw(&app, &sheet, &mut assets);

@@ -421,6 +421,16 @@ impl Assets {
         if let Some(e) = authored_error {
             eprintln!("ignoring {}: {e}", authored_path.display());
         }
+        let reflection_path = dir.join(::scene::reflection_data::FILE_NAME);
+        match ::scene::reflection_data::ReflectionParts::load(
+            &reflection_path,
+            world_id,
+            world.protos.len(),
+            &sheet,
+        ) {
+            Ok(parts) => sheet.reflections = parts,
+            Err(e) => eprintln!("ignoring {}: {e}", reflection_path.display()),
+        }
         let cloud_path = dir.join(::scene::cloud_data::FILE_NAME);
         let cloud_defs = match ::scene::cloud_data::load(&cloud_path, world_id, &sheet) {
             Ok(def) => def,

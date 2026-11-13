@@ -92,6 +92,16 @@ fn main() {
     };
     let mut sheet = sheet;
     let cloud_path = format!("{ROMFS}/{}", scene::cloud_data::FILE_NAME);
+    let reflection_path = format!("{ROMFS}/{}", scene::reflection_data::FILE_NAME);
+    match scene::reflection_data::ReflectionParts::load(
+        std::path::Path::new(&reflection_path),
+        world_id,
+        world.protos.len(),
+        &sheet,
+    ) {
+        Ok(parts) => sheet.reflections = parts,
+        Err(e) => eprintln!("ignoring {reflection_path}: {e}"),
+    }
     let cloud_defs =
         match scene::cloud_data::load(std::path::Path::new(&cloud_path), world_id, &sheet) {
             Ok(def) => def,
@@ -293,6 +303,7 @@ fn main() {
         let t2 = std::time::Instant::now();
         gpu.screen(true);
         top::draw(&s, &sheet, &mut gpu);
+        gpu.capture_reflections(|gpu| top::draw_reflection_extras(&s, &sheet, gpu));
         gpu.screen(false);
         touch::draw(&s, &sheet, &mut gpu);
         let t_scene = std::time::Instant::now();

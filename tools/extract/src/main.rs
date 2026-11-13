@@ -207,7 +207,12 @@ fn export_scenes(
         &serde_json::Value::Object(data.clone()),
     )?;
 
-    let (mut world, clip_paths, prefab_visuals) = world::build(&world::Inputs {
+    let world::Export {
+        mut world,
+        clip_paths,
+        visuals: prefab_visuals,
+        reflections,
+    } = world::build(&world::Inputs {
         main: &main,
         blocks: &blocks,
         loader: &loader,
@@ -246,6 +251,17 @@ fn export_scenes(
     let clouds = world::clouds(&cloud_inputs)?;
     let atmosphere = world::atmosphere(&cloud_inputs)?;
     let world_id = game::save::fingerprint(&bytes);
+    let reflection_bytes = reflections.encode(world_id)?;
+    scene::reflection_data::ReflectionParts::decode(
+        &reflection_bytes,
+        world_id,
+        world.protos.len(),
+    )?;
+    std::fs::write(
+        out.join(scene::reflection_data::FILE_NAME),
+        reflection_bytes,
+    )
+    .map_err(|e| e.to_string())?;
     let atmosphere_bytes = atmosphere.encode(world_id)?;
     scene::atmosphere_data::AtmosphereDef::decode(&atmosphere_bytes, world_id)?;
     std::fs::write(

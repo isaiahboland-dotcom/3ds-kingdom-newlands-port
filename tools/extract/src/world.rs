@@ -198,6 +198,72 @@ fn authored_prefab(node: &Value, legacy_parts: usize) -> Result<PrefabVisual, St
     Ok(visual)
 }
 
+/// Layer 29 is rendered by the reflection camera. Compose its full ancestor
+/// chain here while leaving the legacy prototype's renderer IDs untouched.
+fn reflection_parts(node: &Value, inp: &Inputs<'_>) -> Vec<scene::reflection_data::ReflectionPart> {
+    use scene::authored::Affine2;
+    use scene::reflection_data::ReflectionPart;
+
+    fn collect(
+        node: &Value,
+        inp: &Inputs<'_>,
+        parent: Affine2,
+        parent_z: f32,
+        root: bool,
+        scaffold: bool,
+        out: &mut Vec<ReflectionPart>,
+    ) {
+        if comp(node, "ScaffoldModule").is_some() {
+            return;
+        }
+        let renderer = comp(node, "SpriteRenderer");
+        let mut pose = local_pose(node, renderer);
+        if root {
+            pose.position = [0.0; 3];
+            pose.scale[0] = pose.scale[0].abs();
+        }
+        let transform = parent.compose(Affine2::from_pose(pose));
+        let z = parent_z + pose.position[2];
+        let scaffold = scaffold || comp(node, "Scaffolding").is_some();
+        if node["layer"].as_i64() == Some(29) {
+            if let Some(renderer) = renderer.filter(|r| flag(r, "m_Enabled")) {
+                if let Some(sprite) =
+                    asset_path(renderer.get("m_Sprite")).and_then(|path| inp.sprite_names.get(path))
+                {
+                    let material = renderer
+                        .get("m_Materials")
+                        .and_then(Value::as_array)
+                        .and_then(|m| asset_path(m.first()));
+                    let sort =
+                        |field| renderer.get(field).and_then(Value::as_i64).unwrap_or(0) as i16;
+                    out.push(ReflectionPart {
+                        sprite: sprite.clone(),
+                        basis: transform.basis,
+                        position: [transform.translation[0], transform.translation[1], z],
+                        tint: pose.color,
+                        flip_x: flag(renderer, "m_FlipX"),
+                        flip_y: flag(renderer, "m_FlipY"),
+                        sort_layer: sort("m_SortingLayer"),
+                        sort_order: sort("m_SortingOrder"),
+                        lit: material.is_some_and(|p| {
+                            p.starts_with("Material/")
+                                && !p.contains("Unlit")
+                                && !p.contains("Additive")
+                        }),
+                        scaffold,
+                    });
+                }
+            }
+        }
+        for child in active_part_children(node) {
+            collect(child, inp, transform, z, false, scaffold, out);
+        }
+    }
+    let mut parts = Vec::new();
+    collect(node, inp, Affine2::IDENTITY, 0.0, true, false, &mut parts);
+    parts
+}
+
 /// Materials with the `Recolor` toggle on.
 fn recolor_materials(assets: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -224,6 +290,7 @@ struct Builder<'a> {
     inp: &'a Inputs<'a>,
     world: WorldData,
     visuals: Vec<Result<PrefabVisual, String>>,
+    reflections: scene::reflection_data::ReflectionParts,
     sprite_ids: HashMap<String, SpriteId>,
     prefab_protos: HashMap<String, ProtoId>,
     recolor: HashSet<String>,
@@ -455,6 +522,10 @@ impl<'a> Builder<'a> {
             &mut part_ids,
         );
         self.visuals[id as usize] = authored_prefab(node, parts.len());
+        let reflection = reflection_parts(node, self.inp);
+        if !reflection.is_empty() {
+            self.reflections.entries.push((id, reflection));
+        }
 
         let root_sprite = comp(node, "SpriteRenderer").and_then(|sr| {
             let r = sr.get("m_Sprite");
@@ -2275,12 +2346,19 @@ fn level_config(name: &str, f: &Map<String, Value>, waves: &HashMap<&str, u16>) 
     }
 }
 
-/// Legacy world data, audio clip source paths, and visual metadata by prototype ID.
-pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>, Vec<PrefabVisual>), String> {
+pub struct Export {
+    pub world: WorldData,
+    pub clip_paths: Vec<String>,
+    pub visuals: Vec<PrefabVisual>,
+    pub reflections: scene::reflection_data::ReflectionParts,
+}
+
+pub fn build(inp: &Inputs<'_>) -> Result<Export, String> {
     let mut b = Builder {
         inp,
         world: WorldData::default(),
         visuals: Vec::new(),
+        reflections: Default::default(),
         sprite_ids: HashMap::new(),
         prefab_protos: HashMap::new(),
         recolor: recolor_materials(inp.assets_dir),
@@ -2555,7 +2633,13 @@ pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>, Vec<PrefabVisual>)
     }
     b.world.audio = found.audio;
     let visuals = b.visuals.into_iter().collect::<Result<_, _>>()?;
-    Ok((b.world, found.clip_paths, visuals))
+    b.reflections.entries.sort_by_key(|entry| entry.0);
+    Ok(Export {
+        world: b.world,
+        clip_paths: found.clip_paths,
+        visuals,
+        reflections: b.reflections,
+    })
 }
 
 /// Data assets of `ty`, sorted by path, as (path, fields).
@@ -2700,6 +2784,7 @@ mod transform_tests {
             inp: &inp,
             world: WorldData::default(),
             visuals: Vec::new(),
+            reflections: Default::default(),
             sprite_ids: HashMap::new(),
             prefab_protos: HashMap::new(),
             recolor: HashSet::new(),
@@ -2819,6 +2904,58 @@ mod transform_tests {
         {
             close(actual, expected);
         }
+    }
+
+    #[test]
+    fn reflection_layer_retains_parent_transform_without_legacy_sprite_ids() {
+        let mut art = node(
+            "Reflected",
+            [2.0, 0.0, -0.5],
+            [1.0; 3],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        art["layer"] = 29.into();
+        let q = core::f32::consts::FRAC_1_SQRT_2;
+        let parent = node(
+            "Pivot",
+            [1.0, 2.0, 0.5],
+            [2.0, 3.0, 1.0],
+            [0.0, 0.0, q, q],
+            vec![art],
+            false,
+        );
+        let root = plain("Root", vec![parent], false);
+        let (legacy, _, names) = extract(&root);
+        assert!(legacy.parts.is_empty() && names.is_empty());
+        let names = HashMap::from([("sprite".into(), "reflection".into())]);
+        let empty = Value::Null;
+        let maps = Map::new();
+        let parts = reflection_parts(
+            &root,
+            &Inputs {
+                main: &empty,
+                blocks: &empty,
+                loader: &empty,
+                prefabs: &maps,
+                data: &maps,
+                sprite_names: &names,
+                sprite_sizes: &HashMap::new(),
+                assets_dir: Path::new("."),
+            },
+        );
+        let [part] = parts.as_slice() else {
+            panic!("expected one reflected part");
+        };
+        assert_eq!(part.sprite, "reflection");
+        for (actual, expected) in part.position.into_iter().zip([1.0, 6.0, 0.0]) {
+            close(actual, expected);
+        }
+        for (actual, expected) in part.basis.into_iter().zip([0.0, -3.0, 2.0, 0.0]) {
+            close(actual, expected);
+        }
+        assert!(part.flip_x && part.flip_y);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod cloud_mesh;
 pub mod cloud_shadow;
 pub mod clouds;
 pub mod heraldry;
+pub mod reflection_data;
 pub mod render;
 pub mod session;
 pub mod sheet;
