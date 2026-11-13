@@ -224,6 +224,8 @@ fn export_scenes(
         audio_paths,
         visuals,
         catapults,
+        boss_throw,
+        boulder_walls,
     } = world::build(
         &world::Inputs {
             main: &main,
@@ -251,6 +253,8 @@ fn export_scenes(
         prefabs: visuals,
         clips: animations,
         catapults,
+        boss_throw,
+        boulder_walls,
     };
     let animation = authored.encode(game::save::fingerprint(&bytes))?;
     std::fs::write(out.join(scene::authored::FILENAME), animation).map_err(|e| e.to_string())?;

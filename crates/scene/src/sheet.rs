@@ -175,6 +175,11 @@ impl Sheet {
             .authored
             .as_ref()
             .map_or_else(Vec::new, |a| a.catapults.clone());
+        world.boss_throw = self.authored.as_ref().and_then(|a| a.boss_throw.clone());
+        world.boulder_walls = self
+            .authored
+            .as_ref()
+            .map_or_else(Vec::new, |a| a.boulder_walls.clone());
     }
 
     pub fn authored(&self) -> Option<&crate::authored::AssetAnimation> {

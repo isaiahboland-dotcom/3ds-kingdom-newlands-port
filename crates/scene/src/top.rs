@@ -414,8 +414,10 @@ pub fn draw_list(s: &Session, sheet: &Sheet) -> Vec<((i16, i16, f32), DrawItem)>
             items.push(((0, 0, -0.95), DrawItem::Dog));
         }
     }
-    for i in 0..g.siege.boulders.len() {
-        items.push(((0, 0, -0.7), DrawItem::Boulder(i)));
+    for (i, boulder) in g.siege.boulders.iter().enumerate() {
+        if boulder.runtime.held_by.is_none() {
+            items.push(((0, 0, -0.7), DrawItem::Boulder(i)));
+        }
     }
     for i in 0..g.greed.bolts.len() {
         items.push(((0, 0, -0.7), DrawItem::Bolt(i)));
@@ -1446,10 +1448,12 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     use game::greed::EnemyKind;
     let s = c.s;
     let t = &s.game.greed.trolls[i];
+    let throw_time = t.boss_throw_animation_time(&s.world);
     let clip = match (t.kind, t.state) {
         (EnemyKind::Squid, TrollState::Dead { .. }) => "squid_death",
         (EnemyKind::Squid, _) => "squid_move",
         (EnemyKind::Boss | EnemyKind::KillerBoss, TrollState::Dead { .. }) => "boss_death",
+        (EnemyKind::Boss | EnemyKind::KillerBoss, _) if throw_time.is_some() => "boss_throw",
         (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.bash.is_some() => "boss_bash_right",
         (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.puke.is_some() => "boss_puke",
         (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.mover.vx.abs() < 0.05 => "boss_idle",
@@ -1463,18 +1467,36 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
             _ => "troll_walk",
         },
     };
-    let Some(sprite) = c.frame(clip, t.anim_t) else {
+    let authored_boss = t.kind.is_boss() && s.world.boss_throw.is_some();
+    let animation_time = match t.state {
+        TrollState::Dead { t } if authored_boss => t,
+        _ => throw_time.unwrap_or(t.anim_t),
+    };
+    let Some(sprite) = c.frame(clip, animation_time) else {
         return;
     };
     let mut tint = c.lit(WHITE);
     if let TrollState::Dead { t: dt } = t.state {
-        tint.a = (1.0 - (dt - 0.5).max(0.0)).max(0.0);
+        if !authored_boss {
+            tint.a = (1.0 - (dt - 0.5).max(0.0)).max(0.0);
+        }
     }
     c.sprite_lit(
         sprite,
         world_to_screen(s, t.x, t.y),
         Draw::tint(tint).flip(t.mover.facing < 0),
     );
+    if authored_boss {
+        if let Some(boulder) = s
+            .game
+            .siege
+            .boulders
+            .iter()
+            .find(|b| b.runtime.held_by == Some(t.id))
+        {
+            draw_boulder(c, boulder);
+        }
+    }
     // What it carries. orig: Troll.PickupLoot puts it at (0.1875, 0.25) with x mirrored.
     if let Some(loot) = t.loot {
         let id = match loot {
@@ -1494,6 +1516,17 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
             let at = world_to_screen(s, t.x + 0.1875 * f, t.y + 0.25);
             c.r.sprite(id, at, Draw::tint(tint).flip(t.mover.facing > 0));
         }
+    }
+}
+
+fn draw_boulder<R: Renderer>(c: &mut Ctx<R>, boulder: &game::siege::Boulder) {
+    if let Some(sprite) = c.s.world.boulder_sprite {
+        let at = world_to_screen(c.s, boulder.x, boulder.y);
+        c.world_lit(
+            sprite,
+            at,
+            Draw::tint(c.lit(WHITE)).angle(boulder.spin.to_radians()),
+        );
     }
 }
 
@@ -1862,12 +1895,7 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
                 }
             }
             DrawItem::Boulder(i) => {
-                let b = &s.game.siege.boulders[i];
-                if let Some(sp) = s.world.boulder_sprite {
-                    let at = world_to_screen(s, b.x, b.y);
-                    let tint = c.lit(WHITE);
-                    c.world_lit(sp, at, Draw::tint(tint).angle(b.spin.to_radians()));
-                }
+                draw_boulder(c, &s.game.siege.boulders[i]);
             }
         }
     }
@@ -2327,7 +2355,7 @@ mod tests {
                 ],
             }],
             clips,
-            catapults: vec![],
+            ..Default::default()
         };
         let world_id = 0x1234_5678;
         let bytes = authored.encode(world_id).unwrap();

@@ -11,7 +11,7 @@ use crate::sheet::Sheet;
 
 pub const FILENAME: &str = "animation.bin";
 const MAGIC: [u8; 4] = *b"KNAF";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER: usize = 10;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
@@ -30,6 +30,8 @@ pub struct AssetAnimation {
     pub prefabs: Vec<PrefabVisual>,
     pub clips: Library,
     pub catapults: Vec<(u16, game::siege::CatapultPhysics)>,
+    pub boss_throw: Option<game::data::BossThrowDef>,
+    pub boulder_walls: Vec<(u16, Vec<game::data::BoulderWallPolygon>)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -156,7 +158,20 @@ impl AssetAnimation {
                     Self {
                         prefabs,
                         clips,
-                        catapults: Vec::new(),
+                        ..Self::default()
+                    },
+                    rest,
+                )
+            }
+            2 => {
+                let ((prefabs, clips, catapults), rest) =
+                    postcard::take_from_bytes(&bytes[HEADER..]).map_err(|e| e.to_string())?;
+                (
+                    Self {
+                        prefabs,
+                        clips,
+                        catapults,
+                        ..Self::default()
                     },
                     rest,
                 )
@@ -174,12 +189,14 @@ impl AssetAnimation {
     /// and prototype references. Used by headless runners with no sprite sheet.
     pub fn install_gameplay(bytes: &[u8], id: u32, world: &mut WorldData) -> Result<(), String> {
         let data = Self::decode(bytes, id)?;
-        data.validate_catapults(world)?;
+        data.validate_gameplay(world)?;
         world.catapult_physics = data.catapults;
+        world.boss_throw = data.boss_throw;
+        world.boulder_walls = data.boulder_walls;
         Ok(())
     }
 
-    fn validate_catapults(&self, world: &WorldData) -> Result<(), String> {
+    fn validate_gameplay(&self, world: &WorldData) -> Result<(), String> {
         if self.catapults.windows(2).any(|pair| pair[0].0 >= pair[1].0)
             || self.catapults.iter().any(|(id, def)| {
                 !def.valid()
@@ -190,6 +207,28 @@ impl AssetAnimation {
             })
         {
             return Err("invalid authored catapult data".into());
+        }
+        if self.boss_throw.as_ref().is_some_and(|def| !def.valid())
+            || self
+                .boulder_walls
+                .windows(2)
+                .any(|pair| pair[0].0 >= pair[1].0)
+            || self.boulder_walls.iter().any(|(id, polygons)| {
+                world
+                    .protos
+                    .get(*id as usize)
+                    .is_none_or(|proto| proto.wall_def.is_none())
+                    || polygons.is_empty()
+                    || polygons.iter().any(|polygon| {
+                        polygon.len() < 3
+                            || polygon
+                                .iter()
+                                .flatten()
+                                .any(|v| v.abs() > 100.0 || !v.is_finite())
+                    })
+            })
+        {
+            return Err("invalid authored boss boulder data".into());
         }
         Ok(())
     }
@@ -221,7 +260,7 @@ impl AssetAnimation {
             return Err("animation data contains an invalid clip or sprite reference".into());
         }
         game::greed::validate_portal_graph(&self.clips)?;
-        self.validate_catapults(world)
+        self.validate_gameplay(world)
     }
 }
 

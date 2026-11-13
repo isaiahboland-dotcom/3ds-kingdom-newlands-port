@@ -4,7 +4,7 @@
 //! orig: `Director.ScheduleWaveToday()`, `EnemyManager` (`SpawnWave`,
 //! `GetEnemies`, `CheckDanger`, wave cohesion), `Portal` (spawn queue),
 //! `Troll`, `Arrow`, `Crown`, portal defence / destruction / rebuilding
-//! and retaliation waves. Squids and bosses aren't ported yet.
+//! and retaliation waves.
 
 use alloc::vec::Vec;
 
@@ -93,6 +93,9 @@ mod boss {
     pub const BASH_IMPACT: f32 = 0.5;
     pub const PUKE_RANGE: f32 = 8.0;
     pub const PUKE_INTERVAL: f32 = 10.0;
+    pub const THROW_PAUSE: f32 = 2.0;
+    pub const THROW_TIME: f32 = 2.6;
+    pub const SCAN_INTERVAL: f32 = 1.0 / 6.0;
     pub const PUKE_AMOUNT: usize = 4;
     pub const PUKE_OFFSET: (f32, f32) = (0.8, 1.2);
 }
@@ -130,6 +133,30 @@ pub enum TrollState {
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjectileRef {
+    Boulder(u64),
+    Arrow(u64),
+    Bolt(u64),
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+struct BossSight {
+    elapsed: f32,
+    projectiles: Vec<ProjectileRef>,
+}
+
+impl Default for BossSight {
+    fn default() -> Self {
+        Self {
+            elapsed: boss::SCAN_INTERVAL,
+            projectiles: Vec::new(),
+        }
+    }
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug)]
 pub struct Troll {
     pub id: u32,
@@ -162,9 +189,39 @@ pub struct Troll {
     since_puke: f32,
     puke_now: bool,
     reached_center: bool,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    boss_sight: BossSight,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    throw_elapsed: Option<f32>,
 }
 
 impl Troll {
+    pub fn boss_throw_animation_time(&self, world: &WorldData) -> Option<f32> {
+        self.throw_elapsed.filter(|&elapsed| {
+            world
+                .boss_throw
+                .as_ref()
+                .is_some_and(|definition| elapsed < definition.clip_length)
+        })
+    }
+
+    pub fn boss_hand(&self, world: &WorldData) -> [f32; 2] {
+        self.hand_at(world, self.boss_throw_animation_time(world))
+    }
+
+    fn hand_at(&self, world: &WorldData, clip_time: Option<f32>) -> [f32; 2] {
+        let mut p = [0.0; 3];
+        if let Some(definition) = &world.boss_throw {
+            p = definition.hand;
+            if let Some(time) = clip_time {
+                for (axis, coord) in p.iter_mut().enumerate() {
+                    *coord = crate::animation::sample(&definition.hand_track[axis], time, *coord);
+                }
+            }
+        }
+        [self.x + p[0] * self.mover.facing as f32, self.y + p[1]]
+    }
+
     pub fn box_at(&self) -> Rect {
         match self.kind {
             EnemyKind::Boss | EnemyKind::KillerBoss => {
@@ -220,6 +277,8 @@ pub struct LootInfo {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Arrow {
+    #[cfg_attr(feature = "serde", serde(skip))]
+    scan_id: u64,
     pub x: f32,
     pub y: f32,
     pub vx: f32,
@@ -238,6 +297,8 @@ pub struct Arrow {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bolt {
+    #[cfg_attr(feature = "serde", serde(skip))]
+    scan_id: u64,
     pub x: f32,
     pub y: f32,
     pub vx: f32,
@@ -582,6 +643,9 @@ pub enum GreedEvent {
     CliffsDestroyed,
     /// A retaliation wave came out. orig: `EnemyManager.SpawnRetaliation()`.
     Retaliation,
+    BoulderThrown {
+        x: f32,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -605,6 +669,8 @@ pub struct Greed {
     cliffs_down: u32,
     #[cfg_attr(feature = "serde", serde(skip))]
     portal_visuals: Vec<PortalVisual>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    next_projectile_id: u64,
 }
 
 /// A portal as the greed module sees it this tick.
@@ -644,7 +710,142 @@ pub struct GreedCtx<'a> {
     pub boat: bool,
 }
 
+#[cfg(feature = "save")]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct BossSave {
+    next_id: u64,
+    bosses: Vec<(u32, Option<f32>, BossSight)>,
+    arrows: Vec<u64>,
+    bolts: Vec<u64>,
+}
+
 impl Greed {
+    #[cfg(feature = "save")]
+    pub(crate) fn save_bosses(&self) -> Option<BossSave> {
+        let bosses: Vec<_> = self
+            .trolls
+            .iter()
+            .filter(|t| {
+                t.kind.is_boss()
+                    && (t.throw_elapsed.is_some() || t.boss_sight != BossSight::default())
+            })
+            .map(|t| (t.id, t.throw_elapsed, t.boss_sight.clone()))
+            .collect();
+        (!bosses.is_empty() || self.next_projectile_id != 0).then(|| BossSave {
+            next_id: self.next_projectile_id,
+            bosses,
+            arrows: self.arrows.iter().map(|a| a.scan_id).collect(),
+            bolts: self.bolts.iter().map(|b| b.scan_id).collect(),
+        })
+    }
+
+    #[cfg(feature = "save")]
+    pub(crate) fn restore_bosses(
+        &mut self,
+        saved: BossSave,
+        siege: &crate::siege::Siege,
+        definition: Option<&crate::data::BossThrowDef>,
+    ) -> bool {
+        if saved.next_id == u64::MAX
+            || self.arrows.len() != saved.arrows.len()
+            || self.bolts.len() != saved.bolts.len()
+        {
+            return false;
+        }
+        let ids: Vec<_> = saved
+            .arrows
+            .iter()
+            .chain(&saved.bolts)
+            .copied()
+            .filter(|&id| id != 0)
+            .collect();
+        if ids
+            .iter()
+            .enumerate()
+            .any(|(i, id)| *id > saved.next_id || ids[..i].contains(id))
+        {
+            return false;
+        }
+        for (i, (id, elapsed, sight)) in saved.bosses.iter().enumerate() {
+            let Some(boss) = self.trolls.iter().find(|t| t.id == *id && t.kind.is_boss()) else {
+                return false;
+            };
+            let held = siege
+                .boulders
+                .iter()
+                .any(|b| b.runtime.held_by == Some(*id));
+            if saved.bosses[..i].iter().any(|p| p.0 == *id)
+                || elapsed.is_some_and(|elapsed| {
+                    !(0.0..boss::THROW_TIME).contains(&elapsed)
+                        || boss.is_dead()
+                        || boss.bash.is_some()
+                        || boss.puke.is_some()
+                        || definition.is_some_and(|d| (elapsed < d.release) != held)
+                })
+                || !(0.0..=boss::SCAN_INTERVAL).contains(&sight.elapsed)
+                || sight.projectiles.len() > 12
+                || sight.projectiles.iter().enumerate().any(|(i, p)| {
+                    sight.projectiles[..i].contains(p)
+                        || match p {
+                            ProjectileRef::Boulder(id) => *id == 0 || *id > siege.max_boulder_id(),
+                            ProjectileRef::Arrow(id) | ProjectileRef::Bolt(id) => {
+                                *id == 0 || *id > saved.next_id
+                            }
+                        }
+                })
+            {
+                return false;
+            }
+        }
+        if siege
+            .boulders
+            .iter()
+            .filter_map(|b| b.runtime.held_by)
+            .any(|id| {
+                !self.trolls.iter().any(|t| {
+                    t.id == id
+                        && t.kind.is_boss()
+                        && (t.is_dead() || saved.bosses.iter().any(|p| p.0 == id && p.1.is_some()))
+                })
+            })
+        {
+            return false;
+        }
+        if definition.is_none() {
+            return true;
+        }
+        self.next_projectile_id = saved.next_id;
+        for (arrow, id) in self.arrows.iter_mut().zip(saved.arrows) {
+            arrow.scan_id = id;
+        }
+        for (bolt, id) in self.bolts.iter_mut().zip(saved.bolts) {
+            bolt.scan_id = id;
+        }
+        for (id, elapsed, sight) in saved.bosses {
+            let boss = self
+                .trolls
+                .iter_mut()
+                .find(|t| t.id == id)
+                .expect("validated boss");
+            boss.throw_elapsed = elapsed;
+            boss.boss_sight = sight;
+        }
+        true
+    }
+
+    #[cfg(feature = "save")]
+    pub(crate) fn held_boulders_have_owners(&self, siege: &crate::siege::Siege) -> bool {
+        siege
+            .boulders
+            .iter()
+            .filter_map(|b| b.runtime.held_by)
+            .all(|id| {
+                self.trolls.iter().any(|t| {
+                    t.id == id && t.kind.is_boss() && (t.is_dead() || t.throw_elapsed.is_some())
+                })
+            })
+    }
+
     pub fn portal_animation(&self, object: u32) -> Option<(&'static str, f32)> {
         self.portal_visuals
             .iter()
@@ -1006,6 +1207,8 @@ impl Greed {
             since_puke: boss::PUKE_INTERVAL,
             puke_now: false,
             reached_center: false,
+            boss_sight: BossSight::default(),
+            throw_elapsed: None,
         });
         id
     }
@@ -1021,6 +1224,7 @@ impl Greed {
         t.puke_now = true;
         if t.hp <= 0 {
             t.state = TrollState::Dead { t: 0.0 };
+            t.throw_elapsed = None;
             t.mover.stop();
             t.attacking = false;
             events(GreedEvent::Killed(t.id));
@@ -1037,6 +1241,7 @@ impl Greed {
     /// Fires an arrow. orig: `Archer.Shoot()` → `Arrow` with an impulse.
     pub fn shoot(&mut self, x: f32, y: f32, vx: f32, vy: f32, missed: bool, perfect: bool) {
         self.arrows.push(Arrow {
+            scan_id: 0,
             x,
             y,
             vx,
@@ -1051,6 +1256,7 @@ impl Greed {
     /// orig: `Ballista.Fire()` → `Bolt.Launch()`.
     pub fn fire_bolt(&mut self, x: f32, y: f32, vx: f32, vy: f32, damage: i32, max_hits: u8) {
         self.bolts.push(Bolt {
+            scan_id: 0,
             x,
             y,
             vx,
@@ -1114,6 +1320,28 @@ impl Greed {
         ctx: &GreedCtx,
         level: &Level,
         rng: &mut Rng,
+        events: impl FnMut(GreedEvent),
+    ) {
+        self.update_with_siege(
+            dt,
+            hours_now,
+            ctx,
+            level,
+            rng,
+            &mut Default::default(),
+            events,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_with_siege(
+        &mut self,
+        dt: f32,
+        hours_now: f32,
+        ctx: &GreedCtx,
+        level: &Level,
+        rng: &mut Rng,
+        siege: &mut crate::siege::Siege,
         mut events: impl FnMut(GreedEvent),
     ) {
         // Scheduled waves: open the portal, then queue the trolls.
@@ -1183,7 +1411,7 @@ impl Greed {
         }
 
         self.update_cohesion(dt);
-        self.update_trolls(dt, ctx, rng, &mut events);
+        self.update_trolls(dt, ctx, rng, siege, &mut events);
         self.update_arrows(dt, ctx, &mut events);
         self.update_bolts(dt, &mut events);
         self.update_crown(dt);
@@ -1379,8 +1607,29 @@ impl Greed {
         dt: f32,
         ctx: &GreedCtx,
         rng: &mut Rng,
+        siege: &mut crate::siege::Siege,
         events: &mut impl FnMut(GreedEvent),
     ) {
+        let enhanced = ctx.world.boss_throw.is_some();
+        if enhanced && self.trolls.iter().any(|t| t.kind.is_boss()) {
+            siege.identify_boulders();
+            for id in self
+                .arrows
+                .iter_mut()
+                .map(|a| &mut a.scan_id)
+                .chain(self.bolts.iter_mut().map(|b| &mut b.scan_id))
+            {
+                if *id == 0 {
+                    self.next_projectile_id += 1;
+                    *id = self.next_projectile_id;
+                }
+            }
+        }
+        let mut projectiles = BossProjectiles {
+            boulders: &mut siege.boulders,
+            arrows: &self.arrows,
+            bolts: &self.bolts,
+        };
         let mut taken: Vec<usize> = Vec::new();
         let mut gone: Vec<usize> = Vec::new();
         let mut pukes: Vec<(f32, i8, u32)> = Vec::new();
@@ -1390,7 +1639,7 @@ impl Greed {
                 let done = if t.kind == EnemyKind::Squid {
                     update_squid(t, dt, ctx, events)
                 } else {
-                    update_boss(t, dt, ctx, rng, &mut pukes, events)
+                    update_boss(t, dt, ctx, &mut projectiles, rng, &mut pukes, events)
                 };
                 if done {
                     gone.push(ti);
@@ -1619,6 +1868,9 @@ impl Greed {
         gone.dedup();
         for &i in gone.iter().rev() {
             let t = self.trolls.remove(i);
+            if t.kind.is_boss() {
+                siege.boulders.retain(|b| b.runtime.held_by != Some(t.id));
+            }
             if !t.is_dead() {
                 events(GreedEvent::Escaped {
                     by: t.id,
@@ -1803,25 +2055,116 @@ fn update_squid(
     false
 }
 
-/// orig: `Boss` FSM: march to the campfire, then after the monarch; bash
-/// whatever's in front (walls, citizens, the monarch); spit out trolls
-/// when hurt or near the monarch; die instead of retreating.
+struct BossProjectiles<'a> {
+    boulders: &'a mut Vec<crate::siege::Boulder>,
+    arrows: &'a [Arrow],
+    bolts: &'a [Bolt],
+}
+
+impl BossProjectiles<'_> {
+    fn held(&mut self, boss: u32) -> Option<&mut crate::siege::Boulder> {
+        self.boulders
+            .iter_mut()
+            .find(|b| b.runtime.held_by == Some(boss))
+    }
+
+    fn catch(&mut self, boss: &mut Troll, world: &WorldData, radius: f32) -> bool {
+        let sight = &mut boss.boss_sight;
+        if sight.elapsed >= boss::SCAN_INTERVAL {
+            sight.elapsed = 0.0;
+            // Scanner.ComputeCorners: symmetric .6 X, world Y .5 to root+1.
+            let low = 0.5 - crate::build::WALK_Y;
+            let high = boss.y + 1.0;
+            let scan = Rect {
+                x: boss.x - 0.6,
+                y: low.min(high),
+                w: 1.2,
+                h: (high - low).abs(),
+            };
+            sight.projectiles.clear();
+            // Unity's native traversal order is unavailable. Keep port order
+            // deterministic, including non-boulders that can mask a catch.
+            sight.projectiles.extend(
+                self.arrows
+                    .iter()
+                    .filter(|a| {
+                        !a.missed
+                            && Rect::centered(0.0, 0.15, 0.0625)
+                                .at(a.x, a.y, false)
+                                .overlaps(&scan)
+                    })
+                    .map(|a| ProjectileRef::Arrow(a.scan_id))
+                    .chain(
+                        self.bolts
+                            .iter()
+                            .filter(|b| {
+                                b.stuck <= 0.0
+                                    && Rect::centered(0.0, 0.9, 0.09375)
+                                        .at(b.x, b.y, false)
+                                        .overlaps(&scan)
+                            })
+                            .map(|b| ProjectileRef::Bolt(b.scan_id)),
+                    )
+                    .chain(
+                        self.boulders
+                            .iter()
+                            .filter(|b| {
+                                let dx = b.x - b.x.clamp(scan.x, scan.x + scan.w);
+                                let dy = b.y - b.y.clamp(scan.y, scan.y + scan.h);
+                                b.scan_eligible()
+                                    && b.runtime.held_by.is_none()
+                                    && dx * dx + dy * dy <= radius * radius
+                            })
+                            .map(|b| ProjectileRef::Boulder(b.runtime.id)),
+                    )
+                    .take(12),
+            );
+        }
+        // GetAny selects the first still-active object, before checking its
+        // component, stuck state, or hand alignment. Resolve cached identities
+        // against the live objects even if they have since moved.
+        let candidate = sight.projectiles.iter().copied().find(|p| match p {
+            ProjectileRef::Arrow(id) => self.arrows.iter().any(|a| a.scan_id == *id),
+            ProjectileRef::Bolt(id) => self.bolts.iter().any(|b| b.scan_id == *id),
+            ProjectileRef::Boulder(id) => self.boulders.iter().any(|b| b.runtime.id == *id),
+        });
+        let Some(ProjectileRef::Boulder(id)) = candidate else {
+            return false;
+        };
+        let hand = boss.boss_hand(world);
+        let Some(boulder) = self.boulders.iter_mut().find(|b| b.runtime.id == id) else {
+            return false;
+        };
+        if (boulder.x - hand[0]).abs() >= 1.0 / 32.0 || !boulder.hold_by(boss.id) {
+            return false;
+        }
+        [boulder.x, boulder.y] = hand;
+        true
+    }
+}
+
+/// orig: Boss.Update and the noninterruptible actions reached from Chase.
 fn update_boss(
     t: &mut Troll,
     dt: f32,
     ctx: &GreedCtx,
+    projectiles: &mut BossProjectiles<'_>,
     rng: &mut Rng,
     pukes: &mut Vec<(f32, i8, u32)>,
     events: &mut impl FnMut(GreedEvent),
 ) -> bool {
-    let _ = rng;
+    let definition = ctx.world.boss_throw.as_ref();
     if let TrollState::Dead { t: d } = t.state {
         t.state = TrollState::Dead { t: d + dt };
-        // orig: Pool.Despawn(gameObject, 10).
-        return d > 10.0;
+        if definition.is_none() {
+            return d > 10.0;
+        }
+        if let Some(b) = projectiles.held(t.id) {
+            [b.x, b.y] = t.boss_hand(ctx.world);
+        }
+        return d + dt >= 10.0;
     }
-    if t.should_retreat {
-        // orig: Boss.Update: ReceiveDamage(hitPoints) on retreat.
+    if t.should_retreat && definition.is_none() {
         t.hp = 0;
         t.state = TrollState::Dead { t: 0.0 };
         t.attacking = false;
@@ -1829,21 +2172,82 @@ fn update_boss(
         return false;
     }
     t.since_puke += dt;
+    if definition.is_some() {
+        t.boss_sight.elapsed = (t.boss_sight.elapsed + dt).min(boss::SCAN_INTERVAL);
+    }
+    if let (Some(before), Some(definition)) = (t.throw_elapsed, definition) {
+        // Boss.Update handles retreat before the Animator can emit the marker.
+        if !t.should_retreat {
+            let marker = definition.release;
+            let now = before + dt;
+            let until = (marker - before).clamp(0.0, dt);
+            if before < marker && now >= marker {
+                t.mover.update(&mut t.x, until);
+                if let Some(b) = projectiles.held(t.id) {
+                    let position = t.hand_at(ctx.world, Some(marker));
+                    let force = definition.force;
+                    let speed = rng.range(force.0, force.1);
+                    b.release_from_boss(
+                        position,
+                        t.mover.facing,
+                        speed,
+                        dt - until,
+                        definition,
+                        rng,
+                    );
+                    events(GreedEvent::BoulderThrown { x: t.x });
+                }
+                t.mover.update(&mut t.x, dt - until);
+            } else {
+                // Pause keeps the old movement goal. At two seconds Mover
+                // resumes it even though Throw still owns the FSM.
+                t.mover.update(&mut t.x, dt);
+            }
+            t.throw_elapsed = (now < boss::THROW_TIME).then_some(now);
+            if t.throw_elapsed.is_none() {
+                t.state = TrollState::Chase { t: -1.0 };
+            }
+            if let Some(b) = projectiles.held(t.id) {
+                [b.x, b.y] = t.boss_hand(ctx.world);
+            }
+        }
+    } else if !t.should_retreat || (t.bash.is_none() && t.puke.is_none()) {
+        update_boss_chase_or_attack(t, dt, ctx, projectiles, pukes, events);
+    }
+    if t.should_retreat {
+        t.hp = 0;
+        t.throw_elapsed = None;
+        t.state = TrollState::Dead { t: 0.0 };
+        t.attacking = false;
+        t.mover.stop();
+        if let Some(b) = projectiles.held(t.id) {
+            [b.x, b.y] = t.boss_hand(ctx.world);
+        }
+        events(GreedEvent::Killed(t.id));
+    }
+    false
+}
+
+fn update_boss_chase_or_attack(
+    t: &mut Troll,
+    dt: f32,
+    ctx: &GreedCtx,
+    projectiles: &mut BossProjectiles<'_>,
+    pukes: &mut Vec<(f32, i8, u32)>,
+    events: &mut impl FnMut(GreedEvent),
+) {
+    let definition = ctx.world.boss_throw.as_ref();
     let dir = t.mover.facing as f32;
-    let in_front = |x: f32| {
-        let d = (x - t.x) * dir;
-        (0.0..=boss::REACH).contains(&d)
-    };
-    if let Some((bt, landed)) = t.bash {
+    let boss_x = t.x;
+    let in_front = |x: f32| (0.0..=boss::REACH).contains(&((x - boss_x) * dir));
+    if let Some((bt, mut landed)) = t.bash {
         let bt = bt + dt;
-        let mut landed = landed;
-        if !landed && bt >= boss::BASH_IMPACT {
+        let impact_at = boss::BASH_IMPACT;
+        if !landed && bt >= impact_at {
             landed = true;
-            // orig: OnAnimBashImpact: everything Ogre-damageable in the box.
             let mut hits = Vec::new();
             for i in ctx.targets {
-                let d = (i.x - t.x) * dir;
-                if (0.0..=boss::REACH).contains(&d) {
+                if in_front(i.x) {
                     hits.push(i.target);
                 }
             }
@@ -1859,41 +2263,71 @@ fn update_boss(
                 });
             }
         }
-        t.bash = if bt >= boss::BASH_TIME {
-            None
-        } else {
-            Some((bt, landed))
-        };
-        return false;
+        t.bash = (bt < boss::BASH_TIME).then_some((bt, landed));
+        if definition.is_some() && t.bash.is_none() {
+            t.state = TrollState::Chase { t: -1.0 };
+        }
+        return;
     }
-    if let Some(pt) = t.puke {
-        let pt = pt + dt;
-        if pt >= 0.5 && pt - dt < 0.5 {
+    if let Some(before) = t.puke {
+        let pt = before + dt;
+        if pt >= 0.5 && before < 0.5 {
             pukes.push((t.x, t.mover.facing, t.wave));
         }
-        t.puke = if pt >= 1.5 { None } else { Some(pt) };
-        return false;
+        t.puke = (pt < 1.5).then_some(pt);
+        if definition.is_some() && t.puke.is_none() {
+            t.state = TrollState::Chase { t: -1.0 };
+        }
+        return;
     }
-    // orig: ShouldPuke (interrupts Chase).
-    let monarch_ahead =
-        (ctx.monarch_x - t.x) * dir >= 0.0 && (ctx.monarch_x - t.x).abs() <= boss::PUKE_RANGE;
-    if t.since_puke > boss::PUKE_INTERVAL && (t.puke_now || monarch_ahead) {
-        t.puke_now = false;
-        t.since_puke = 0.0;
-        t.mover.stop();
-        t.puke = Some(0.0);
-        return false;
+    let elapsed = match t.state {
+        TrollState::Chase { t } => t,
+        _ => -1.0,
+    };
+    if definition.is_some() && elapsed < 0.0 {
+        // The queued Chase entry executes without evaluating transitions.
+        t.state = TrollState::Chase { t: 0.0 };
+        move_boss(t, dt, ctx);
+        return;
     }
-    // orig: ShouldBash: an obstacle, the monarch or a citizen in front.
-    let target_ahead = ctx.targets.iter().any(|i| in_front(i.x)) || in_front(ctx.monarch_x);
-    if target_ahead {
-        t.mover.stop();
-        t.bash = Some((0.0, false));
-        t.anim_t = 0.0;
-        return false;
+    let elapsed = elapsed + dt;
+    if definition.is_none() || !t.mover.moving_to_goal || elapsed > 1.0 {
+        if definition.is_some() {
+            t.state = TrollState::Chase { t: 0.0 };
+        }
+        // Awake adds Chase transitions in this order: Puke, Throw, Bash.
+        let monarch_ahead =
+            (ctx.monarch_x - t.x) * dir >= 0.0 && (ctx.monarch_x - t.x).abs() <= boss::PUKE_RANGE;
+        if t.since_puke > boss::PUKE_INTERVAL && (t.puke_now || monarch_ahead) {
+            t.puke_now = false;
+            t.since_puke = 0.0;
+            t.mover.stop();
+            t.puke = Some(0.0);
+            return;
+        }
+        if definition.is_some_and(|d| projectiles.catch(t, ctx.world, d.boulder_radius)) {
+            t.mover.pause(boss::THROW_PAUSE);
+            t.throw_elapsed = Some(0.0);
+            t.anim_t = 0.0;
+            return;
+        }
+        if ctx.targets.iter().any(|i| in_front(i.x)) || in_front(ctx.monarch_x) {
+            t.mover.stop();
+            t.bash = Some((0.0, false));
+            t.anim_t = 0.0;
+            return;
+        }
+    } else {
+        t.state = TrollState::Chase { t: elapsed };
     }
-    // orig: Chase: the campfire first, then the crowned monarch.
-    if (t.x - ctx.campfire).abs() < 0.5 {
+    move_boss(t, dt, ctx);
+}
+
+fn move_boss(t: &mut Troll, dt: f32, ctx: &GreedCtx) {
+    let camp_goal = Some((ctx.campfire, boss::WALK));
+    if (ctx.world.boss_throw.is_some() && t.mover.goal == camp_goal && !t.mover.moving_to_goal)
+        || (ctx.world.boss_throw.is_none() && (t.x - ctx.campfire).abs() < 0.5)
+    {
         t.reached_center = true;
     }
     let goal = if t.reached_center && ctx.monarch_has_crown {
@@ -1903,7 +2337,6 @@ fn update_boss(
     };
     t.mover.set_goal(goal, boss::WALK);
     t.mover.update(&mut t.x, dt);
-    false
 }
 
 fn point_in(r: &Rect, x: f32, y: f32) -> bool {
@@ -1983,6 +2416,109 @@ fn retreat_portal(ctx: &GreedCtx, x: f32, side: i8) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn boss_throw_checks_strict_chase_cadence_and_puke_throw_bash_order() {
+        let world = WorldData {
+            boss_throw: Some(Default::default()),
+            ..Default::default()
+        };
+        let wall = [TargetInfo {
+            target: Target::Object(12),
+            x: 1.0,
+            rect: Rect::centered(0.5, 1.0, 1.0).at(1.0, 0.0, false),
+            priority: false,
+            wall: true,
+        }];
+        for (puke, aligned) in [(true, true), (false, true), (false, false)] {
+            let mut ctx = GreedCtx {
+                world: &world,
+                level_index: 0,
+                campfire: 10.0,
+                borders: Borders {
+                    left: 0.0,
+                    right: 100.0,
+                },
+                monarch_x: 100.0,
+                monarch_has_crown: true,
+                targets: &[],
+                loot: &[],
+                portals: &[],
+                portal_infos: &[],
+                threats: &[],
+                season: Season::Summer,
+                day: 0,
+                boat: false,
+            };
+            ctx.targets = &wall;
+            ctx.monarch_x = if puke { 4.0 } else { 100.0 };
+            let mut greed = Greed::default();
+            let mut rng = Rng::new(29);
+            greed.spawn_troll(EnemyKind::Boss, 0.0, 0, true, &mut rng);
+            let t = &mut greed.trolls[0];
+            t.state = TrollState::Chase { t: 0.75 };
+            t.mover.set_goal(ctx.campfire, boss::WALK);
+            t.mover.pause(1.0);
+            let x =
+                world.boss_throw.as_ref().unwrap().hand[0] + if aligned { 0.0 } else { 1.0 / 32.0 };
+            let mut siege = crate::siege::Siege::default();
+            siege.boulders.push(crate::siege::Boulder::test_lodged(x));
+            siege.identify_boulders();
+            greed.update_trolls(0.25, &ctx, &mut rng, &mut siege, &mut |_| {});
+            assert_eq!(greed.trolls[0].state, TrollState::Chase { t: 1.0 });
+            assert!(greed.trolls[0].puke.is_none() && greed.trolls[0].bash.is_none());
+            greed.update_trolls(0.001, &ctx, &mut rng, &mut siege, &mut |_| {});
+            let t = &greed.trolls[0];
+            assert_eq!(t.puke.is_some(), puke);
+            assert_eq!(t.bash.is_some(), !puke && !aligned);
+            assert_eq!(
+                siege.boulders[0].runtime.held_by,
+                (!puke && aligned).then_some(t.id)
+            );
+        }
+    }
+
+    #[test]
+    fn boss_scanner_uses_first_active_projectile_and_resolves_cached_boulder_position() {
+        let world = WorldData {
+            boss_throw: Some(Default::default()),
+            ..Default::default()
+        };
+        let mut greed = Greed::default();
+        greed.spawn_troll(EnemyKind::Boss, 0.0, 0, true, &mut Rng::new(4));
+        greed.shoot(0.0, 0.3, 0.0, 0.0, false, false);
+        greed.arrows[0].scan_id = 1;
+        let boss = &mut greed.trolls[0];
+        let mut siege = crate::siege::Siege::default();
+        siege
+            .boulders
+            .push(crate::siege::Boulder::test_lodged(0.55));
+        siege.boulders.push(crate::siege::Boulder::test_lodged(0.4));
+        siege.identify_boulders();
+        boss.boss_sight.elapsed = boss::SCAN_INTERVAL;
+        let mut projectiles = BossProjectiles {
+            boulders: &mut siege.boulders,
+            arrows: &greed.arrows,
+            bolts: &[],
+        };
+        assert!(
+            !projectiles.catch(boss, &world, 0.15625),
+            "a selected arrow masks both stones"
+        );
+        projectiles.arrows = &[];
+        assert!(
+            !projectiles.catch(boss, &world, 0.15625),
+            "the first stone is outside hand reach"
+        );
+        projectiles.boulders[0].x = 0.4;
+        assert!(
+            projectiles.catch(boss, &world, 0.15625),
+            "the cache resolves the moved stone's live X"
+        );
+        assert_eq!(projectiles.boulders[0].runtime.held_by, Some(boss.id));
+        assert!(projectiles.boulders[1].stuck.is_some());
+    }
+
     use crate::data::{Curve, LevelConfigDef, WaveDef};
     use alloc::string::ToString;
     use alloc::vec;

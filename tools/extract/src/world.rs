@@ -1944,6 +1944,8 @@ pub struct Export {
     pub audio_paths: Vec<String>,
     pub visuals: Vec<PrefabVisual>,
     pub catapults: Vec<(ProtoId, game::siege::CatapultPhysics)>,
+    pub boss_throw: Option<game::data::BossThrowDef>,
+    pub boulder_walls: Vec<(ProtoId, Vec<game::data::BoulderWallPolygon>)>,
 }
 
 pub fn build(inp: &Inputs, animations: &game::animation::Library) -> Result<Export, String> {
@@ -2226,7 +2228,10 @@ pub fn build(inp: &Inputs, animations: &game::animation::Library) -> Result<Expo
     b.world.audio = found.audio;
     let visuals = b.visuals.into_iter().collect::<Result<Vec<_>, _>>()?;
     let mut catapults = Vec::new();
-    if b.world.protos.iter().any(|p| p.catapult.is_some()) {
+    let mut boss_throw = None;
+    let mut boulder_walls = Vec::new();
+    let boss = inp.prefabs.get("Resources/prefabs/enemies/Boss.prefab");
+    if boss.is_some() || b.world.protos.iter().any(|p| p.catapult.is_some()) {
         let settings = inp
             .assets_dir
             .parent()
@@ -2236,6 +2241,25 @@ pub fn build(inp: &Inputs, animations: &game::animation::Library) -> Result<Expo
             read_physics_settings(&settings, "Physics2DSettings.asset", "Physics2DSettings")?;
         let time = read_physics_settings(&settings, "TimeManager.asset", "TimeManager")?;
         let ground = catapult_ground(inp.main)?;
+        if let Some(boss) = boss {
+            let boulder = inp
+                .prefabs
+                .get("Resources/prefabs/objects/Boulder.prefab")
+                .ok_or("missing authored Boulder prefab")?;
+            let definition =
+                boss_throw_definition(boss, boulder, &physics, &time, ground, inp.assets_dir)?;
+            boss_throw = Some(boss_throw_animation(definition, animations)?);
+            for (path, &id) in &b.prefab_protos {
+                if b.world.protos[id as usize].wall_def.is_some() {
+                    let polygons =
+                        obstacle_shapes(&inp.prefabs[path]).map_err(|e| format!("{path}: {e}"))?;
+                    if !polygons.is_empty() {
+                        boulder_walls.push((id, polygons));
+                    }
+                }
+            }
+            boulder_walls.sort_unstable_by_key(|(id, _)| *id);
+        }
         for (path, &id) in &b.prefab_protos {
             if b.world.protos[id as usize].catapult.is_none() {
                 continue;
@@ -2264,6 +2288,8 @@ pub fn build(inp: &Inputs, animations: &game::animation::Library) -> Result<Expo
         audio_paths: found.clip_paths,
         visuals,
         catapults,
+        boss_throw,
+        boulder_walls,
     })
 }
 
@@ -2435,6 +2461,253 @@ fn catapult_animation(
     };
     if !definition.valid() {
         return Err("invalid catapult marker order or timing".into());
+    }
+    Ok(definition)
+}
+
+fn obstacle_shapes(node: &Value) -> Result<Vec<game::data::BoulderWallPolygon>, String> {
+    use game::animation::Affine2;
+
+    fn walk(
+        node: &Value,
+        at: Affine2,
+        out: &mut Vec<game::data::BoulderWallPolygon>,
+    ) -> Result<(), String> {
+        if node["active"].as_bool() == Some(false) {
+            return Ok(());
+        }
+        if node["layer"].as_u64() == Some(20) {
+            for c in node["components"].as_array().into_iter().flatten() {
+                let ty = c["type"].as_str().unwrap_or("");
+                if !ty.ends_with("Collider2D") {
+                    continue;
+                }
+                let f = c["fields"].as_object().ok_or("missing obstacle fields")?;
+                if !flag(f, "m_Enabled") {
+                    continue;
+                }
+                if flag(f, "m_UsedByComposite")
+                    || flag(f, "m_UsedByEffector")
+                    || flag(f, "m_IsTrigger")
+                {
+                    return Err("unsupported obstacle composite, effector or trigger".into());
+                }
+                if asset_path(f.get("m_Material"))
+                    != Some("PhysicsMaterial2D/Walls.physicsMaterial2D")
+                {
+                    return Err("unsupported obstacle material".into());
+                }
+                let offset = physics_xy(&f["m_Offset"])?;
+                let paths: Vec<Vec<[f32; 2]>> = match ty {
+                    "PolygonCollider2D" => f["m_Points"]["m_Paths"]
+                        .as_array()
+                        .ok_or("missing obstacle polygon")?
+                        .iter()
+                        .map(|path| {
+                            path.as_array()
+                                .ok_or_else(|| "missing obstacle vertices".to_owned())?
+                                .iter()
+                                .map(physics_xy)
+                                .collect()
+                        })
+                        .collect::<Result<_, _>>()?,
+                    "BoxCollider2D" => {
+                        let size = physics_xy(&f["m_Size"])?;
+                        if size.iter().any(|v| *v <= 0.0) {
+                            return Err("invalid obstacle box".into());
+                        }
+                        vec![vec![
+                            [-size[0] * 0.5, -size[1] * 0.5],
+                            [size[0] * 0.5, -size[1] * 0.5],
+                            [size[0] * 0.5, size[1] * 0.5],
+                            [-size[0] * 0.5, size[1] * 0.5],
+                        ]]
+                    }
+                    _ => return Err(format!("unsupported obstacle collider {ty}")),
+                };
+                for path in paths {
+                    let points: Vec<_> = path
+                        .iter()
+                        .map(|v| at.point([v[0] + offset[0], v[1] + offset[1]]))
+                        .collect();
+                    if points.len() < 3 || points.iter().flatten().any(|v| !v.is_finite()) {
+                        return Err("invalid obstacle vertices".into());
+                    }
+                    out.push(points);
+                }
+            }
+        }
+        for child in node["children"].as_array().into_iter().flatten() {
+            walk(
+                child,
+                at.compose(Affine2::from_pose(local_pose(child, None))),
+                out,
+            )?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(node, Affine2::IDENTITY, &mut out)?;
+    Ok(out)
+}
+
+/// Resolve Boss.hand through its authored reference and follow the projectile's
+/// actual collider material. The throwback solver expects a circular body with
+/// a centered collider and the game's normal and ghost collision layers.
+fn boss_throw_definition(
+    boss: &Value,
+    boulder: &Value,
+    physics: &Value,
+    time: &Value,
+    ground_y: f32,
+    assets_dir: &Path,
+) -> Result<game::data::BossThrowDef, String> {
+    let boss_script = comp(boss, "Boss").ok_or("missing Boss component")?;
+    let hand_id = boss_script
+        .get("hand")
+        .and_then(|hand| hand["local"].as_i64())
+        .ok_or("unlinked Boss.hand")?;
+    let hand = boss["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|node| node["transform_id"].as_i64() == Some(hand_id))
+        .ok_or("missing direct Boss.hand child")?;
+    let boss_pose = local_pose(boss, None);
+    let hand_pose = local_pose(hand, None);
+    if hand["name"] != "Hand"
+        || !hand["pos"].as_array().is_some_and(|position| {
+            position.len() == 3 && position.iter().all(|value| value.as_f64().is_some())
+        })
+        || hand_pose.scale != [1.0; 3]
+        || hand_pose.rotation != [0.0, 0.0, 0.0, 1.0]
+        || boss_pose.scale != [1.0; 3]
+        || boss_pose.rotation != [0.0, 0.0, 0.0, 1.0]
+    {
+        return Err("unsupported Boss.hand hierarchy or pose".into());
+    }
+    if comp(boss, "Animator").and_then(|a| asset_path(a.get("m_Controller")))
+        != Some("AnimatorController/boss.controller")
+    {
+        return Err("unsupported Boss animator controller".into());
+    }
+
+    let script = comp(boulder, "Boulder").ok_or("missing Boulder component")?;
+    let body = comp(boulder, "Rigidbody2D").ok_or("missing Boulder body")?;
+    let circle = comp(boulder, "CircleCollider2D").ok_or("missing Boulder circle")?;
+    let value = |fields: &Map<String, Value>, key: &str| -> Result<f32, String> {
+        fields
+            .get(key)
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("missing or invalid Boulder {key}"))
+    };
+    if boulder["layer"].as_u64() != Some(11)
+        || !flag(body, "m_Simulated")
+        || value(body, "m_BodyType")? != 0.0
+        || value(body, "m_GravityScale")? != 1.0
+        || value(body, "m_Constraints")? != 0.0
+        || value(body, "m_CollisionDetection")? != 0.0
+        || !flag(circle, "m_Enabled")
+        || flag(circle, "m_IsTrigger")
+        || flag(circle, "m_UsedByComposite")
+        || flag(circle, "m_UsedByEffector")
+        || physics_xy(
+            circle
+                .get("m_Offset")
+                .ok_or("missing Boulder collider offset")?,
+        )? != [0.0; 2]
+    {
+        return Err("unsupported Boulder body or collider".into());
+    }
+    for layer in [0, 8, 9, 10, 16, 20] {
+        if !physics_layers_collide(physics, 11, layer)?
+            || !physics_layers_collide(physics, layer, 11)?
+            || physics_layers_collide(physics, 17, layer)? != (layer == 0)
+            || physics_layers_collide(physics, layer, 17)? != (layer == 0)
+        {
+            return Err("unsupported Boulder normal/ghost collision layers".into());
+        }
+    }
+    if physics_xy(&physics["m_Gravity"])?[0] != 0.0
+        || physics_number(physics, "m_AutoSimulation")? != 1.0
+        || physics_number(time, "m_TimeScale")? != 1.0
+    {
+        return Err("unsupported Boulder simulation mode".into());
+    }
+    let material = asset_path(circle.get("m_Material")).ok_or("unlinked Boulder material")?;
+    let material = read_physics_settings(assets_dir, material, "PhysicsMaterial2D")?;
+    let force = boss_script
+        .get("throwForce")
+        .ok_or("missing Boss.throwForce")?;
+    let def = game::data::BossThrowDef {
+        force: (physics_number(force, "min")?, physics_number(force, "max")?),
+        hand: hand_pose.position,
+        boulder_radius: value(circle, "m_Radius")?,
+        boulder_ghost: value(script, "ghostTime")?,
+        boulder_damage: script
+            .get("hitDamage")
+            .and_then(Value::as_i64)
+            .and_then(|x| i32::try_from(x).ok())
+            .ok_or("invalid Boulder.hitDamage")?,
+        boulder_max_hits: script
+            .get("maxHitCitizens")
+            .and_then(Value::as_u64)
+            .and_then(|x| u8::try_from(x).ok())
+            .ok_or("invalid Boulder.maxHitCitizens")?,
+        boulder_linear_drag: value(body, "m_LinearDrag")?,
+        boulder_angular_drag: value(body, "m_AngularDrag")?,
+        boulder_restitution: physics_number(&material, "bounciness")?,
+        boulder_friction: physics_number(&material, "friction")?,
+        gravity: -physics_xy(&physics["m_Gravity"])?[1],
+        fixed_step: physics_number(time, "Fixed Timestep")?,
+        ground_y,
+        ..Default::default()
+    };
+    if !def.valid() {
+        return Err("invalid Boss throwback definition".into());
+    }
+    Ok(def)
+}
+
+fn boss_throw_animation(
+    mut definition: game::data::BossThrowDef,
+    animations: &game::animation::Library,
+) -> Result<game::data::BossThrowDef, String> {
+    let state = animations
+        .state("boss", "Throw")
+        .ok_or("missing boss Throw state")?;
+    let clip = animations
+        .state_clip("boss", "Throw")
+        .ok_or("missing boss Throw clip")?;
+    if state.speed != 1.0
+        || state.cycle_offset != 0.0
+        || state.speed_parameter.is_some()
+        || clip.looping
+    {
+        return Err("unsupported boss Throw timing".into());
+    }
+    let track = clip
+        .tracks
+        .iter()
+        .find(|track| track.path == "Hand")
+        .ok_or("missing boss Throw Hand track")?;
+    if track.position[0].is_empty() || track.position[1].is_empty() {
+        return Err("missing boss Throw Hand position curves".into());
+    }
+    let mut markers = clip
+        .events
+        .iter()
+        .filter(|event| event.kind == game::animation::EventKind::BoulderRelease);
+    definition.release = markers
+        .next()
+        .ok_or("missing boss Throw release marker")?
+        .time;
+    definition.clip_length = clip.length;
+    definition.hand_track = track.position.clone();
+    if markers.next().is_some() || !definition.valid() {
+        return Err("invalid boss Throw animation".into());
     }
     Ok(definition)
 }
@@ -3199,5 +3472,47 @@ mod transform_tests {
         close((a * a + c * c).sqrt(), 6.659998);
         close((b * b + d * d).sqrt(), 1.0);
         assert!(c > 4.0 && b < -0.6, "rope rotation was discarded");
+    }
+}
+#[cfg(test)]
+mod boss_throw_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the user's private PC asset export; set KINGDOM_RECOIL_REFERENCE_ASSETS"]
+    fn local_reference_boss_throwback_export() {
+        let assets =
+            std::path::PathBuf::from(std::env::var_os("KINGDOM_RECOIL_REFERENCE_ASSETS").unwrap());
+        let guids = crate::guid_map(&assets);
+        let resolver = crate::scenes::Resolver::new(&guids, &assets);
+        let read = |path: &str| crate::scenes::export_file(&assets.join(path), &resolver).unwrap();
+        let settings = assets.parent().unwrap().join("ProjectSettings");
+        let physics =
+            read_physics_settings(&settings, "Physics2DSettings.asset", "Physics2DSettings")
+                .unwrap();
+        let time = read_physics_settings(&settings, "TimeManager.asset", "TimeManager").unwrap();
+        let ground = catapult_ground(&read("main.unity")).unwrap();
+        let boss = read("Resources/prefabs/enemies/Boss.prefab")["roots"][0].clone();
+        let boulder = read("Resources/prefabs/objects/Boulder.prefab")["roots"][0].clone();
+        let extract =
+            |boss: &Value| boss_throw_definition(boss, &boulder, &physics, &time, ground, &assets);
+        assert_eq!(extract(&boss).unwrap(), game::data::BossThrowDef::default());
+        let mut altered = boss;
+        let script = altered["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["type"] == "Boss")
+            .unwrap();
+        script["fields"]["throwForce"]["min"] = Value::from(5);
+        assert_eq!(extract(&altered).unwrap().force, (5.0, 7.0));
+        let script = altered["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["type"] == "Boss")
+            .unwrap();
+        script["fields"]["hand"]["local"] = Value::from(-1);
+        assert!(extract(&altered).unwrap_err().contains("Boss.hand"));
     }
 }

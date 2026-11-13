@@ -17,6 +17,7 @@ const MAGIC: [u8; 4] = *b"KNL1";
 const EXTENSIONS: [u8; 4] = *b"KNEX";
 const PORTALS: [u8; 4] = *b"PORT";
 const CATAPULTS: [u8; 4] = *b"CATA";
+const THROWBACK: [u8; 4] = *b"BOSS";
 
 /// The slot names the backends store under. orig: `"AUTO"`, `"unlocks"`.
 pub const GAME_SLOT: &str = "game";
@@ -86,13 +87,22 @@ pub fn save_game(g: &GameState, world: u32) -> Vec<u8> {
     // Serializing plain data into a Vec can't fail.
     out.extend(postcard::to_allocvec(g).expect("plain-data serialization cannot fail"));
     let recoil = g.siege.save_recoil();
-    if !g.greed.portal_visuals().is_empty() || recoil.is_some() {
+    let boss = g.greed.save_bosses();
+    let boulders = g.siege.save_boulders();
+    if !g.greed.portal_visuals().is_empty()
+        || recoil.is_some()
+        || boss.is_some()
+        || boulders.is_some()
+    {
         out.extend_from_slice(&EXTENSIONS);
         if !g.greed.portal_visuals().is_empty() {
             write_extension(&mut out, PORTALS, g.greed.portal_visuals());
         }
         if let Some(recoil) = recoil {
             write_extension(&mut out, CATAPULTS, &recoil);
+        }
+        if boss.is_some() || boulders.is_some() {
+            write_extension(&mut out, THROWBACK, &(boss, boulders));
         }
     }
     out
@@ -129,6 +139,7 @@ fn load_extensions(
         .ok_or(LoadError::Corrupt)?;
     let mut seen_portals = false;
     let mut seen_catapults = false;
+    let mut seen_throwback = false;
     while !rest.is_empty() {
         let (header, data) = rest.split_at_checked(8).ok_or(LoadError::Corrupt)?;
         let length = u32::from_le_bytes(header[4..].try_into().expect("header size")) as usize;
@@ -154,7 +165,33 @@ fn load_extensions(
                 }
                 seen_catapults = true;
             }
-            tag if tag == PORTALS || tag == CATAPULTS => return Err(LoadError::Corrupt),
+            tag if tag == THROWBACK && !seen_throwback => {
+                let (boss, boulders): (
+                    Option<crate::greed::BossSave>,
+                    Option<crate::siege::BoulderSave>,
+                ) = extension(payload)?;
+                if (boss.is_none() && boulders.is_none())
+                    || boulders.is_some_and(|saved| !game.siege.restore_boulders(saved))
+                {
+                    return Err(LoadError::Corrupt);
+                }
+                let owners_valid = if let Some(saved) = boss {
+                    game.greed
+                        .restore_bosses(saved, &game.siege, world.boss_throw.as_ref())
+                } else {
+                    game.greed.held_boulders_have_owners(&game.siege)
+                };
+                if !owners_valid {
+                    return Err(LoadError::Corrupt);
+                }
+                if world.boss_throw.is_none() {
+                    game.siege.discard_throwback();
+                }
+                seen_throwback = true;
+            }
+            tag if tag == PORTALS || tag == CATAPULTS || tag == THROWBACK => {
+                return Err(LoadError::Corrupt)
+            }
             _ => return Err(LoadError::Format),
         }
         rest = next;
