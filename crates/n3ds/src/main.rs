@@ -49,7 +49,8 @@ fn fail(gfx: &Gfx, hid: &mut Hid, apt: &Apt, msg: &str) {
 fn load() -> Result<(WorldData, u32, Sheet), String> {
     let bytes =
         std::fs::read(format!("{ROMFS}/world.bin")).map_err(|e| format!("world.bin: {e}"))?;
-    let mut world: WorldData = postcard::from_bytes(&bytes).map_err(|e| format!("world.bin: {e}"))?;
+    let mut world: WorldData =
+        postcard::from_bytes(&bytes).map_err(|e| format!("world.bin: {e}"))?;
     let world_id = save::fingerprint(&bytes);
     if let Err(e) = scene::squid::install(std::path::Path::new(ROMFS), &mut world, world_id) {
         eprintln!("ignoring {}: {e}", scene::squid::FILENAME);

@@ -524,10 +524,16 @@ impl Gpu {
             c3d::C3D_TexEnvInit(env);
             if let Some(overlay) = state.overlay {
                 c3d::C3D_TexEnvSrc(
-                    env, c3d::C3D_RGB, ctru::GPU_CONSTANT, ctru::GPU_PREVIOUS, ctru::GPU_CONSTANT,
+                    env,
+                    c3d::C3D_RGB,
+                    ctru::GPU_CONSTANT,
+                    ctru::GPU_PREVIOUS,
+                    ctru::GPU_CONSTANT,
                 );
                 c3d::C3D_TexEnvOpRgb(
-                    env, ctru::GPU_TEVOP_RGB_SRC_COLOR, ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                    env,
+                    ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                    ctru::GPU_TEVOP_RGB_SRC_COLOR,
                     ctru::GPU_TEVOP_RGB_SRC_ALPHA,
                 );
                 c3d::C3D_TexEnvFunc(env, c3d::C3D_RGB, ctru::GPU_INTERPOLATE);
