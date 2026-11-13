@@ -89,6 +89,12 @@ pub struct Screen {
     projection: c3d::C3D_Mtx,
 }
 
+enum RightCloudExposure {
+    Pending,
+    Allocated(Box<c3d::C3D_Tex>),
+    Unavailable,
+}
+
 pub struct Gpu {
     top: Screen,
     /// The top screen's right eye.
@@ -126,6 +132,7 @@ pub struct Gpu {
     bound_textured: Option<(Env, Option<u32>, bool)>,
     cloud_shadow: cloud_shadow::Pass,
     cloud_exposure: Option<Box<c3d::C3D_Tex>>,
+    right_cloud_exposure: RightCloudExposure,
     bound_additive: Option<bool>,
     /// Draw calls this frame.
     pub draws: u32,
@@ -425,6 +432,7 @@ impl Gpu {
                 bound_textured: None,
                 cloud_shadow,
                 cloud_exposure,
+                right_cloud_exposure: RightCloudExposure::Pending,
                 bound_additive: None,
                 draws: 0,
                 reflection,
@@ -520,11 +528,19 @@ impl Gpu {
                 0.0,
             );
         }
+        let has_exposure =
+            if let RightCloudExposure::Allocated(tex) = &mut self.right_cloud_exposure {
+                unsafe { c3d::C3D_TexBind(1, tex.as_mut()) };
+                true
+            } else {
+                false
+            };
         self.unbind();
         for &c in &calls {
             match c {
                 Call::Pass(opaque) => self.depth_test(opaque),
-                Call::Draw(state, first, n) => unsafe {
+                Call::Draw(mut state, first, n) => unsafe {
+                    state.cloud_shadow &= has_exposure;
                     self.bind(state);
                     c3d::C3D_DrawElements(
                         ctru::GPU_TRIANGLES,
@@ -975,13 +991,30 @@ impl Renderer for Gpu {
         let Some(tex) = &mut self.cloud_exposure else {
             return false;
         };
-        let Some(atlas) = self.cloud_shadow.prepare(camera, clouds) else {
+        let half = self.stereo / 2.0;
+        let Some(atlas) = self.cloud_shadow.prepare_left(camera, clouds, half) else {
             return false;
         };
-        unsafe {
-            upload_cloud_exposure(tex.as_mut(), atlas);
-            c3d::C3D_TexBind(1, tex.as_mut());
+        // The frame's synchronous begin has finished GPU use of both old atlases.
+        unsafe { upload_cloud_exposure(tex.as_mut(), atlas) };
+        if half > 0.0 {
+            if matches!(self.right_cloud_exposure, RightCloudExposure::Pending) {
+                // Keep the second texture out of the mono allocation budget.
+                self.right_cloud_exposure = match unsafe { new_cloud_exposure() } {
+                    Some(tex) => RightCloudExposure::Allocated(tex),
+                    None => {
+                        eprintln!("right-eye cloud shadows disabled: insufficient texture memory");
+                        RightCloudExposure::Unavailable
+                    }
+                };
+            }
+            if let RightCloudExposure::Allocated(right) = &mut self.right_cloud_exposure {
+                let atlas = self.cloud_shadow.prepare_right(camera, clouds, half);
+                unsafe { upload_cloud_exposure(right.as_mut(), atlas) };
+            }
         }
+        // Rebind after upload to invalidate the GPU's texture cache.
+        unsafe { c3d::C3D_TexBind(1, tex.as_mut()) };
         true
     }
 

@@ -1833,6 +1833,7 @@ fn prepare_cloud_shadows(c: &mut Ctx<'_, impl Renderer>, draws: &mut [CloudDraw]
                 flip: p.flip,
                 opacity: p.tint.a,
                 screen: [draw.at.0, draw.at.1],
+                stereo_depth: stereo_depth(p.position[2] - layer_z(&c.s.world)),
                 receiver: draw.shadow.map(|r| r.index),
             });
         }

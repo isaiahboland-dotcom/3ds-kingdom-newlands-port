@@ -6,6 +6,7 @@
 
 - Shade cloud highlights using the authored tight sprite meshes and the
   original two-tap shadow depth comparison.
+- Prepare separate cloud shadow masks for the two eyes in 3DS stereo mode.
 
 - Render the authored stratus and cumulus decks with weather density, wind,
   parallax, and red-moon color channels when an enhanced pack is installed.

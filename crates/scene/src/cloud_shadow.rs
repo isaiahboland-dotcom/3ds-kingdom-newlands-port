@@ -115,6 +115,8 @@ pub struct Sprite {
     pub(crate) flip: bool,
     pub(crate) opacity: f32,
     pub(crate) screen: [f32; 2],
+    /// The same disparity weight as the cloud's draw command.
+    pub(crate) stereo_depth: f32,
     pub(crate) receiver: Option<usize>,
 }
 
@@ -214,8 +216,13 @@ impl Pass {
     }
 
     /// Build the shared caster depth and receiver layout, then rasterize the
-    /// center view.
-    pub fn prepare(&mut self, camera: Camera, clouds: &[Sprite]) -> Option<Atlas<'_>> {
+    /// left eye. A zero half-separation draws the ordinary 2D view.
+    pub fn prepare_left(
+        &mut self,
+        camera: Camera,
+        clouds: &[Sprite],
+        half_separation: f32,
+    ) -> Option<Atlas<'_>> {
         self.masks.clear();
         self.prepare_depth(camera, clouds)?;
         let mut shelf = Shelf::default();
@@ -226,7 +233,8 @@ impl Pass {
             let Some(art) = self.art.iter().find(|art| art.id == sprite.id) else {
                 continue;
             };
-            let (x, y) = screen_bounds(art, *sprite);
+            let disparity = (half_separation * sprite.stereo_depth).abs();
+            let (x, y) = screen_bounds(art, *sprite, disparity);
             self.masks.resize(self.masks.len().max(receiver + 1), None);
             self.masks[receiver] = shelf.place(x, y);
         }
@@ -236,23 +244,38 @@ impl Pass {
         }
         self.atlas
             .resize(usize::from(ATLAS_WIDTH) * usize::from(height), 255);
-        Some(self.rasterize(camera, clouds))
+        Some(self.rasterize_eye(camera, clouds, -half_separation))
     }
 
-    fn rasterize(&mut self, camera: Camera, clouds: &[Sprite]) -> Atlas<'_> {
+    /// Reuse the depth, layout and CPU pixels from this frame's left-eye
+    /// preparation. The backend uploads the left atlas before calling this.
+    pub fn prepare_right(
+        &mut self,
+        camera: Camera,
+        clouds: &[Sprite],
+        half_separation: f32,
+    ) -> Atlas<'_> {
+        self.rasterize_eye(camera, clouds, half_separation)
+    }
+
+    fn rasterize_eye(&mut self, camera: Camera, clouds: &[Sprite], eye: f32) -> Atlas<'_> {
         self.atlas.fill(255);
         for sprite in clouds {
             let Some(mask) = sprite.receiver.and_then(|i| self.mask(i)) else {
                 continue;
             };
             if let Some(art) = self.art.iter().find(|art| art.id == sprite.id) {
+                // Shift only the receiver's screen-space geometry. Its
+                // world-space shadow coordinates and the caster map are shared.
+                let mut shifted = *sprite;
+                shifted.screen[0] += eye * sprite.stereo_depth;
                 receive(
                     &self.depth,
                     &mut self.atlas,
                     &mut self.projected,
                     camera,
                     art,
-                    *sprite,
+                    shifted,
                     mask,
                 );
             }
@@ -314,11 +337,11 @@ impl Shelf {
     }
 }
 
-fn screen_bounds(art: &Art, sprite: Sprite) -> (Range<i32>, Range<i32>) {
+fn screen_bounds(art: &Art, sprite: Sprite, disparity: f32) -> (Range<i32>, Range<i32>) {
     let pivot = art.left_pivot(sprite.flip) * sprite.scale[0];
-    let left = (sprite.screen[0]) - pivot;
+    let left = (sprite.screen[0] - disparity) - pivot;
     let top = sprite.screen[1] - art.sprite.py * sprite.scale[1];
-    let right = (sprite.screen[0]) - pivot + f32::from(art.sprite.w) * sprite.scale[0];
+    let right = (sprite.screen[0] + disparity) - pivot + f32::from(art.sprite.w) * sprite.scale[0];
     let bottom = top + f32::from(art.sprite.h) * sprite.scale[1];
     let x = 0..crate::top::W as i32;
     let y = 0..crate::top::H as i32;
@@ -478,7 +501,7 @@ fn receive(
 ) {
     let geometry = art.geometry();
     project_sprite(projected, camera, &geometry, sprite);
-    let (x_clip, y_clip) = screen_bounds(art, sprite);
+    let (x_clip, y_clip) = screen_bounds(art, sprite, 0.0);
     let [tile_x, tile_y] = mask.tile.map(i32::from);
     let [ox, oy] = mask.origin.map(i32::from);
     let left = sprite.screen[0] - art.left_pivot(sprite.flip) * sprite.scale[0];
@@ -553,7 +576,7 @@ mod tests {
             flip: false,
             opacity: 1.0,
             screen: [200.0, 120.0],
-
+            stereo_depth: 1.0,
             receiver,
         }
     }
@@ -637,20 +660,20 @@ mod tests {
         let mut caster = sprite(1, 52.31, None);
         let receiver = sprite(2, 44.31, Some(0));
         caster.opacity = 0.499;
-        let atlas = pass.prepare(camera, &[caster, receiver]).unwrap();
+        let atlas = pass.prepare_left(camera, &[caster, receiver], 0.0).unwrap();
         assert_eq!((at(&atlas, 12, 16), at(&atlas, 52, 16)), (255, 255));
 
         caster.opacity = 0.5;
-        let atlas = pass.prepare(camera, &[caster, receiver]).unwrap();
+        let atlas = pass.prepare_left(camera, &[caster, receiver], 0.0).unwrap();
         assert_eq!((at(&atlas, 12, 16), at(&atlas, 52, 16)), (0, 255));
         caster.flip = true;
-        let atlas = pass.prepare(camera, &[caster, receiver]).unwrap();
+        let atlas = pass.prepare_left(camera, &[caster, receiver], 0.0).unwrap();
         assert_eq!((at(&atlas, 12, 16), at(&atlas, 52, 16)), (255, 0));
         let mut mirrored = receiver;
         mirrored.flip = true;
-        let atlas = pass.prepare(camera, &[caster, mirrored]).unwrap();
+        let atlas = pass.prepare_left(camera, &[caster, mirrored], 0.0).unwrap();
         assert_eq!((at(&atlas, 12, 16), at(&atlas, 52, 16)), (255, 0));
-        let atlas = pass.prepare(camera, &[receiver]).unwrap();
+        let atlas = pass.prepare_left(camera, &[receiver], 0.0).unwrap();
         assert_eq!(at(&atlas, 12, 16), 255, "no stale mask or self-shadowing");
     }
 
@@ -669,11 +692,11 @@ mod tests {
         let near = sprite(1, 52.31, None);
         let far = sprite(1, 42.31, None);
         let recv = sprite(2, 44.31, Some(0));
-        let a = pass.prepare(camera, &[near, far, recv]).unwrap();
+        let a = pass.prepare_left(camera, &[near, far, recv], 0.0).unwrap();
         assert_eq!((at(&a, 30, 16), at(&a, 31, 16)), (0, 255));
-        let b = pass.prepare(camera, &[far, near, recv]).unwrap();
+        let b = pass.prepare_left(camera, &[far, near, recv], 0.0).unwrap();
         assert_eq!(at(&b, 30, 16), 0);
-        let c = pass.prepare(camera, &[far, recv]).unwrap();
+        let c = pass.prepare_left(camera, &[far, recv], 0.0).unwrap();
         assert_eq!(at(&c, 30, 16), 255);
     }
 
@@ -701,13 +724,13 @@ mod tests {
         let camera = Camera::new(ORIGIN, 11.0);
         let caster = sprite(1, 52.31, None);
         let receiver = sprite(2, 44.31, Some(0));
-        let a = pass.prepare(camera, &[caster, receiver]).unwrap();
+        let a = pass.prepare_left(camera, &[caster, receiver], 0.0).unwrap();
         assert_eq!((at(&a, 12, 16), at(&a, 52, 16)), (0, 255));
 
         let solid_caster = sprite(2, 52.31, None);
         let tight_receiver = sprite(3, 44.31, Some(0));
         let b = pass
-            .prepare(camera, &[solid_caster, tight_receiver])
+            .prepare_left(camera, &[solid_caster, tight_receiver], 0.0)
             .unwrap();
         assert_eq!((at(&b, 12, 16), at(&b, 52, 16)), (0, 255));
     }
@@ -727,10 +750,75 @@ mod tests {
         let mut receiver = sprite(2, 44.31, Some(0));
         receiver.scale = [16.0; 2];
         receiver.opacity = 0.49;
-        let atlas = pass.prepare(camera, &[caster, receiver]).unwrap();
+        let atlas = pass.prepare_left(camera, &[caster, receiver], 0.0).unwrap();
         assert_eq!((at(&atlas, 4, 8), at(&atlas, 12, 8)), (0, 255));
         assert_eq!(screen_exposure(&pass, 196, 120), 0);
         assert_eq!(screen_exposure(&pass, 204, 120), 255);
+    }
+
+    #[test]
+    fn fractional_disparity_samples_each_eye_on_its_own_pixel_grid() {
+        let mut pass = Pass::default();
+        pass.insert(
+            1,
+            &art(64, 32),
+            None,
+            (0..64 * 32).map(|i| if i % 64 < 32 { 255 } else { 0 }),
+        );
+        pass.insert(2, &art(1, 1), None, [191].into_iter());
+        let camera = Camera::new(ORIGIN, 11.0);
+        let mut caster = sprite(1, 52.31, None);
+        caster.position[0] = 0.5 / PPU;
+        let mut receiver = sprite(2, 44.31, Some(0));
+        receiver.scale = [16.0; 2];
+        receiver.opacity = 0.49;
+        receiver.stereo_depth = 0.5;
+        let clouds = [caster, receiver];
+
+        let left = pass
+            .prepare_left(camera, &clouds, 0.5)
+            .unwrap()
+            .pixels
+            .to_vec();
+        let depth = pass.depth.clone();
+        let layout = pass.mask(0).unwrap();
+        assert_eq!(screen_exposure(&pass, 201, 120), 255);
+
+        let right = pass.prepare_right(camera, &clouds, 0.5);
+        assert_ne!(right.pixels, left);
+        assert_eq!(screen_exposure(&pass, 201, 120), 0);
+        assert_eq!(pass.depth, depth);
+        assert_eq!(pass.mask(0).unwrap().tile, layout.tile);
+        assert_eq!(pass.mask(0).unwrap().origin, layout.origin);
+
+        let mono = pass
+            .prepare_left(camera, &clouds, 0.0)
+            .unwrap()
+            .pixels
+            .to_vec();
+        assert_eq!(pass.prepare_right(camera, &clouds, 0.0).pixels, mono);
+    }
+
+    #[test]
+    fn shared_atlas_layout_keeps_pixels_visible_only_to_one_eye() {
+        let mut pass = Pass::default();
+        pass.insert(1, &art(64, 32), None, std::iter::repeat_n(255, 64 * 32));
+        pass.insert(2, &art(4, 4), None, std::iter::repeat_n(191, 16));
+        let camera = Camera::new(ORIGIN, 11.0);
+        let caster = sprite(1, 52.31, None);
+        let mut receiver = sprite(2, 44.31, Some(0));
+        receiver.screen[0] = -1.75;
+        receiver.opacity = 0.49;
+        let clouds = [caster, receiver];
+
+        assert!(pass.prepare_left(camera, &clouds, 0.0).is_none());
+        let left = pass.prepare_left(camera, &clouds, 2.0).unwrap();
+        assert!(left.pixels.iter().all(|&pixel| pixel == 255));
+        assert_eq!(pass.mask(0).unwrap().origin, [0, 118]);
+        pass.prepare_right(camera, &clouds, 2.0);
+        assert_eq!(screen_exposure(&pass, 0, 120), 0);
+        assert!(pass.prepare_left(camera, &clouds, 0.0).is_none());
+        assert!(pass.mask(0).is_none());
     }
 
     #[test]
