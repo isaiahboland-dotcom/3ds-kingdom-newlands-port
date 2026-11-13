@@ -16,6 +16,7 @@ pub const VERSION: u16 = 5;
 const MAGIC: [u8; 4] = *b"KNL1";
 const EXTENSIONS: [u8; 4] = *b"KNEX";
 const PORTALS: [u8; 4] = *b"PORT";
+const SQUID: [u8; 4] = *b"SQID";
 
 /// The slot names the backends store under. orig: `"AUTO"`, `"unlocks"`.
 pub const GAME_SLOT: &str = "game";
@@ -84,9 +85,16 @@ pub fn save_game(g: &GameState, world: u32) -> Vec<u8> {
     let mut out = header(world);
     // Serializing plain data into a Vec can't fail.
     out.extend(postcard::to_allocvec(g).expect("plain-data serialization cannot fail"));
-    if !g.greed.portal_visuals().is_empty() {
+    let portals = g.greed.portal_visuals();
+    let squids: Vec<_> = g.greed.squid_states().collect();
+    if !portals.is_empty() || !squids.is_empty() {
         out.extend_from_slice(&EXTENSIONS);
-        write_extension(&mut out, PORTALS, g.greed.portal_visuals());
+    }
+    if !portals.is_empty() {
+        write_extension(&mut out, PORTALS, portals);
+    }
+    if !squids.is_empty() {
+        write_extension(&mut out, SQUID, &squids);
     }
     out
 }
@@ -121,6 +129,7 @@ fn load_extensions(
         .filter(|data| !data.is_empty())
         .ok_or(LoadError::Corrupt)?;
     let mut seen_portals = false;
+    let mut seen_squid = false;
     while !rest.is_empty() {
         let (header, data) = rest.split_at_checked(8).ok_or(LoadError::Corrupt)?;
         let length = u32::from_le_bytes(header[4..].try_into().expect("header size")) as usize;
@@ -136,7 +145,13 @@ fn load_extensions(
                 }
                 seen_portals = true;
             }
-            tag if tag == PORTALS => return Err(LoadError::Corrupt),
+            tag if tag == SQUID && !seen_squid => {
+                if !game.greed.restore_squid_states(extension(payload)?, world) {
+                    return Err(LoadError::Corrupt);
+                }
+                seen_squid = true;
+            }
+            tag if tag == PORTALS || tag == SQUID => return Err(LoadError::Corrupt),
             _ => return Err(LoadError::Format),
         }
         rest = next;

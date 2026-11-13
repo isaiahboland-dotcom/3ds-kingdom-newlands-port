@@ -24,6 +24,7 @@ pub fn load_world(assets: &std::path::Path) -> Result<(WorldData, u32), String> 
     let path = assets.join("world.bin");
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let id = game::save::fingerprint(&bytes);
-    let world = postcard::from_bytes(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut world = postcard::from_bytes(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    scene::squid::install(assets, &mut world, id)?;
     Ok((world, id))
 }

@@ -66,6 +66,8 @@ pub struct Draw {
     pub angle: f32,
     /// orig: `SpriteFX` `recolorA` / `recolorB`.
     pub recolor: Option<(Color, Color)>,
+    /// Mix this RGB into the lit sprite without changing its coverage.
+    pub overlay: Option<Color>,
     pub additive: bool,
     /// Filtered smoothly when scaled (glows); everything else stays pixel-sharp.
     pub smooth: bool,
@@ -81,6 +83,7 @@ impl Draw {
             scale: 1.0,
             angle: 0.0,
             recolor: None,
+            overlay: None,
             additive: false,
             smooth: false,
         }

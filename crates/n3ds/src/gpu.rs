@@ -66,6 +66,7 @@ type Quad = [Vertex; 4];
 struct State {
     /// Texture page, or untextured.
     page: Option<u16>,
+    overlay: Option<u32>,
     additive: bool,
     /// Linear filtering (scaled glows).
     smooth: bool,
@@ -119,6 +120,7 @@ pub struct Gpu {
     pub painter: bool,
     bound_page: Option<(u16, bool)>,
     bound_textured: Option<Env>,
+    bound_overlay: Option<Option<u32>>,
     bound_additive: Option<bool>,
     /// Draw calls this frame.
     pub draws: u32,
@@ -303,6 +305,7 @@ impl Gpu {
                 painter: false,
                 bound_page: None,
                 bound_textured: None,
+                bound_overlay: None,
                 bound_additive: None,
                 draws: 0,
                 reflection,
@@ -344,6 +347,7 @@ impl Gpu {
     fn unbind(&mut self) {
         self.bound_page = None;
         self.bound_textured = None;
+        self.bound_overlay = None;
         self.bound_additive = None;
     }
 
@@ -514,6 +518,23 @@ impl Gpu {
             }
             self.bound_textured = Some(mode);
         }
+        if self.bound_overlay != Some(state.overlay) {
+            let env = c3d::C3D_GetTexEnv(1);
+            // Stage 0 computes coverage. Stage 1 changes RGB only.
+            c3d::C3D_TexEnvInit(env);
+            if let Some(overlay) = state.overlay {
+                c3d::C3D_TexEnvSrc(
+                    env, c3d::C3D_RGB, ctru::GPU_CONSTANT, ctru::GPU_PREVIOUS, ctru::GPU_CONSTANT,
+                );
+                c3d::C3D_TexEnvOpRgb(
+                    env, ctru::GPU_TEVOP_RGB_SRC_COLOR, ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                    ctru::GPU_TEVOP_RGB_SRC_ALPHA,
+                );
+                c3d::C3D_TexEnvFunc(env, c3d::C3D_RGB, ctru::GPU_INTERPOLATE);
+                c3d::C3D_TexEnvColor(env, overlay);
+            }
+            self.bound_overlay = Some(state.overlay);
+        }
         if let Some(p) = state.page {
             if self.bound_page != Some((p, state.smooth)) {
                 let tex = self.pages[p as usize].as_mut();
@@ -587,6 +608,7 @@ impl Gpu {
         self.draw(
             State {
                 page: None,
+                overlay: None,
                 additive: false,
                 smooth: false,
             },
@@ -599,6 +621,7 @@ impl Gpu {
             self.draw(
                 State {
                     page: Some(p as u16),
+                    overlay: None,
                     additive: false,
                     smooth: false,
                 },
@@ -697,6 +720,7 @@ impl Gpu {
         let uv = [(ul, vt), (ur, vt), (ur, vb), (ul, vb)];
         let state = State {
             page: Some(s.page),
+            overlay: d.overlay.map(|overlay| u32::from_le_bytes(color(overlay))),
             additive: d.additive,
             smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0 || authored),
         };
@@ -712,6 +736,7 @@ impl Gpu {
         ];
         let state = State {
             page: None,
+            overlay: None,
             additive,
             smooth: false,
         };
@@ -755,6 +780,7 @@ impl Renderer for Gpu {
         ];
         let state = State {
             page: Some(s.page),
+            overlay: None,
             additive: false,
             smooth: false,
         };
@@ -807,6 +833,7 @@ impl Renderer for Gpu {
         const N: usize = 16;
         let state = State {
             page: None,
+            overlay: None,
             additive: false,
             smooth: false,
         };
@@ -826,6 +853,7 @@ impl Renderer for Gpu {
         let r1 = radius + thickness / 2.0;
         let state = State {
             page: None,
+            overlay: None,
             additive: false,
             smooth: false,
         };
@@ -869,6 +897,7 @@ impl Renderer for Gpu {
         ];
         let state = State {
             page: Some(page),
+            overlay: None,
             additive: true,
             smooth: false,
         };

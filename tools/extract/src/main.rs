@@ -239,11 +239,17 @@ fn export_scenes(
     );
     let bytes = postcard::to_allocvec(&world).map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), &bytes).map_err(|e| e.to_string())?;
+    let world_id = game::save::fingerprint(&bytes);
+    if let Some(squid) = &mut world.squid {
+        squid.set_animation(&animations);
+    }
+    let squid = scene::squid::encode(&world, world_id)?;
+    std::fs::write(out.join(scene::squid::FILENAME), squid).map_err(|e| e.to_string())?;
     let authored = scene::authored::AssetAnimation {
         prefabs,
         clips: animations,
     };
-    let animation = authored.encode(game::save::fingerprint(&bytes))?;
+    let animation = authored.encode(world_id)?;
     std::fs::write(out.join(scene::authored::FILENAME), animation).map_err(|e| e.to_string())?;
     println!(
         "world: {} blocks, {} protos, {} scatterables, {} islands, {} lights, {} days ({} KiB)",

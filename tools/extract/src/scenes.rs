@@ -276,6 +276,7 @@ pub fn export_file(path: &Path, r: &Resolver) -> Result<Value, String> {
             .collect();
         json!({
             "id": go_id,
+            "transform_id": tf.map(|t| t.id),
             "name": go.body.get("m_Name").cloned().unwrap_or(Value::Null),
             "active": go.body.get("m_IsActive").and_then(Value::as_i64) != Some(0),
             "tag": go.body.get("m_TagString").cloned().unwrap_or(Value::Null),

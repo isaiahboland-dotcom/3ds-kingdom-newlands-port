@@ -14,6 +14,7 @@ pub mod data;
 pub mod director;
 pub mod dog;
 pub mod farm;
+pub mod flight;
 pub mod grass;
 pub mod greed;
 pub mod hermits;

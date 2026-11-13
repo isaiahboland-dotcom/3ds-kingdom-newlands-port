@@ -1007,6 +1007,9 @@ pub struct WorldData {
     pub water: WaterDef,
     pub audio: AudioDef,
     pub fire: FireStyleDef,
+    /// Optional authored squid body, collider and animation timing metadata.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub squid: Option<crate::flight::AssetData>,
 }
 
 pub type SoundId = u16;
@@ -1478,4 +1481,13 @@ pub struct WallDef {
     pub minimum_intact: f32,
     /// What's left when it falls. orig: `wreckPrefab`.
     pub wreck: Option<ProtoId>,
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ObstacleDef {
+    /// Collider Transform origin, used by Squid.Chase when comparing obstacle/citizen X.
+    pub origin: [f32; 2],
+    /// Polygon vertices after all child transforms, before the placed object's transform.
+    pub points: Vec<[f32; 2]>,
 }

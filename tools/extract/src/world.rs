@@ -14,7 +14,7 @@ use game::data::{
     UpgradeDef, WorldData, LIGHT_COLORS, LIGHT_FLOATS, TILE_SCATTER_FLAGS,
 };
 use game::data::{Curve, PortalDef, WallDef, WaveDef};
-use scene::authored::{PartVisual, PrefabVisual, TransformNode};
+use scene::authored::{Affine2, PartVisual, PrefabVisual, TransformNode};
 use serde_json::{Map, Value};
 
 /// Components deriving from `Payable` (for overlap regions and half widths).
@@ -223,6 +223,7 @@ struct Builder<'a> {
     inp: &'a Inputs<'a>,
     world: WorldData,
     visuals: Vec<Result<PrefabVisual, String>>,
+    obstacles: Vec<Result<Vec<game::data::ObstacleDef>, String>>,
     sprite_ids: HashMap<String, SpriteId>,
     prefab_protos: HashMap<String, ProtoId>,
     recolor: HashSet<String>,
@@ -261,6 +262,7 @@ impl<'a> Builder<'a> {
         let id = self.world.protos.len() as ProtoId;
         self.world.protos.push(Proto::default());
         self.visuals.push(Ok(PrefabVisual::default()));
+        self.obstacles.push(Ok(Vec::new()));
         id
     }
 
@@ -454,6 +456,8 @@ impl<'a> Builder<'a> {
             &mut part_ids,
         );
         self.visuals[id as usize] = authored_prefab(node, parts.len());
+        self.obstacles[id as usize] =
+            obstacle_shapes(node).map_err(|e| format!("{} obstacle: {e}", node["name"]));
 
         let root_sprite = comp(node, "SpriteRenderer").and_then(|sr| {
             let r = sr.get("m_Sprite");
@@ -1944,6 +1948,7 @@ pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>, Vec<PrefabVisual>)
         inp,
         world: WorldData::default(),
         visuals: Vec::new(),
+        obstacles: Vec::new(),
         sprite_ids: HashMap::new(),
         prefab_protos: HashMap::new(),
         recolor: recolor_materials(inp.assets_dir),
@@ -2217,8 +2222,354 @@ pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>, Vec<PrefabVisual>)
             .collect();
     }
     b.world.audio = found.audio;
+    b.world.squid = Some(game::flight::AssetData {
+        definition: authored_squid(inp)?,
+        obstacles: b.obstacles.into_iter().collect::<Result<_, _>>()?,
+        ..Default::default()
+    });
     let visuals = b.visuals.into_iter().collect::<Result<_, _>>()?;
     Ok((b.world, found.clip_paths, visuals))
+}
+
+fn authored_squid(inp: &Inputs) -> Result<game::flight::Definition, String> {
+    let settings = inp
+        .assets_dir
+        .parent()
+        .ok_or("missing project directory")?
+        .join("ProjectSettings");
+    let physics = read_physics_settings(&settings, "Physics2DSettings.asset", "Physics2DSettings")?;
+    let time = read_physics_settings(&settings, "TimeManager.asset", "TimeManager")?;
+    let material = read_physics_settings(
+        &inp.assets_dir.join("PhysicsMaterial2D"),
+        "Walls.physicsMaterial2D",
+        "PhysicsMaterial2D",
+    )?;
+    if physics_number(&material, "friction")? != 0.0
+        || physics_number(&material, "bounciness")? != 0.0
+    {
+        return Err("unsupported nonzero wall contact material".into());
+    }
+    let squid = inp
+        .prefabs
+        .get("Resources/prefabs/enemies/Squid.prefab")
+        .ok_or("missing authored Squid prefab")?;
+    squid_definition(squid, &physics, &time, squid_ground(inp.main)?)
+}
+
+/// Preserve the actual Obstacles-layer geometry independently of attack targets.
+fn obstacle_shapes(node: &Value) -> Result<Vec<game::data::ObstacleDef>, String> {
+    fn walk(
+        node: &Value,
+        at: Affine2,
+        out: &mut Vec<game::data::ObstacleDef>,
+    ) -> Result<(), String> {
+        if node["active"].as_bool() == Some(false) {
+            return Ok(());
+        }
+        if node["layer"].as_u64() == Some(20) {
+            for c in node["components"].as_array().into_iter().flatten() {
+                let ty = c["type"].as_str().unwrap_or("");
+                if !ty.ends_with("Collider2D") {
+                    continue;
+                }
+                let f = c["fields"].as_object().ok_or("missing obstacle fields")?;
+                if !flag(f, "m_Enabled") {
+                    continue;
+                }
+                if flag(f, "m_UsedByComposite")
+                    || flag(f, "m_UsedByEffector")
+                    || flag(f, "m_IsTrigger")
+                {
+                    return Err("unsupported obstacle composite, effector or trigger".into());
+                }
+                if asset_path(f.get("m_Material"))
+                    != Some("PhysicsMaterial2D/Walls.physicsMaterial2D")
+                {
+                    return Err("unsupported obstacle material".into());
+                }
+                let offset = physics_xy(&f["m_Offset"])?;
+                let paths: Vec<Vec<[f32; 2]>> = match ty {
+                    "PolygonCollider2D" => f["m_Points"]["m_Paths"]
+                        .as_array()
+                        .ok_or("missing obstacle polygon")?
+                        .iter()
+                        .map(|path| {
+                            path.as_array()
+                                .ok_or_else(|| "missing obstacle vertices".to_owned())?
+                                .iter()
+                                .map(physics_xy)
+                                .collect()
+                        })
+                        .collect::<Result<_, _>>()?,
+                    "BoxCollider2D" => {
+                        let size = physics_xy(&f["m_Size"])?;
+                        if size.iter().any(|v| *v <= 0.0) {
+                            return Err("invalid obstacle box".into());
+                        }
+                        vec![vec![
+                            [-size[0] * 0.5, -size[1] * 0.5],
+                            [size[0] * 0.5, -size[1] * 0.5],
+                            [size[0] * 0.5, size[1] * 0.5],
+                            [-size[0] * 0.5, size[1] * 0.5],
+                        ]]
+                    }
+                    _ => return Err(format!("unsupported obstacle collider {ty}")),
+                };
+                for path in paths {
+                    let points: Vec<_> = path
+                        .iter()
+                        .map(|v| at.point([v[0] + offset[0], v[1] + offset[1]]))
+                        .collect();
+                    if points.len() < 3 || points.iter().flatten().any(|v| !v.is_finite()) {
+                        return Err("invalid obstacle vertices".into());
+                    }
+                    out.push(game::data::ObstacleDef {
+                        origin: at.translation,
+                        points,
+                    });
+                }
+            }
+        }
+        for child in node["children"].as_array().into_iter().flatten() {
+            walk(
+                child,
+                at.compose(Affine2::from_pose(local_pose(child, None))),
+                out,
+            )?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(node, Affine2::IDENTITY, &mut out)?;
+    Ok(out)
+}
+
+fn squid_definition(
+    node: &Value,
+    physics: &Value,
+    time: &Value,
+    ground_height: f32,
+) -> Result<game::flight::Definition, String> {
+    let squid = comp(node, "Squid").ok_or("missing Squid component")?;
+    let body = comp(node, "Rigidbody2D").ok_or("missing Squid body")?;
+    let mover = comp(node, "Mover").ok_or("missing Squid mover")?;
+    let field = |f: &Map<String, Value>, key: &str| -> Result<f32, String> {
+        f.get(key)
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("missing/invalid Squid {key}"))
+    };
+    let physical = node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|n| n["tag"] == "PhysicalCollider")
+        .ok_or("missing Squid physical collider child")?;
+    let pose = local_pose(physical, None);
+    let circle = comp(physical, "CircleCollider2D").ok_or("missing Squid physical circle")?;
+    let sensor = comp(node, "PolygonCollider2D").ok_or("missing Squid hit sensor")?;
+    if num(body, "m_BodyType") != 0.0
+        || !flag(body, "m_Simulated")
+        || flag(body, "m_UseAutoMass")
+        || num(body, "m_Constraints") != 4.0
+        || num(body, "m_CollisionDetection") != 0.0
+        || !default_physics_material(&body["m_Material"])
+        || !default_physics_material(&circle["m_Material"])
+        || !default_physics_material(&physics["m_DefaultMaterial"])
+        || pose.position != [0.0; 3]
+        || pose.rotation != [0.0, 0.0, 0.0, 1.0]
+        || pose.scale != [1.0; 3]
+        || !flag(circle, "m_Enabled")
+        || flag(circle, "m_IsTrigger")
+        || flag(circle, "m_UsedByComposite")
+        || flag(circle, "m_UsedByEffector")
+        || !flag(sensor, "m_IsTrigger")
+        || !flag(sensor, "m_Enabled")
+        || physical["layer"].as_u64() != Some(21)
+    {
+        return Err("unsupported Squid rigidbody/collider topology or material".into());
+    }
+    for (a, b, collides) in [
+        (21, 0, true),
+        (21, 20, true),
+        (17, 0, true),
+        (17, 20, false),
+    ] {
+        if physics_layers_collide(physics, a, b)? != collides
+            || physics_layers_collide(physics, b, a)? != collides
+        {
+            return Err("unsupported Squid chase/retreat collision layers".into());
+        }
+    }
+    if physics_xy(&physics["m_Gravity"])?[0] != 0.0
+        || physics_number(physics, "m_AutoSimulation")? != 1.0
+        || physics_number(time, "m_TimeScale")? != 1.0
+    {
+        return Err("unsupported Squid simulation mode".into());
+    }
+    let positions = squid["carryPositions"]
+        .as_array()
+        .ok_or("missing Squid carry positions")?;
+    if positions.is_empty() || positions.len() > u8::MAX as usize {
+        return Err("invalid Squid carry capacity".into());
+    }
+    for reference in positions {
+        let id = reference["local"]
+            .as_i64()
+            .ok_or("unlinked Squid carry position")?;
+        if !node["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|n| n["transform_id"].as_i64() == Some(id))
+        {
+            return Err("missing direct Squid carry position".into());
+        }
+    }
+    let iterations = |key| -> Result<u8, String> {
+        physics[key]
+            .as_u64()
+            .filter(|v| *v > 0 && *v <= 255)
+            .map(|v| v as u8)
+            .ok_or_else(|| format!("invalid Squid {key}"))
+    };
+    let hit = &squid["hitBox"];
+    let d = game::flight::Definition {
+        mass: field(body, "m_Mass")?,
+        gravity: -physics_xy(&physics["m_Gravity"])?[1],
+        gravity_scale: field(body, "m_GravityScale")?,
+        // Squid.OnEnable overrides the authored body drag to .5 every spawn.
+        linear_drag: 0.5,
+        angular_drag: field(body, "m_AngularDrag")?,
+        fixed_step: physics_number(time, "Fixed Timestep")?,
+        max_linear_speed: physics_number(physics, "m_MaxTranslationSpeed")?,
+        max_acceleration_per_frame: field(mover, "maxAccelerationPerFrame")?,
+        fly_lift: field(squid, "flyLift")?,
+        fly_duration: field(squid, "flyDuration")?,
+        fly_cooldown: field(squid, "flyCooldown")?,
+        base_altitude: field(squid, "baseAltitude")?,
+        move_speed: field(squid, "moveSpeed")?,
+        scan_range: field(squid, "scanRange")?,
+        attack_cooldown: field(squid, "attackCooldown")?,
+        physical_radius: field(circle, "m_Radius")?,
+        physical_offset: physics_xy(&circle["m_Offset"])?,
+        dead_radius: field(squid, "deadRadius")?,
+        grab_bounds: [
+            physics_number(hit, "x")?,
+            physics_number(hit, "y")?,
+            physics_number(hit, "width")?,
+            physics_number(hit, "height")?,
+        ],
+        carry_capacity: positions.len() as u8,
+        spawn_overlay_color: ["r", "g", "b", "a"]
+            .map(|key| physics_number(&squid["spawnOverlayColor"], key))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| "invalid overlay color")?,
+        ground_height,
+        // Unity 2017.1 null collider/body/global material defaults.
+        friction: 0.4,
+        restitution: 0.0,
+        contact_offset: physics_number(physics, "m_DefaultContactOffset")?,
+        velocity_threshold: physics_number(physics, "m_VelocityThreshold")?,
+        max_linear_correction: physics_number(physics, "m_MaxLinearCorrection")?,
+        baumgarte: physics_number(physics, "m_BaumgarteScale")?,
+        velocity_iterations: iterations("m_VelocityIterations")?,
+        position_iterations: iterations("m_PositionIterations")?,
+    };
+    if !d.valid() {
+        return Err("invalid Squid flight definition".into());
+    }
+    Ok(d)
+}
+
+fn read_physics_settings(dir: &Path, name: &str, key: &str) -> Result<Value, String> {
+    let text = std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+    let body = text
+        .lines()
+        .filter(|l| !l.starts_with('%') && !l.starts_with("---"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value: Value = serde_yaml::from_str(&body).map_err(|e| format!("{name}: {e}"))?;
+    Ok(value[key].clone())
+}
+
+fn physics_number(v: &Value, key: &str) -> Result<f32, String> {
+    v[key]
+        .as_f64()
+        .map(|v| v as f32)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| format!("missing or invalid physics {key}"))
+}
+
+fn physics_xy(v: &Value) -> Result<[f32; 2], String> {
+    Ok([physics_number(v, "x")?, physics_number(v, "y")?])
+}
+
+fn default_physics_material(v: &Value) -> bool {
+    v.is_null() || v["fileID"].as_i64() == Some(0)
+}
+
+fn physics_layers_collide(physics: &Value, a: u32, b: u32) -> Result<bool, String> {
+    if a >= 32 || b >= 32 {
+        return Err("invalid physics layer".into());
+    }
+    let matrix = physics["m_LayerCollisionMatrix"]
+        .as_str()
+        .ok_or("missing physics layer collision matrix")?;
+    if matrix.len() != 256 || !matrix.is_ascii() {
+        return Err("invalid physics layer collision matrix".into());
+    }
+    let row = matrix
+        .get(a as usize * 8..a as usize * 8 + 8)
+        .ok_or("invalid physics layer collision matrix")?;
+    let mut bytes = [0; 4];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&row[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "invalid physics layer collision matrix")?;
+    }
+    Ok(u32::from_le_bytes(bytes) & (1 << b) != 0)
+}
+
+/// Level.GenerateInternal (original CIL 0x06000fe5) places the ground transform
+/// at world Y=0 and replaces its edge points with Y=.875*.5. Collider offset is
+/// still applied. The workshop's spawn Y=1 is above this surface, not the floor.
+fn squid_ground(main: &Value) -> Result<f32, String> {
+    let (level_node, level) = find_component(main, "Level").ok_or("missing ground Level")?;
+    let id = level["ground"]["local"]
+        .as_i64()
+        .ok_or("unlinked Level.ground")?;
+    let ground = level_node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["id"].as_i64() == Some(id))
+        .ok_or("missing direct ground child")?;
+    for node in [level_node, ground] {
+        let pose = local_pose(node, None);
+        if pose.rotation != [0.0, 0.0, 0.0, 1.0] || pose.scale != [1.0; 3] {
+            return Err("unsupported transformed squid ground".into());
+        }
+    }
+    if comp(ground, "Rigidbody2D").is_some() {
+        return Err("squid ground must be static".into());
+    }
+    if ground["layer"].as_u64() != Some(0) {
+        return Err("unsupported squid ground layer".into());
+    }
+    let edge = comp(ground, "EdgeCollider2D").ok_or("missing ground edge")?;
+    if !flag(edge, "m_Enabled")
+        || flag(edge, "m_IsTrigger")
+        || flag(edge, "m_UsedByComposite")
+        || flag(edge, "m_UsedByEffector")
+        || num(edge, "m_EdgeRadius") != 0.0
+        || !default_physics_material(&edge["m_Material"])
+    {
+        return Err("unsupported ground collider or material".into());
+    }
+    Ok(physics_xy(&edge["m_Offset"])?[1] + 0.875 * 0.5)
 }
 
 /// Data assets of `ty`, sorted by path, as (path, fields).
@@ -2363,6 +2714,7 @@ mod transform_tests {
             inp: &inp,
             world: WorldData::default(),
             visuals: Vec::new(),
+            obstacles: Vec::new(),
             sprite_ids: HashMap::new(),
             prefab_protos: HashMap::new(),
             recolor: HashSet::new(),

@@ -141,14 +141,17 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
 
     let world_bytes =
         std::fs::read(src.join("world.bin")).map_err(|e| format!("world.bin: {e}"))?;
+    let world: WorldData =
+        postcard::from_bytes(&world_bytes).map_err(|e| format!("world.bin: {e}"))?;
+    let world_id = game::save::fingerprint(&world_bytes);
+    let squid = scene::squid::packed_bytes(src, &world, world_id)
+        .map_err(|e| format!("{}: {e}", scene::squid::FILENAME))?;
     let mut out_sheet = sheet.clone();
     let authored = match read_file(src.join(FILENAME)) {
         Ok(bytes) => {
-            let world: WorldData =
-                postcard::from_bytes(&world_bytes).map_err(|e| format!("world.bin: {e}"))?;
             out_sheet.link(&world.sprites);
             out_sheet
-                .install_authored(&bytes, game::save::fingerprint(&world_bytes), &world)
+                .install_authored(&bytes, world_id, &world)
                 .map_err(|e| format!("{FILENAME}: {e}"))?;
             Some(bytes)
         }
@@ -401,12 +404,14 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     let bin = postcard::to_allocvec(&out_sheet).map_err(|e| e.to_string())?;
     std::fs::write(out.join("sheet.bin"), bin).map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), world_bytes).map_err(|e| format!("world.bin: {e}"))?;
-    let authored_out = out.join(FILENAME);
-    if let Some(bytes) = authored {
-        std::fs::write(authored_out, bytes).map_err(|e| format!("{FILENAME}: {e}"))?;
-    } else if let Err(e) = std::fs::remove_file(authored_out) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(format!("{FILENAME}: {e}"));
+    for (name, bytes) in [(FILENAME, authored), (scene::squid::FILENAME, squid)] {
+        let path = out.join(name);
+        if let Some(bytes) = bytes {
+            std::fs::write(path, bytes).map_err(|e| format!("{name}: {e}"))?;
+        } else if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(format!("{name}: {e}"));
+            }
         }
     }
     let sd = out

@@ -9,6 +9,8 @@
   saves keep their formats.
 - Play authored portal opening, closing and destruction transitions. Persist
   their phase and pending triggers across saves.
+- Match squid flight, citizen selection, retreat, and attack animation to
+  authored PC data while retaining support for older asset packs.
 
 ## 1.3.0 — 2026-11-08
 

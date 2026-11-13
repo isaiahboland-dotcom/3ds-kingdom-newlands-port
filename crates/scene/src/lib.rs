@@ -11,6 +11,7 @@ pub mod render;
 pub mod session;
 pub mod sheet;
 pub mod sound;
+pub mod squid;
 pub mod text;
 pub mod top;
 pub mod touch;

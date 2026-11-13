@@ -24,6 +24,7 @@ pub struct Assets {
     pub sheet: Rc<Sheet>,
     /// Recolors sprite pixels keyed by alpha. See `RECOLOR_FS`.
     recolor: Material,
+    overlay: Material,
     /// Additive blending (glows, PostFX add color).
     additive: Material,
     /// Water reflections (see `REFLECT_FS`).
@@ -43,6 +44,7 @@ varying vec4 color;
 uniform sampler2D Texture;
 uniform vec4 RecolorA;
 uniform vec4 RecolorB;
+uniform vec4 Overlay;
 void main() {
     vec4 t = texture2D(Texture, uv);
     // The keyed pixels' red channel is their shade of the recolour.
@@ -51,7 +53,8 @@ void main() {
     } else if (t.a > 0.79 && t.a < 0.85) {
         t = vec4(t.r * RecolorA.rgb, 1.0);
     }
-    gl_FragColor = t * color;
+    vec4 lit = t * color;
+    gl_FragColor = vec4(mix(lit.rgb, Overlay.rgb, Overlay.a), lit.a);
 }
 "#;
 
@@ -62,6 +65,18 @@ varying vec4 color;
 uniform sampler2D Texture;
 void main() {
     gl_FragColor = texture2D(Texture, uv) * color;
+}
+"#;
+
+const OVERLAY_FS: &str = r#"#version 100
+precision lowp float;
+varying vec2 uv;
+varying vec4 color;
+uniform sampler2D Texture;
+uniform vec4 Overlay;
+void main() {
+    vec4 lit = texture2D(Texture, uv) * color;
+    gl_FragColor = vec4(mix(lit.rgb, Overlay.rgb, Overlay.a), lit.a);
 }
 "#;
 
@@ -143,7 +158,20 @@ impl Assets {
                 uniforms: vec![
                     UniformDesc::new("RecolorA", UniformType::Float4),
                     UniformDesc::new("RecolorB", UniformType::Float4),
+                    UniformDesc::new("Overlay", UniformType::Float4),
                 ],
+                pipeline_params: blend(BlendFactor::OneMinusValue(BlendValue::SourceAlpha)),
+                ..Default::default()
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        let overlay = load_material(
+            ShaderSource::Glsl {
+                vertex: RECOLOR_VS,
+                fragment: OVERLAY_FS,
+            },
+            MaterialParams {
+                uniforms: vec![UniformDesc::new("Overlay", UniformType::Float4)],
                 pipeline_params: blend(BlendFactor::OneMinusValue(BlendValue::SourceAlpha)),
                 ..Default::default()
             },
@@ -177,6 +205,7 @@ impl Assets {
             smooth,
             sheet: Rc::new(sheet),
             recolor,
+            overlay,
             additive,
             previous: None,
         })
@@ -209,6 +238,13 @@ impl Renderer for Assets {
             gl_use_material(&self.recolor);
             self.recolor.set_uniform("RecolorA", mc(a).to_vec());
             self.recolor.set_uniform("RecolorB", mc(b).to_vec());
+            self.recolor.set_uniform(
+                "Overlay",
+                mc(d.overlay.unwrap_or(Color::new(0.0, 0.0, 0.0, 0.0))).to_vec(),
+            );
+        } else if let Some(overlay) = d.overlay {
+            gl_use_material(&self.overlay);
+            self.overlay.set_uniform("Overlay", mc(overlay).to_vec());
         } else if d.additive {
             gl_use_material(&self.additive);
         }
@@ -253,7 +289,7 @@ impl Renderer for Assets {
                 },
             );
         }
-        if d.recolor.is_some() || d.additive {
+        if d.recolor.is_some() || d.overlay.is_some() || d.additive {
             gl_use_default_material();
         }
     }

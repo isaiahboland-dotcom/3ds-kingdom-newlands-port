@@ -1426,35 +1426,48 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     use game::greed::EnemyKind;
     let s = c.s;
     let t = &s.game.greed.trolls[i];
-    let clip = match (t.kind, t.state) {
-        (EnemyKind::Squid, TrollState::Dead { .. }) => "squid_death",
-        (EnemyKind::Squid, _) => "squid_move",
-        (EnemyKind::Boss | EnemyKind::KillerBoss, TrollState::Dead { .. }) => "boss_death",
-        (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.bash.is_some() => "boss_bash_right",
-        (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.puke.is_some() => "boss_puke",
-        (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.mover.vx.abs() < 0.05 => "boss_idle",
-        (EnemyKind::Boss | EnemyKind::KillerBoss, _) => "boss_walk",
-        (_, st) => match st {
-            TrollState::Dead { .. } => "troll_die",
-            TrollState::Charge { landed: true, .. } => "troll_recover",
-            TrollState::Charge { .. } => "troll_charge",
-            _ if t.mover.vx.abs() < 0.05 => "troll_stand",
-            _ if t.loot.is_some() => "troll_walk_hold",
-            _ => "troll_walk",
-        },
+    let squid = if t.kind == EnemyKind::Squid {
+        s.game.greed.squid_visual(t.id)
+    } else {
+        None
     };
-    let Some(sprite) = c.frame(clip, t.anim_t) else {
+    let clip = squid.map_or_else(
+        || match (t.kind, t.state) {
+            (EnemyKind::Squid, TrollState::Dead { .. }) => "squid_death",
+            (EnemyKind::Squid, _) => "squid_move",
+            (EnemyKind::Boss | EnemyKind::KillerBoss, TrollState::Dead { .. }) => "boss_death",
+            (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.bash.is_some() => "boss_bash_right",
+            (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.puke.is_some() => "boss_puke",
+            (EnemyKind::Boss | EnemyKind::KillerBoss, _) if t.mover.vx.abs() < 0.05 => "boss_idle",
+            (EnemyKind::Boss | EnemyKind::KillerBoss, _) => "boss_walk",
+            (_, st) => match st {
+                TrollState::Dead { .. } => "troll_die",
+                TrollState::Charge { landed: true, .. } => "troll_recover",
+                TrollState::Charge { .. } => "troll_charge",
+                _ if t.mover.vx.abs() < 0.05 => "troll_stand",
+                _ if t.loot.is_some() => "troll_walk_hold",
+                _ => "troll_walk",
+            },
+        },
+        |v| v.clip,
+    );
+    let Some(sprite) = c.frame(clip, squid.map_or(t.anim_t, |v| v.time)) else {
         return;
     };
     let mut tint = c.lit(WHITE);
     if let TrollState::Dead { t: dt } = t.state {
-        tint.a = (1.0 - (dt - 0.5).max(0.0)).max(0.0);
+        tint.a = squid.map_or((1.0 - (dt - 0.5).max(0.0)).max(0.0), |v| v.death_alpha);
     }
-    c.sprite_lit(
-        sprite,
-        world_to_screen(s, t.x, t.y),
-        Draw::tint(tint).flip(t.mover.facing < 0),
-    );
+    let mut draw = Draw::tint(tint).flip(t.mover.facing < 0);
+    if let Some((elapsed, data)) = squid
+        .and_then(|v| v.overlay_elapsed)
+        .zip(s.world.squid.as_ref())
+    {
+        let mut overlay = Color::rgba(data.definition.spawn_overlay_color);
+        overlay.a *= (elapsed / 2.0).clamp(0.0, 1.0);
+        draw.overlay = Some(overlay);
+    }
+    c.sprite_lit(sprite, world_to_screen(s, t.x, t.y), draw);
     // What it carries. orig: Troll.PickupLoot puts it at (0.1875, 0.25) with x mirrored.
     if let Some(loot) = t.loot {
         let id = match loot {
@@ -2369,6 +2382,125 @@ mod tests {
         assert!(
             capture(&session, &sheet).is_empty(),
             "authored null frames stop drawing"
+        );
+    }
+
+    #[test]
+    fn squid_portal_overlay_is_unlit_and_keeps_sprite_coverage() {
+        use crate::authored::{AssetAnimation, PartVisual, PrefabVisual, TransformNode};
+        use crate::sheet::{Page, PageFormat, Sprite};
+        use game::animation::{Clip, Library, SpriteTrack};
+        use game::greed::{EnemyKind, GreedCtx, TrollState};
+        use game::rng::Rng;
+
+        let mut world = animation_world();
+        let data = game::flight::AssetData::default();
+        let overlay = data.definition.spawn_overlay_color;
+        world.squid = Some(data);
+        let mut session = super::Session::new(world, 0, 1, Default::default());
+        session.camera_x = 0.0;
+        let mut rng = Rng::new(7);
+        session
+            .game
+            .greed
+            .spawn_troll(EnemyKind::Squid, 0.0, 0, false, &mut rng);
+        session.game.greed.trolls[0].state = TrollState::Retreat { t: 0.0 };
+        let ctx = GreedCtx {
+            world: &session.world,
+            level_index: 0,
+            campfire: 20.0,
+            borders: session.game.borders,
+            monarch_x: 20.0,
+            monarch_has_crown: true,
+            targets: &[],
+            citizens: &[],
+            obstacles: &[],
+            solid_obstacles: &[],
+            loot: &[],
+            portals: &[(0, 1.0)],
+            portal_infos: &[],
+            threats: &[],
+            season: session.game.season,
+            day: 1,
+            boat: false,
+        };
+        for dt in [0.0, 0.5] {
+            session
+                .game
+                .greed
+                .update(dt, 0.0, &ctx, &session.game.level, &mut rng, |_| {});
+        }
+
+        let mut sheet = super::Sheet::default();
+        sheet.pages = vec![Page {
+            file: "fixture".into(),
+            w: 16,
+            h: 16,
+            format: PageFormat::Rgba8,
+        }];
+        sheet.names = vec!["panel".into(), "squid".into()];
+        sheet.sprites = vec![
+            Sprite {
+                page: 0,
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 2,
+                px: 1.0,
+                py: 0.5,
+                masks: [None; 2],
+            };
+            2
+        ];
+        sheet.link(&session.world.sprites);
+        let pack = AssetAnimation {
+            prefabs: vec![PrefabVisual {
+                nodes: vec![TransformNode {
+                    path: String::new(),
+                    parent: None,
+                    local: Default::default(),
+                    animator: None,
+                }],
+                parts: vec![
+                    PartVisual {
+                        node: 0,
+                        flip_x: false,
+                        flip_y: false
+                    };
+                    2
+                ],
+            }],
+            clips: Library {
+                clips: vec![(
+                    "squid_move".into(),
+                    Clip {
+                        length: 1.0,
+                        looping: true,
+                        sprites: vec![SpriteTrack {
+                            path: String::new(),
+                            keys: vec![(0.0, Some("squid".into()))],
+                        }],
+                        ..Default::default()
+                    },
+                )],
+                ..Default::default()
+            },
+        };
+        sheet
+            .install_authored(&pack.encode(7).unwrap(), 7, &session.world)
+            .unwrap();
+        let mut capture = Capture::default();
+        super::draw(&session, &sheet, &mut capture);
+        let draw = capture.0.iter().find(|sprite| sprite.0 == 1).unwrap().2;
+        assert_eq!(draw.tint.a, 1.0);
+        assert_eq!(
+            draw.overlay,
+            Some(super::Color::rgba([
+                overlay[0],
+                overlay[1],
+                overlay[2],
+                overlay[3] * 0.25
+            ]))
         );
     }
 
