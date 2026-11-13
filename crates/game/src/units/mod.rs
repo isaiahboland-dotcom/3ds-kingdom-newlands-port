@@ -545,9 +545,16 @@ pub struct Tool {
     pub x: f32,
     pub y: f32,
     vy: f32,
-    /// Shop object id while on its rack. orig: `PayableShop._items`.
+    /// Rack owner or the banner owner of a loose shield.
     pub shop: Option<u32>,
+    /// Rack slot. A recovered tool uses `u8::MAX`.
     pub slot: u8,
+}
+
+impl Tool {
+    pub(crate) fn on_rack(&self) -> bool {
+        self.shop.is_some() && self.slot != u8::MAX
+    }
 }
 
 /// orig: `BeggarCamp.SlowUpdate()` progress.
@@ -786,7 +793,10 @@ impl Population {
 
     /// Tools on a shop's rack. orig: `PayableShop.GetItemCount()`.
     pub fn rack_count(&self, shop: u32) -> u8 {
-        self.tools.iter().filter(|t| t.shop == Some(shop)).count() as u8
+        self.tools
+            .iter()
+            .filter(|t| t.shop == Some(shop) && t.on_rack())
+            .count() as u8
     }
 
     /// Puts a bought tool in the first free rack slot. orig: `PayableShop.Pay()` / `AddItem()`.
@@ -800,7 +810,7 @@ impl Population {
         let used: Vec<u8> = self
             .tools
             .iter()
-            .filter(|t| t.shop == Some(shop))
+            .filter(|t| t.shop == Some(shop) && t.on_rack())
             .map(|t| t.slot)
             .collect();
         let Some(slot) = (0..def.max_items).find(|s| !used.contains(s)) else {
@@ -839,7 +849,7 @@ impl Population {
         }
         // Tools fall to the ground when not on a rack.
         for t in &mut self.tools {
-            if t.shop.is_none() && t.y > 0.0 {
+            if !t.on_rack() && t.y > 0.0 {
                 t.vy -= crate::coins::GRAVITY * dt;
                 t.y = (t.y + t.vy * dt).max(0.0);
             }
@@ -1124,15 +1134,64 @@ impl Population {
         });
     }
 
-    /// A tool left the world (a troll took it). orig: `DroppableShield.OnDisable()`.
-    pub fn tool_lost(&mut self, tool: &Tool) {
-        if let Some(shop) = tool.shop {
-            if let Some(s) = self.shields.iter_mut().find(|s| s.object == shop) {
-                if s.status == ShieldStatus::Available {
-                    s.status = ShieldStatus::Empty;
-                }
+    /// orig: DroppableShield.OnDisable. The thief escaped with the shield.
+    pub(crate) fn release_shield_stock(&mut self, shop: u32) {
+        if let Some(s) = self.shields.iter_mut().find(|s| s.object == shop) {
+            if s.status == ShieldStatus::Available {
+                s.status = ShieldStatus::Empty;
             }
         }
+    }
+
+    /// Restore a thief's carried tool on death. A modern payload keeps its
+    /// identity; legacy saves only retained its kind and need a fresh id.
+    /// orig: `Troll.DropLoot` releases the existing droppable, with upward
+    /// impulse 1, while a shield keeps its `PayableShield` association.
+    pub(crate) fn release_stolen_tool(
+        &mut self,
+        kind: ToolKind,
+        id: Option<u32>,
+        shield_shop: Option<u32>,
+        x: f32,
+        y: f32,
+    ) {
+        let id = match id {
+            Some(id) => {
+                // Death effects are normally consumed once; don't duplicate
+                // an already restored payload if a caller repeats one.
+                if self.tools.iter().any(|t| t.id == id) {
+                    return;
+                }
+                self.next_id = self.next_id.max(id.saturating_add(1));
+                id
+            }
+            None => {
+                let id = self.next_id;
+                self.next_id += 1;
+                id
+            }
+        };
+        let shop = (kind == ToolKind::Shield).then_some(shield_shop).flatten();
+        if let Some(s) = shop.and_then(|id| self.shields.iter_mut().find(|s| s.object == id)) {
+            if matches!(s.status, ShieldStatus::Empty | ShieldStatus::Broken) {
+                s.status = ShieldStatus::Available;
+            }
+        }
+        self.tools.push(Tool {
+            id,
+            kind,
+            x,
+            y,
+            vy: 1.0,
+            shop,
+            slot: u8::MAX,
+        });
+    }
+
+    /// Carried tools remain in the population's identity space while absent
+    /// from `tools`; save validation must still reject unallocated ids.
+    pub(crate) fn tool_id_allocated(&self, id: u32) -> bool {
+        id < self.next_id
     }
 
     /// Archers following each knight.

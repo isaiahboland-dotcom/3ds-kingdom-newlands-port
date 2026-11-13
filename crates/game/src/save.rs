@@ -12,7 +12,8 @@ use crate::progress::Progress;
 use crate::state::GameState;
 
 /// Bumped whenever the saved state's layout changes.
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
+const LEGACY_VERSION: u16 = 5;
 const MAGIC: [u8; 4] = *b"KNL1";
 
 /// The slot names the backends store under. orig: `"AUTO"`, `"unlocks"`.
@@ -54,10 +55,10 @@ pub fn fingerprint(world_bin: &[u8]) -> u32 {
     h
 }
 
-fn header(world: u32) -> Vec<u8> {
+fn header(world: u32, version: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(10);
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&world.to_le_bytes());
     out
 }
@@ -79,7 +80,12 @@ fn body(bytes: &[u8], world: Option<u32>) -> Result<(u16, &[u8]), LoadError> {
 
 /// orig: `PersistentManager.Save()`.
 pub fn save_game(g: &GameState, world: u32) -> Vec<u8> {
-    let mut out = header(world);
+    let version = if g.needs_loot_save_version() {
+        VERSION
+    } else {
+        LEGACY_VERSION
+    };
+    let mut out = header(world, version);
     // Serializing plain data into a Vec can't fail.
     out.extend(postcard::to_allocvec(g).expect("plain-data serialization cannot fail"));
     out
@@ -106,7 +112,7 @@ pub fn load_game(
         }
         postcard::from_bytes(&old)
     };
-    let g: GameState = if stored == VERSION {
+    let g: GameState = if stored >= LEGACY_VERSION {
         postcard::from_bytes(body)
     } else {
         postcard::from_bytes(body)
@@ -114,7 +120,7 @@ pub fn load_game(
             .or_else(|_| with(&[&tutorial, &look]))
     }
     .map_err(|_| LoadError::Corrupt)?;
-    if !g.ids_valid(world) {
+    if !g.ids_valid(world) || (stored < VERSION && g.needs_loot_save_version()) {
         return Err(LoadError::Corrupt);
     }
     Ok(g)
@@ -122,7 +128,7 @@ pub fn load_game(
 
 /// orig: `UnlockManager.SaveUnlocks()` (unlocks don't depend on the game data).
 pub fn save_progress(p: &Progress) -> Vec<u8> {
-    let mut out = header(0);
+    let mut out = header(0, LEGACY_VERSION);
     out.extend(postcard::to_allocvec(p).expect("plain-data serialization cannot fail"));
     out
 }
@@ -137,7 +143,7 @@ pub fn load_progress(bytes: &[u8]) -> Result<Progress, LoadError> {
         old.resize(old.len() + zeros, 0);
         postcard::from_bytes(&old)
     };
-    if stored == VERSION {
+    if stored >= LEGACY_VERSION {
         postcard::from_bytes(body)
     } else {
         postcard::from_bytes(body)

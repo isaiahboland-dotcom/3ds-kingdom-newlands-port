@@ -5,6 +5,8 @@
 ### Fixed
 
 - Release captured citizens when a squid is killed by any supported attack.
+- Drop stolen coins and tools when their carrier dies. Keep a stolen shield's
+  shop occupied until the shield is recovered or the carrier escapes.
 
 ## 1.3.0 — 2026-11-08
 

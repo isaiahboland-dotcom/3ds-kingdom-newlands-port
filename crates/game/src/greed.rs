@@ -107,6 +107,12 @@ pub enum Loot {
     /// A part stacked at the wharf (index into `WharfDef::parts`).
     /// orig: the `BoatPart` droppable.
     BoatPart(u16),
+    /// A live droppable retains its tool ID and any shield-banner owner.
+    CarriedTool {
+        kind: ToolKind,
+        id: u32,
+        shield_shop: Option<u32>,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -376,6 +382,12 @@ pub enum GreedEvent {
     CliffsDestroyed,
     /// A retaliation wave came out. orig: `EnemyManager.SpawnRetaliation()`.
     Retaliation,
+    /// A dying carrier let go of a coin or tool.
+    DroppedLoot {
+        loot: Loot,
+        x: f32,
+        y: f32,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -737,7 +749,8 @@ impl Greed {
     /// Damages a troll (arrows). orig: `Damageable.ReceiveDamage()`.
     pub fn hurt(&mut self, i: usize, damage: i32, events: &mut impl FnMut(GreedEvent)) {
         let t = &mut self.trolls[i];
-        if t.is_dead() {
+        // orig: PickupCrown makes its carrier invulnerable before game over.
+        if t.is_dead() || t.loot == Some(Loot::Crown) {
             return;
         }
         t.hp -= damage;
@@ -748,6 +761,17 @@ impl Greed {
             t.mover.stop();
             t.attacking = false;
             events(GreedEvent::Killed(t.id));
+            // The wharf's pickup handler already returned a stolen plank
+            // to the purchase pool. Its dropped debris is never stock.
+            if let Some(loot @ (Loot::Coin | Loot::Tool(_) | Loot::CarriedTool { .. })) =
+                t.loot.take()
+            {
+                events(GreedEvent::DroppedLoot {
+                    loot,
+                    x: t.x + 0.1875 * t.mover.facing as f32,
+                    y: t.y + 0.25,
+                });
+            }
             if t.victims > 0 {
                 events(GreedEvent::Released {
                     x: t.x,

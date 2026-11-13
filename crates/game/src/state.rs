@@ -180,7 +180,8 @@ pub struct GameState {
 impl GameState {
     /// Reject saved world indices before they can reach indexed access.
     pub(crate) fn ids_valid(&self, world: &WorldData) -> bool {
-        self.level_index < world.levels.len()
+        self.carried_tools_valid()
+            && self.level_index < world.levels.len()
             && (self.steed as usize) < world.steeds.len()
             && self
                 .mounts
@@ -194,6 +195,43 @@ impl GameState {
             && self.blender.presets_valid(world)
             && self.director.lights_valid(world)
     }
+    fn carried_tools_valid(&self) -> bool {
+        let mut ids = Vec::new();
+        for troll in &self.greed.trolls {
+            let Some(Loot::CarriedTool {
+                kind,
+                id,
+                shield_shop,
+            }) = troll.loot
+            else {
+                continue;
+            };
+            if (shield_shop.is_some() && kind != crate::data::ToolKind::Shield)
+                || !self.population.tool_id_allocated(id)
+                || ids.contains(&id)
+                || self.population.tools.iter().any(|tool| tool.id == id)
+                || self.population.units.iter().any(|unit| unit.id == id)
+            {
+                return false;
+            }
+            ids.push(id);
+        }
+        true
+    }
+
+    #[cfg(feature = "save")]
+    pub(crate) fn needs_loot_save_version(&self) -> bool {
+        self.greed
+            .trolls
+            .iter()
+            .any(|t| matches!(t.loot, Some(Loot::CarriedTool { .. })))
+            || self
+                .population
+                .tools
+                .iter()
+                .any(|tool| tool.shop.is_some() && !tool.on_rack())
+    }
+
     /// Starts a fresh run on island `level_index` (0 = Land One).
     pub fn new(world: &WorldData, level_index: usize, seed: u32) -> Self {
         Self::start(
@@ -1878,12 +1916,54 @@ impl GameState {
 
     /// orig: Squid.HandleOnDeath → Character.Release.
     fn apply_greed_effect(&mut self, effect: GreedEvent, events: &mut Vec<GameEvent>) {
-        if let GreedEvent::Released { x, count } = effect {
-            for _ in 0..count {
-                self.population
-                    .spawn(crate::data::Role::Peasant, x, &mut self.rng);
+        match effect {
+            GreedEvent::Released { x, count } => {
+                for _ in 0..count {
+                    self.population
+                        .spawn(crate::data::Role::Peasant, x, &mut self.rng);
+                }
+                self.payables_dirty = true;
             }
-            self.payables_dirty = true;
+            GreedEvent::DroppedLoot { loot, x, y } => {
+                match loot {
+                    Loot::Coin => {
+                        // Droppable.Drop replaces the player dropper with the troll.
+                        self.coins.drop(
+                            Who::Thing,
+                            (x, y),
+                            (self.rng.range(-0.5, 0.5), 1.0),
+                            crate::coins::Policy::Anybody,
+                            None,
+                            None,
+                        );
+                    }
+                    Loot::Tool(kind) => {
+                        self.population.release_stolen_tool(kind, None, None, x, y);
+                    }
+                    Loot::CarriedTool {
+                        kind,
+                        id,
+                        shield_shop,
+                    } => {
+                        self.population
+                            .release_stolen_tool(kind, Some(id), shield_shop, x, y);
+                    }
+                    Loot::Crown | Loot::BoatPart(_) => {}
+                }
+                self.payables_dirty = true;
+            }
+            GreedEvent::Escaped {
+                loot:
+                    Some(Loot::CarriedTool {
+                        shield_shop: Some(shop),
+                        ..
+                    }),
+                ..
+            } => {
+                self.population.release_shield_stock(shop);
+                self.payables_dirty = true;
+            }
+            _ => {}
         }
         events.push(GameEvent::Greed(effect));
     }
@@ -1975,7 +2055,15 @@ impl GameState {
         let n_coins = self.coins.list.len();
         for (j, t) in self.population.tools.iter().enumerate() {
             loot.push(LootInfo {
-                loot: Loot::Tool(t.kind),
+                loot: Loot::CarriedTool {
+                    kind: t.kind,
+                    id: t.id,
+                    shield_shop: if t.kind == crate::data::ToolKind::Shield {
+                        t.shop
+                    } else {
+                        None
+                    },
+                },
                 x: t.x,
                 y: t.y,
                 index: n_coins + j,
@@ -2044,6 +2132,36 @@ impl GameState {
         let mut coin_removals: Vec<usize> = Vec::new();
         let mut part_removals: Vec<usize> = Vec::new();
         let mut tool_removals: Vec<usize> = Vec::new();
+        // Commit pickups before any death can restore an item with the
+        // same identity. The snapshot indices are stable until this pass.
+        for &e in &out {
+            if let GreedEvent::TookLoot { index, .. } = e {
+                if index < n_coins {
+                    coin_removals.push(index);
+                } else if index < crown_index {
+                    tool_removals.push(index - n_coins);
+                } else if index == crown_index {
+                    self.greed.crown = None;
+                } else {
+                    part_removals.push(index - parts_index);
+                }
+            }
+        }
+        coin_removals.sort_unstable();
+        for i in coin_removals.into_iter().rev() {
+            self.coins.list.remove(i);
+        }
+        // orig: Wharf.HandleOnPartPickedUp makes the plank available to buy.
+        part_removals.sort_unstable();
+        for i in part_removals.into_iter().rev() {
+            self.harbor.part_taken(&mut self.level, i);
+            self.payables_dirty = true;
+        }
+        tool_removals.sort_unstable();
+        for i in tool_removals.into_iter().rev() {
+            self.population.tools.remove(i);
+            self.payables_dirty = true;
+        }
         for e in out {
             match e {
                 GreedEvent::Hit { by, target, damage } => {
@@ -2086,17 +2204,6 @@ impl GameState {
                             }
                         }
                         Target::Object(id) => self.hurt_wall(world, id, damage),
-                    }
-                }
-                GreedEvent::TookLoot { index, .. } => {
-                    if index < n_coins {
-                        coin_removals.push(index);
-                    } else if index < crown_index {
-                        tool_removals.push(index - n_coins);
-                    } else if index == crown_index {
-                        self.greed.crown = None;
-                    } else {
-                        part_removals.push(index - parts_index);
                     }
                 }
                 GreedEvent::CrownTaken => {
@@ -2145,22 +2252,6 @@ impl GameState {
                 _ => {}
             }
             self.apply_greed_effect(e, events);
-        }
-        coin_removals.sort_unstable();
-        for i in coin_removals.into_iter().rev() {
-            self.coins.list.remove(i);
-        }
-        // orig: Wharf.HandleOnPartPickedUp: the part goes back to be paid for again.
-        part_removals.sort_unstable();
-        for i in part_removals.into_iter().rev() {
-            self.harbor.part_taken(&mut self.level, i);
-            self.payables_dirty = true;
-        }
-        tool_removals.sort_unstable();
-        for i in tool_removals.into_iter().rev() {
-            let t = self.population.tools.remove(i);
-            self.population.tool_lost(&t);
-            self.payables_dirty = true;
         }
 
         // orig: the monarch picks the crown back up by touching it.
@@ -3571,6 +3662,264 @@ mod tests {
         assert_captives_released(&g, &events, 2);
     }
 
+    #[test]
+    fn stolen_coin_is_released_once_with_enemy_dropper_after_arrow_or_bolt() {
+        for bolt in [false, true] {
+            let w = fight_world();
+            let mut g = GameState::new(&w, 0, 41);
+            g.monarch.x = -20.0;
+            g.coins.drop(
+                Who::Monarch,
+                (8.0, 0.0),
+                (0.0, 0.0),
+                crate::coins::Policy::Anybody,
+                None,
+                None,
+            );
+            g.greed
+                .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+            g.update_greed(&w, TICK, &mut Vec::new());
+            assert!(g.coins.list.is_empty());
+            assert_eq!(g.greed.trolls[0].loot, Some(Loot::Coin));
+            let ev = shoot_carrier(&mut g, &w, 0, bolt);
+            assert!(ev
+                .iter()
+                .any(|e| matches!(e, GameEvent::Greed(GreedEvent::Killed(_)))));
+            assert_eq!(g.coins.list.len(), 1);
+            let coin = &g.coins.list[0];
+            assert_eq!(
+                coin.dropper,
+                Who::Thing,
+                "Droppable.Drop resets the player flag"
+            );
+            assert_eq!(coin.claimer, None, "old friendly claim is cleared");
+            assert_eq!(coin.policy, crate::coins::Policy::Anybody);
+            assert_eq!(g.greed.trolls[0].loot, None);
+            shoot_carrier(&mut g, &w, 0, bolt);
+            assert_eq!(g.coins.list.len(), 1, "dead carrier cannot release twice");
+        }
+    }
+
+    #[test]
+    fn stolen_tools_keep_identity_and_shields_keep_their_shop_on_recovery() {
+        for kind in [
+            ToolKind::Bow,
+            ToolKind::Hammer,
+            ToolKind::Scythe,
+            ToolKind::Shield,
+            ToolKind::Bread,
+        ] {
+            let w = fight_world();
+            let mut g = GameState::new(&w, 0, 42);
+            g.monarch.x = -20.0;
+            let mut shop = crate::units::ShieldShop::new(55, 8.0, 0.0, g.coat, 0.0, &mut g.rng);
+            shop.status = crate::units::ShieldStatus::Available;
+            g.population.shields.push(shop);
+            let owner = (kind == ToolKind::Shield).then_some(55);
+            g.population
+                .release_stolen_tool(kind, None, owner, 8.0, 0.0);
+            let id = g.population.tools[0].id;
+            g.greed
+                .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+            g.update_greed(&w, TICK, &mut Vec::new());
+            assert!(g.population.tools.is_empty());
+            assert_eq!(
+                g.greed.trolls[0].loot,
+                Some(Loot::CarriedTool {
+                    kind,
+                    id,
+                    shield_shop: owner
+                })
+            );
+            assert!(
+                !g.population.shields[0].can_pay(),
+                "carried shield still occupies shop"
+            );
+            shoot_carrier(&mut g, &w, 0, false);
+            assert_eq!(g.population.tools.len(), 1);
+            let t = &g.population.tools[0];
+            assert_eq!((t.id, t.kind, t.shop), (id, kind, owner));
+            assert_eq!(t.slot, u8::MAX);
+            shoot_carrier(&mut g, &w, 0, true);
+            assert_eq!(g.population.tools.len(), 1);
+        }
+    }
+
+    #[test]
+    fn escaped_carrier_returns_no_loot_and_frees_its_shield_shop() {
+        for kind in [None, Some(ToolKind::Shield)] {
+            let w = fight_world();
+            let mut g = GameState::new(&w, 0, 43);
+            g.monarch.x = -20.0;
+            let mut shop = crate::units::ShieldShop::new(55, 8.0, 0.0, g.coat, 0.0, &mut g.rng);
+            shop.status = crate::units::ShieldStatus::Available;
+            g.population.shields.push(shop);
+            g.greed
+                .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+            g.greed.trolls[0].loot = Some(match kind {
+                Some(kind) => Loot::CarriedTool {
+                    kind,
+                    id: 0,
+                    shield_shop: Some(55),
+                },
+                None => Loot::Coin,
+            });
+            g.greed.trolls[0].state = crate::greed::TrollState::Retreat { t: 10.0 };
+            let mut ev = Vec::new();
+            g.update_greed(&w, TICK, &mut ev);
+            assert!(g.greed.trolls.is_empty());
+            assert!(g.population.tools.is_empty());
+            assert!(g.coins.list.is_empty());
+            assert!(!ev
+                .iter()
+                .any(|e| matches!(e, GameEvent::Greed(GreedEvent::DroppedLoot { .. }))));
+            assert_eq!(g.population.shields[0].can_pay(), kind.is_some());
+        }
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn carried_tool_save_roundtrip_preserves_identity_and_rejects_duplicate_ids() {
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        let mut g = GameState::new(&w, 0, 46);
+        g.monarch.x = -20.0;
+        g.population
+            .release_stolen_tool(ToolKind::Bow, None, None, 8.0, 0.0);
+        let id = g.population.tools[0].id;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+        g.update_greed(&w, TICK, &mut Vec::new());
+        let bytes = crate::save::save_game(&g, 123);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 6);
+        let mut loaded = crate::save::load_game(&bytes, 123, &w).unwrap();
+        assert_eq!(loaded.greed.trolls[0].loot, g.greed.trolls[0].loot);
+        shoot_carrier(&mut loaded, &w, 0, false);
+        assert_eq!(loaded.population.tools[0].id, id);
+        g.population
+            .release_stolen_tool(ToolKind::Bow, Some(id), None, 9.0, 0.0);
+        assert_eq!(
+            crate::save::load_game(&crate::save::save_game(&g, 123), 123, &w).err(),
+            Some(crate::save::LoadError::Corrupt)
+        );
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn v5_carried_tool_loads_and_recovers_with_a_fresh_valid_identity() {
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        let mut g = GameState::new(&w, 0, 47);
+        g.monarch.x = -20.0;
+        let citizen = g.population.spawn(Role::Worker, -10.0, &mut g.rng);
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+        g.greed.trolls[0].loot = Some(Loot::Tool(ToolKind::Hammer));
+        // v6 only appended a Loot variant; this legacy payload's bytes are
+        // unchanged from v5. Use its old header to exercise the v5 load path.
+        let bytes = crate::save::save_game(&g, 123);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 5);
+        let mut loaded = crate::save::load_game(&bytes, 123, &w).unwrap();
+        shoot_carrier(&mut loaded, &w, 0, false);
+        let tool = &loaded.population.tools[0];
+        assert_eq!(tool.kind, ToolKind::Hammer);
+        assert_ne!(tool.id, citizen);
+        assert!(loaded.population.tool_id_allocated(tool.id));
+        assert!(crate::save::load_game(&crate::save::save_game(&loaded, 123), 123, &w).is_ok());
+    }
+
+    #[test]
+    fn tool_stolen_and_recovered_in_one_projectile_tick_is_not_lost() {
+        let w = fight_world();
+        let mut g = GameState::new(&w, 0, 48);
+        g.monarch.x = -20.0;
+        g.population
+            .release_stolen_tool(ToolKind::Bow, None, None, 8.0, 0.0);
+        let id = g.population.tools[0].id;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+        let ev = shoot_carrier(&mut g, &w, 0, false);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::TookLoot { .. }))));
+        assert!(g.greed.trolls[0].is_dead());
+        assert_eq!(g.population.tools.len(), 1);
+        assert_eq!(g.population.tools[0].id, id);
+    }
+
+    #[test]
+    fn picking_up_the_crown_makes_its_carrier_invulnerable_in_the_same_tick() {
+        let w = fight_world();
+        let mut g = GameState::new(&w, 0, 49);
+        g.monarch.x = -20.0;
+        g.has_crown = false;
+        g.greed.drop_crown(8.0, 0.0, 0.0);
+        let crown = g.greed.crown.as_mut().unwrap();
+        crown.t = 2.0;
+        crown.y = 0.0;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, 8.0, 1, false, &mut g.rng);
+        let ev = shoot_carrier(&mut g, &w, 0, true);
+        assert!(g.game_over);
+        assert_eq!(g.greed.trolls[0].loot, Some(Loot::Crown));
+        assert!(!g.greed.trolls[0].is_dead());
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::DroppedLoot { .. }))));
+        assert!(g.greed.crown.is_none());
+    }
+
+    #[test]
+    fn stolen_boat_part_stays_available_to_rebuy_after_carrier_dies() {
+        let mut w = fight_world();
+        let mut wharf = wall_proto("Wharf", 2, None, 0);
+        wharf.upgrade = None;
+        wharf.wharf = Some(crate::data::WharfDef {
+            work_per_part: 2,
+            parts: vec![(0, 0.0, 1.0)],
+            skeleton: None,
+            skeleton_at: (0.0, 0.0),
+            boat: None,
+        });
+        w.protos.push(wharf);
+        let mut g = GameState::new(&w, 0, 50);
+        g.monarch.x = -20.0;
+        g.level.add(level::instantiate(
+            &w,
+            1,
+            Layer::Game,
+            8.0,
+            build::WALK_Y,
+            0.1,
+            1.0,
+        ));
+        g.harbor = crate::boat::Harbor::new(&w, &mut g.level, 0, &mut g.rng);
+        g.harbor.pay_wharf(&w, &mut g.level, &mut g.rng);
+        let part = &mut g.harbor.wharf.as_mut().unwrap().stacked[0];
+        part.y = 0.0;
+        let x = part.x;
+        assert!(!g.harbor.wharf_can_pay());
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Troll, x, 1, false, &mut g.rng);
+        g.update_greed(&w, TICK, &mut Vec::new());
+        assert_eq!(g.greed.trolls[0].loot, Some(Loot::BoatPart(0)));
+        assert!(
+            g.harbor.wharf_can_pay(),
+            "pickup already returned part to purchase pool"
+        );
+        let ev = shoot_carrier(&mut g, &w, 0, false);
+        assert!(g.harbor.wharf.as_ref().unwrap().stacked.is_empty());
+        assert!(g.harbor.wharf_can_pay());
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::DroppedLoot { .. }))));
+        g.harbor.pay_wharf(&w, &mut g.level, &mut g.rng);
+        assert_eq!(g.harbor.wharf.as_ref().unwrap().stacked.len(), 1);
+        assert!(
+            !g.harbor.wharf_can_pay(),
+            "death must not duplicate purchase stock"
+        );
+    }
     #[test]
     fn a_boss_smashes_a_wall() {
         let w = fight_world();
