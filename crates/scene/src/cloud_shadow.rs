@@ -729,6 +729,8 @@ mod tests {
         receiver.opacity = 0.49;
         let atlas = pass.prepare(camera, &[caster, receiver]).unwrap();
         assert_eq!((at(&atlas, 4, 8), at(&atlas, 12, 8)), (0, 255));
+        assert_eq!(screen_exposure(&pass, 196, 120), 0);
+        assert_eq!(screen_exposure(&pass, 204, 120), 255);
     }
 
     #[test]
