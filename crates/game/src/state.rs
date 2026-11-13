@@ -65,6 +65,7 @@ pub enum GameEvent {
     Music(crate::data::SoundId),
     /// Two hired and a wall up: the ghost fades. orig: `TutorialManager.CompleteTutorial()`.
     TutorialDone,
+    Catapult(crate::siege::CatapultEvent),
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -940,6 +941,7 @@ impl GameState {
             &pushers,
             &enemies,
             &mut self.rng,
+            |event| events.push(GameEvent::Catapult(event)),
         );
         for crate::siege::BoulderHit::Troll(id, damage) in hits {
             if let Some(i) = self.greed.trolls.iter().position(|t| t.id == id) {
@@ -2063,6 +2065,7 @@ impl GameState {
                                 self.level.objects[i].hp -= damage;
                                 if self.level.objects[i].hp <= 0 {
                                     self.level.objects.remove(i);
+                                    self.siege.remove(id);
                                     self.payables_dirty = true;
                                 }
                             }

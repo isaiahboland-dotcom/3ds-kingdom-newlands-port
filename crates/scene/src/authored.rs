@@ -11,7 +11,7 @@ use crate::sheet::Sheet;
 
 pub const FILENAME: &str = "animation.bin";
 const MAGIC: [u8; 4] = *b"KNAF";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER: usize = 10;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
@@ -29,6 +29,7 @@ pub fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 pub struct AssetAnimation {
     pub prefabs: Vec<PrefabVisual>,
     pub clips: Library,
+    pub catapults: Vec<(u16, game::siege::CatapultPhysics)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -52,65 +53,7 @@ pub struct PartVisual {
     pub flip_y: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Affine2 {
-    /// Row-major linear basis in world coordinates (Y up).
-    pub basis: [f32; 4],
-    pub translation: [f32; 2],
-}
-
-impl Affine2 {
-    pub const IDENTITY: Self = Self {
-        basis: [1.0, 0.0, 0.0, 1.0],
-        translation: [0.0; 2],
-    };
-
-    pub fn from_pose(p: Pose) -> Self {
-        let [x, y, z, w] = p.rotation;
-        let n = x * x + y * y + z * z + w * w;
-        let k = if n > 0.0 { 2.0 / n } else { 0.0 };
-        Self {
-            basis: [
-                (1.0 - k * (y * y + z * z)) * p.scale[0],
-                k * (x * y - z * w) * p.scale[1],
-                k * (x * y + z * w) * p.scale[0],
-                (1.0 - k * (x * x + z * z)) * p.scale[1],
-            ],
-            translation: [p.position[0], p.position[1]],
-        }
-    }
-
-    /// Parent × local.
-    pub fn compose(self, local: Self) -> Self {
-        let [a, b, c, d] = self.basis;
-        let [e, f, g, h] = local.basis;
-        Self {
-            basis: [a * e + b * g, a * f + b * h, c * e + d * g, c * f + d * h],
-            translation: self.point(local.translation),
-        }
-    }
-
-    pub fn point(self, p: [f32; 2]) -> [f32; 2] {
-        let [a, b, c, d] = self.basis;
-        [
-            self.translation[0] + a * p[0] + b * p[1],
-            self.translation[1] + c * p[0] + d * p[1],
-        ]
-    }
-
-    pub fn screen_basis(self, mirrored: bool) -> [f32; 4] {
-        let [a, b, c, d] = self.basis;
-        let sign = if mirrored { -1.0 } else { 1.0 };
-        [sign * a, -sign * b, -c, d]
-    }
-
-    fn finite(self) -> bool {
-        self.basis
-            .into_iter()
-            .chain(self.translation)
-            .all(f32::is_finite)
-    }
-}
+pub use game::animation::Affine2;
 
 impl PrefabVisual {
     pub fn sampled_transform(
@@ -199,21 +142,56 @@ impl AssetAnimation {
     }
 
     pub(crate) fn decode(bytes: &[u8], world_id: u32) -> Result<Self, String> {
-        if !(HEADER..=MAX_BYTES).contains(&bytes.len())
-            || bytes[..4] != MAGIC
-            || bytes[4..6] != VERSION.to_le_bytes()
-        {
+        if !(HEADER..=MAX_BYTES).contains(&bytes.len()) || bytes[..4] != MAGIC {
             return Err("unsupported animation data format".into());
         }
         if bytes[6..10] != world_id.to_le_bytes() {
             return Err("animation data belongs to a different world.bin".into());
         }
-        let (authored, rest) =
-            postcard::take_from_bytes(&bytes[HEADER..]).map_err(|e| e.to_string())?;
+        let (authored, rest) = match u16::from_le_bytes([bytes[4], bytes[5]]) {
+            1 => {
+                let ((prefabs, clips), rest) =
+                    postcard::take_from_bytes(&bytes[HEADER..]).map_err(|e| e.to_string())?;
+                (
+                    Self {
+                        prefabs,
+                        clips,
+                        catapults: Vec::new(),
+                    },
+                    rest,
+                )
+            }
+            VERSION => postcard::take_from_bytes(&bytes[HEADER..]).map_err(|e| e.to_string())?,
+            _ => return Err("unsupported animation data version".into()),
+        };
         if !rest.is_empty() {
             return Err("trailing bytes in animation data".into());
         }
         Ok(authored)
+    }
+
+    /// Install optional simulation data only after checking its world identity
+    /// and prototype references. Used by headless runners with no sprite sheet.
+    pub fn install_gameplay(bytes: &[u8], id: u32, world: &mut WorldData) -> Result<(), String> {
+        let data = Self::decode(bytes, id)?;
+        data.validate_catapults(world)?;
+        world.catapult_physics = data.catapults;
+        Ok(())
+    }
+
+    fn validate_catapults(&self, world: &WorldData) -> Result<(), String> {
+        if self.catapults.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || self.catapults.iter().any(|(id, def)| {
+                !def.valid()
+                    || world
+                        .protos
+                        .get(*id as usize)
+                        .is_none_or(|proto| proto.catapult.is_none())
+            })
+        {
+            return Err("invalid authored catapult data".into());
+        }
+        Ok(())
     }
 
     pub(crate) fn validate(&self, world: &WorldData, sheet: &Sheet) -> Result<(), String> {
@@ -243,7 +221,7 @@ impl AssetAnimation {
             return Err("animation data contains an invalid clip or sprite reference".into());
         }
         game::greed::validate_portal_graph(&self.clips)?;
-        Ok(())
+        self.validate_catapults(world)
     }
 }
 

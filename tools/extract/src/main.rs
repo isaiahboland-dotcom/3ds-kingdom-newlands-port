@@ -219,17 +219,25 @@ fn export_scenes(
         &serde_json::Value::Object(data.clone()),
     )?;
 
-    let (mut world, clip_paths, prefabs) = world::build(&world::Inputs {
-        main: &main,
-        blocks: &blocks,
-        loader: &loader,
-        prefabs: &prefabs,
-        data: &data,
-        sprite_names,
-        sprite_sizes,
-        assets_dir: assets,
-    })?;
-    audio::convert(assets, out, &mut world.audio, &clip_paths)?;
+    let world::Export {
+        mut world,
+        audio_paths,
+        visuals,
+        catapults,
+    } = world::build(
+        &world::Inputs {
+            main: &main,
+            blocks: &blocks,
+            loader: &loader,
+            prefabs: &prefabs,
+            data: &data,
+            sprite_names,
+            sprite_sizes,
+            assets_dir: assets,
+        },
+        &animations,
+    )?;
+    audio::convert(assets, out, &mut world.audio, &audio_paths)?;
     println!(
         "audio: {} sounds, {} clips ({:.0} s), {} script fields",
         world.audio.sounds.len(),
@@ -240,8 +248,9 @@ fn export_scenes(
     let bytes = postcard::to_allocvec(&world).map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), &bytes).map_err(|e| e.to_string())?;
     let authored = scene::authored::AssetAnimation {
-        prefabs,
+        prefabs: visuals,
         clips: animations,
+        catapults,
     };
     let animation = authored.encode(game::save::fingerprint(&bytes))?;
     std::fs::write(out.join(scene::authored::FILENAME), animation).map_err(|e| e.to_string())?;

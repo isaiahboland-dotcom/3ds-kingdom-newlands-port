@@ -1101,8 +1101,23 @@ fn authored_part(
             }
         }
     }
-    let mirrored = o.flip
+    let mut mirrored = o.flip
         && (proto.catapult.is_none() || path == "Flippable" || path.starts_with("Flippable/"));
+    if let Some(physics) = s.world.catapult_physics(o.proto) {
+        let sign = if mirrored { -1.0 } else { 1.0 };
+        let reflected = crate::authored::Affine2 {
+            basis: [sign, 0.0, 0.0, 1.0],
+            translation: [sign * st.shift, 0.0],
+        }
+        .compose(transform);
+        let body = match path.as_str() {
+            "Wheel Front" => s.game.siege.wheel_pose(o.id, 0, &physics.body),
+            "Wheel Rear" => s.game.siege.wheel_pose(o.id, 1, &physics.body),
+            _ => s.game.siege.recoil_pose(o.id, &physics.body),
+        };
+        transform = body.compose(reflected);
+        mirrored = false;
+    }
     let flip_x = if legacy.random.is_some() {
         st.flip
     } else {
@@ -1251,7 +1266,12 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
         colors.1 = GHOST_COLOR;
         cloth = true;
     }
-    let at = layer_to_screen(s, o.x + dir * (px + st.shift), o.y + py, ratio);
+    let shift = if authored.is_some() && s.world.catapult_physics(o.proto).is_some() {
+        0.0
+    } else {
+        st.shift
+    };
+    let at = layer_to_screen(s, o.x + dir * (px + shift), o.y + py, ratio);
     if part.lit {
         tint = c.lit(tint);
     }
@@ -2307,6 +2327,7 @@ mod tests {
                 ],
             }],
             clips,
+            catapults: vec![],
         };
         let world_id = 0x1234_5678;
         let bytes = authored.encode(world_id).unwrap();

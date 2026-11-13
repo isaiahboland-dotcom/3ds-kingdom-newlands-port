@@ -236,6 +236,9 @@ pub fn on_event(
             ),
             _ => {}
         },
+        GameEvent::Catapult(game::siege::CatapultEvent::Fired { x, .. }) => {
+            cue(w.audio.sound("Catapult.fireSound"), Some(x))
+        }
         GameEvent::CrownLost => cue(w.audio.sound("Player.lostCrownSound"), None),
         GameEvent::CrownRecovered => cue(w.audio.sound("Player.pickupCrownSound"), None),
         GameEvent::GameOver => {

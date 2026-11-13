@@ -36,6 +36,7 @@ fn class_name(id: u32) -> String {
         222 => "CanvasRenderer",
         223 => "Canvas",
         224 => "RectTransform",
+        233 => "HingeJoint2D",
         _ => return format!("Class{id}"),
     }
     .to_owned()
@@ -276,6 +277,7 @@ pub fn export_file(path: &Path, r: &Resolver) -> Result<Value, String> {
             .collect();
         json!({
             "id": go_id,
+            "transform_id": tf.map(|t| t.id),
             "name": go.body.get("m_Name").cloned().unwrap_or(Value::Null),
             "active": go.body.get("m_IsActive").and_then(Value::as_i64) != Some(0),
             "tag": go.body.get("m_TagString").cloned().unwrap_or(Value::Null),
@@ -421,6 +423,7 @@ Transform:
         let v = export_file(&file, &r).unwrap();
         let root = &v["roots"][0];
         assert_eq!(root["name"], "Root");
+        assert_eq!(root["transform_id"], 11);
         assert_eq!(root["pos"], json!([1.5, 2.0, 0.0]));
         assert_eq!(root["rot"], json!([0.0, 0.0, 0.6, 0.8]));
         assert_eq!(root["scale"][0], -1.0);
@@ -430,6 +433,7 @@ Transform:
             "Sprite/coin.asset"
         );
         assert_eq!(root["children"][0]["name"], "Child");
+        assert_eq!(root["children"][0]["transform_id"], 21);
         assert_eq!(root["children"][0]["active"], false);
         std::fs::remove_dir_all(dir).ok();
     }

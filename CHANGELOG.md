@@ -9,6 +9,8 @@
   saves keep their formats.
 - Play authored portal opening, closing and destruction transitions. Persist
   their phase and pending triggers across saves.
+- Use the authored catapult firing markers, articulated chassis and wheel
+  physics, and Spoon launch position when enhanced assets are installed.
 
 ## 1.3.0 — 2026-11-08
 
