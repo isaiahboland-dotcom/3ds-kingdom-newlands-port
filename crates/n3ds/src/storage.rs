@@ -16,12 +16,21 @@ impl SdCard {
 }
 
 impl platform::Storage for SdCard {
-    fn read(&self, slot: &str) -> Option<Vec<u8>> {
-        crate::savefile::read(std::path::Path::new(&Self::path(slot))).ok()
+    fn read(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+        platform::savefile::read(std::path::Path::new(&Self::path(slot)))
+    }
+
+    fn read_backup(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+        platform::savefile::read_backup(std::path::Path::new(&Self::path(slot)))
     }
 
     fn write(&mut self, slot: &str, data: &[u8]) -> bool {
-        crate::savefile::write(std::path::Path::new(&Self::path(slot)), data).is_ok()
+        platform::savefile::write(std::path::Path::new(&Self::path(slot)), data).is_ok()
+    }
+
+    fn write_preserving_backup(&mut self, slot: &str, data: &[u8]) -> bool {
+        platform::savefile::write_preserving_backup(std::path::Path::new(&Self::path(slot)), data)
+            .is_ok()
     }
 
     fn delete(&mut self, slot: &str) {

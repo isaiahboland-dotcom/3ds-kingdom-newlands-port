@@ -10,7 +10,7 @@ use game::rng::Rng;
 
 use crate::heraldry;
 use crate::render::{Color, Draw, Rect, Renderer};
-use crate::session::Session;
+use crate::session::{Session, SlotState};
 use crate::sheet::Sheet;
 use crate::text;
 use crate::top;
@@ -204,7 +204,18 @@ fn plus(a: (f32, f32), x: f32, y: f32) -> (f32, f32) {
 }
 
 /// Handles a tap at touch-screen pixel `p`.
+const REPLACE_SAVE: Rect = Rect::new(169.0, 143.0, 128.0, 40.0);
+const CANCEL_SAVE: Rect = Rect::new(23.0, 143.0, 128.0, 40.0);
+
 pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
+    if s.pending_new_slot.is_some() {
+        if REPLACE_SAVE.contains(p) {
+            s.confirm_new_game();
+        } else if CANCEL_SAVE.contains(p) || PAUSE.contains(p) {
+            s.pending_new_slot = None;
+        }
+        return Tap::Nothing;
+    }
     if s.map_shown() {
         let world = &s.world;
         let Some(m) = &mut s.map else {
@@ -255,7 +266,11 @@ pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
         }
         for i in 0..game::save::SLOTS {
             if slot_save(i).contains(p) {
-                s.save_to(i);
+                if s.slots[i] == SlotState::Protected {
+                    s.pending_new_slot = Some(i);
+                } else {
+                    s.save_to(i);
+                }
             } else if slot_load(i).contains(p) {
                 s.load_from(i);
             }
@@ -273,6 +288,29 @@ pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
 
 pub fn draw(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
     r.clear(BACKGROUND);
+    if let Some(i) = s.pending_new_slot {
+        text::draw(
+            r,
+            sheet,
+            &format!("REPLACE SLOT {}?", i + 1),
+            24.0,
+            65.0,
+            22.0,
+            Color::WHITE,
+        );
+        text::draw(
+            r,
+            sheet,
+            "START A NEW GAME. KEEP THE REJECTED FILE.",
+            24.0,
+            99.0,
+            13.0,
+            Color::WHITE,
+        );
+        button(r, sheet, CANCEL_SAVE, "CANCEL", Color::WHITE);
+        button(r, sheet, REPLACE_SAVE, "REPLACE", GOLD);
+        return;
+    }
     if s.map_shown() {
         draw_map(s, sheet, r);
         return;
@@ -374,18 +412,30 @@ fn draw_pause(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
             16.0,
             color,
         );
-        let info = match &s.slots[i] {
-            Some(info) => format!(
-                "{} - DAY {} - {} COINS",
-                info.island.to_uppercase(),
-                info.day,
-                info.coins
+        let (info, load) = match &s.slots[i] {
+            SlotState::Saved(info) => (
+                format!(
+                    "{} - DAY {} - {} COINS",
+                    info.island.to_uppercase(),
+                    info.day,
+                    info.coins
+                ),
+                "LOAD",
             ),
-            None => "EMPTY".to_owned(),
+            SlotState::Recovered(info) => (
+                format!("BACKUP - DAY {} - {} COINS", info.day, info.coins),
+                "LOAD",
+            ),
+            SlotState::Empty => ("EMPTY".to_owned(), "NEW"),
+            SlotState::Protected => ("SAVE PROTECTED".to_owned(), "RETRY"),
         };
         text::draw(r, sheet, &info, row.x + 8.0, row.y + 34.0, 14.0, dim);
-        button(r, sheet, slot_save(i), "SAVE", Color::WHITE);
-        let load = if s.slots[i].is_some() { "LOAD" } else { "NEW" };
+        let save_label = if s.slots[i] == SlotState::Protected {
+            "NEW"
+        } else {
+            "SAVE"
+        };
+        button(r, sheet, slot_save(i), save_label, Color::WHITE);
         button(r, sheet, slot_load(i), load, Color::WHITE);
     }
     button(r, sheet, BANNER, "BANNER", Color::WHITE);
