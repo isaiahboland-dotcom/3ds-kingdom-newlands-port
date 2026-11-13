@@ -24,6 +24,13 @@ pub fn load_world(assets: &std::path::Path) -> Result<(WorldData, u32), String> 
     let path = assets.join("world.bin");
     let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let id = game::save::fingerprint(&bytes);
-    let world = postcard::from_bytes(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut world = postcard::from_bytes(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    let path = assets.join(scene::authored::FILENAME);
+    match scene::authored::read_file(&path) {
+        Ok(data) => scene::authored::AssetAnimation::install_gameplay(&data, id, &mut world)
+            .map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
     Ok((world, id))
 }

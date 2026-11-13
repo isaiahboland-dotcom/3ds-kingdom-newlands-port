@@ -9,6 +9,12 @@
 - Extract and draw authored sprite transforms and animation curves from an
   optional animation pack extension. Existing world data, sheets, and
   saves keep their formats.
+- Play authored portal opening, closing and destruction transitions. Persist
+  their phase and pending triggers across saves.
+- Use the authored catapult firing markers, articulated chassis and wheel
+  physics, and Spoon launch position when enhanced assets are installed.
+- Let bosses catch lodged catapult boulders and throw them back with the
+  authored hand animation, collision behavior, and save recovery.
 
 ## 1.3.0 — 2026-11-08
 

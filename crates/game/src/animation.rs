@@ -70,6 +70,66 @@ impl Default for Pose {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Affine2 {
+    /// Row-major linear basis in world coordinates (Y up).
+    pub basis: [f32; 4],
+    pub translation: [f32; 2],
+}
+
+impl Affine2 {
+    pub const IDENTITY: Self = Self {
+        basis: [1.0, 0.0, 0.0, 1.0],
+        translation: [0.0; 2],
+    };
+
+    pub fn from_pose(p: Pose) -> Self {
+        let [x, y, z, w] = p.rotation;
+        let n = x * x + y * y + z * z + w * w;
+        let k = if n > 0.0 { 2.0 / n } else { 0.0 };
+        Self {
+            basis: [
+                (1.0 - k * (y * y + z * z)) * p.scale[0],
+                k * (x * y - z * w) * p.scale[1],
+                k * (x * y + z * w) * p.scale[0],
+                (1.0 - k * (x * x + z * z)) * p.scale[1],
+            ],
+            translation: [p.position[0], p.position[1]],
+        }
+    }
+
+    /// Parent × local.
+    pub fn compose(self, local: Self) -> Self {
+        let [a, b, c, d] = self.basis;
+        let [e, f, g, h] = local.basis;
+        Self {
+            basis: [a * e + b * g, a * f + b * h, c * e + d * g, c * f + d * h],
+            translation: self.point(local.translation),
+        }
+    }
+
+    pub fn point(self, p: [f32; 2]) -> [f32; 2] {
+        let [a, b, c, d] = self.basis;
+        [
+            self.translation[0] + a * p[0] + b * p[1],
+            self.translation[1] + c * p[0] + d * p[1],
+        ]
+    }
+
+    pub fn screen_basis(self, mirrored: bool) -> [f32; 4] {
+        let [a, b, c, d] = self.basis;
+        let sign = if mirrored { -1.0 } else { 1.0 };
+        [sign * a, -sign * b, -c, d]
+    }
+
+    pub fn finite(self) -> bool {
+        self.basis
+            .into_iter()
+            .chain(self.translation)
+            .all(f32::is_finite)
+    }
+}
+
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TransformTrack {

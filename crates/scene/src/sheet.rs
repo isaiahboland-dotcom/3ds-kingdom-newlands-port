@@ -169,6 +169,19 @@ impl Sheet {
         Ok(())
     }
 
+    /// Bind gameplay data only when the same sidecar was fully accepted for drawing.
+    pub fn install_gameplay(&self, world: &mut game::data::WorldData) {
+        world.catapult_physics = self
+            .authored
+            .as_ref()
+            .map_or_else(Vec::new, |a| a.catapults.clone());
+        world.boss_throw = self.authored.as_ref().and_then(|a| a.boss_throw.clone());
+        world.boulder_walls = self
+            .authored
+            .as_ref()
+            .map_or_else(Vec::new, |a| a.boulder_walls.clone());
+    }
+
     pub fn authored(&self) -> Option<&crate::authored::AssetAnimation> {
         self.authored.as_ref()
     }
