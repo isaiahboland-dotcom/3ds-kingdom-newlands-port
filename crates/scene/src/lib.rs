@@ -5,6 +5,7 @@
 pub mod adpcm;
 #[cfg(feature = "clipfile")]
 pub mod clipfile;
+mod fires;
 pub mod heraldry;
 pub mod render;
 pub mod session;
