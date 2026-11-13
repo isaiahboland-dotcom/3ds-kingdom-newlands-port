@@ -2111,9 +2111,7 @@ impl BossProjectiles<'_> {
                             .filter(|b| {
                                 let dx = b.x - b.x.clamp(scan.x, scan.x + scan.w);
                                 let dy = b.y - b.y.clamp(scan.y, scan.y + scan.h);
-                                b.scan_eligible()
-                                    && b.runtime.held_by.is_none()
-                                    && dx * dx + dy * dy <= radius * radius
+                                b.scan_eligible() && dx * dx + dy * dy <= radius * radius
                             })
                             .map(|b| ProjectileRef::Boulder(b.runtime.id)),
                     )
@@ -2516,6 +2514,15 @@ mod tests {
             "the cache resolves the moved stone's live X"
         );
         assert_eq!(projectiles.boulders[0].runtime.held_by, Some(boss.id));
+        assert!(projectiles.boulders[1].stuck.is_some());
+
+        let mut other_boss = boss.clone();
+        other_boss.id += 1;
+        other_boss.boss_sight = BossSight::default();
+        assert!(
+            !projectiles.catch(&mut other_boss, &world, 0.15625),
+            "the held stone stays on the Projectiles layer and masks the lodged stone"
+        );
         assert!(projectiles.boulders[1].stuck.is_some());
     }
 
