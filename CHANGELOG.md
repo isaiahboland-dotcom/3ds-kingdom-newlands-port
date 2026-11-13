@@ -4,6 +4,8 @@
 
 ### Added
 
+- Use the original camera lead and target seek curves with enhanced asset packs.
+
 - Extract and draw authored sprite transforms and animation curves from an
   optional animation pack extension. Existing world data, sheets, and
   saves keep their formats.

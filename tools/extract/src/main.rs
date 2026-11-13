@@ -243,7 +243,16 @@ fn export_scenes(
         prefabs,
         clips: animations,
     };
-    let animation = authored.encode(game::save::fingerprint(&bytes))?;
+    let world_id = game::save::fingerprint(&bytes);
+    if let Some(camera) = world::camera_def(&main)? {
+        std::fs::write(out.join(scene::camera::FILENAME), camera.encode(world_id)?)
+            .map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(out.join(scene::camera::FILENAME)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
+        }
+    }
+    let animation = authored.encode(world_id)?;
     std::fs::write(out.join(scene::authored::FILENAME), animation).map_err(|e| e.to_string())?;
     println!(
         "world: {} blocks, {} protos, {} scatterables, {} islands, {} lights, {} days ({} KiB)",

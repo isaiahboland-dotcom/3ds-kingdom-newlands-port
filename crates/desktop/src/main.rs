@@ -223,6 +223,14 @@ async fn main() {
     }
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
+    match ::scene::camera::CameraDef::read_file(
+        std::path::Path::new(&dir).join(::scene::camera::FILENAME),
+        world_id,
+    ) {
+        Ok(Some(camera)) => app.install_camera(camera),
+        Ok(None) => {}
+        Err(e) => eprintln!("ignoring camera data: {e}"),
+    }
     app.slot = slot;
     if std::env::args().any(|a| a == "--paused") {
         app.set_paused(true);

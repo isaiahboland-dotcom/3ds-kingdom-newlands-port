@@ -4,6 +4,7 @@
 
 pub mod adpcm;
 pub mod authored;
+pub mod camera;
 #[cfg(feature = "clipfile")]
 pub mod clipfile;
 pub mod heraldry;

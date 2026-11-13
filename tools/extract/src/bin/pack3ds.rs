@@ -141,6 +141,8 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
 
     let world_bytes =
         std::fs::read(src.join("world.bin")).map_err(|e| format!("world.bin: {e}"))?;
+    let world_id = game::save::fingerprint(&world_bytes);
+    let camera = scene::camera::CameraDef::read_file(src.join(scene::camera::FILENAME), world_id)?;
     let mut out_sheet = sheet.clone();
     let authored = match read_file(src.join(FILENAME)) {
         Ok(bytes) => {
@@ -407,6 +409,15 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
     } else if let Err(e) = std::fs::remove_file(authored_out) {
         if e.kind() != std::io::ErrorKind::NotFound {
             return Err(format!("{FILENAME}: {e}"));
+        }
+    }
+    let camera_out = out.join(scene::camera::FILENAME);
+    if let Some(def) = camera {
+        let bytes = def.encode(world_id)?;
+        std::fs::write(camera_out, bytes).map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(camera_out) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
         }
     }
     let sd = out

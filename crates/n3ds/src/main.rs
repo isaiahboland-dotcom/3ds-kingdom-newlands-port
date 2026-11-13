@@ -114,6 +114,14 @@ fn main() {
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
+    match scene::camera::CameraDef::read_file(
+        format!("{ROMFS}/{}", scene::camera::FILENAME),
+        world_id,
+    ) {
+        Ok(Some(camera)) => s.install_camera(camera),
+        Ok(None) => {}
+        Err(e) => eprintln!("ignoring camera data: {e}"),
+    }
     if let Some(g) = saved {
         s.resume(g);
     }

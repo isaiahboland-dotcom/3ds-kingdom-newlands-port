@@ -13,6 +13,37 @@ use platform::Storage;
 
 use crate::touch::MapChoice;
 
+/// PC target routing: TeleporterExit and Boat disable lead; dropped crowns
+/// are tracked until pickup/despawn. Target changes preserve the old screen
+/// position and seek, except startup/resume which explicitly snaps.
+fn camera_target(game: &GameState) -> crate::camera::Target {
+    use crate::camera::{Subject, Target};
+    let (subject, x, lead) = if let Some(exit) = game.teleports.exit {
+        (Subject::Teleporter, exit.x, false)
+    } else if let Some(crown) = &game.greed.crown {
+        (Subject::Crown, crown.x, false)
+    } else if let Some(o) = game
+        .harbor
+        .boat
+        .as_ref()
+        .and_then(|b| game.level.index_of(b.object))
+        .map(|i| &game.level.objects[i])
+        .filter(|o| o.mode == game::boat::mode::SAILING)
+    {
+        (Subject::Boat(o.id), o.x, false)
+    } else if game.game_over {
+        (Subject::Inactive, game.monarch.x, false)
+    } else {
+        (Subject::Monarch, game.monarch.x, true)
+    };
+    Target {
+        subject,
+        x,
+        direction: game.monarch.facing as f32,
+        lead,
+    }
+}
+
 pub struct Session {
     pub game: GameState,
     pub world: WorldData,
@@ -23,6 +54,8 @@ pub struct Session {
     pub paused: bool,
     pub debug: bool,
     pub camera_x: f32,
+    camera: Option<(crate::camera::CameraDef, crate::camera::Camera)>,
+    camera_end_time: f32,
     pub bag_bounce: f32,
     pub day_banner: Option<(u32, f32)>,
     /// Animator state for the monarch: current action and time in its clip.
@@ -119,6 +152,8 @@ impl Session {
             paused: false,
             debug: false,
             camera_x,
+            camera: None,
+            camera_end_time: 0.0,
             bag_bounce: 0.0,
             day_banner: None,
             anim: (Action::Stand, 0.0),
@@ -151,6 +186,23 @@ impl Session {
         s
     }
 
+    pub fn install_camera(&mut self, definition: crate::camera::CameraDef) {
+        let camera = crate::camera::Camera::new(camera_target(&self.game));
+        self.camera_x = camera.position();
+        self.water_camera = self.camera_x;
+        self.camera = Some((definition, camera));
+    }
+
+    fn reset_camera(&mut self) {
+        self.camera_end_time = 0.0;
+        self.camera_x = if let Some((_, camera)) = &mut self.camera {
+            *camera = crate::camera::Camera::new(camera_target(&self.game));
+            camera.position()
+        } else {
+            self.game.monarch.x
+        };
+    }
+
     /// Picks up a saved run. orig: `Loader` → `PersistentManager.Load()`.
     pub fn resume(&mut self, game: GameState) {
         self.game = game;
@@ -158,7 +210,7 @@ impl Session {
         if let Some((coat, look)) = self.progress.chosen {
             (self.game.coat, self.game.look) = (coat, look);
         }
-        self.camera_x = self.game.monarch.x;
+        self.reset_camera();
         self.water_camera = self.camera_x;
         self.music_cues.clear();
     }
@@ -348,7 +400,7 @@ impl Session {
         if voyage.is_some() {
             self.game.look = look;
         }
-        self.camera_x = self.game.monarch.x;
+        self.reset_camera();
         self.won_for = 0.0;
         // orig: UnlockManager.Restore → AutoSave.
         if voyage.is_some() {
@@ -412,15 +464,29 @@ impl Session {
                 (action, 0.0)
             };
             self.t += TICK;
+            if let Some((definition, camera)) = &mut self.camera {
+                let mut target = camera_target(&self.game);
+                if self.game.game_over && !self.game.won {
+                    self.camera_end_time += TICK;
+                    if self.camera_end_time >= 4.0 {
+                        target.subject = crate::camera::Subject::Monarch;
+                        target.x = self.game.monarch.x;
+                        target.lead = false;
+                    }
+                }
+                self.camera_x = camera.step(definition, target, TICK);
+            }
         }
         // orig: MainCamera follows the monarch with a lead; plain follow for now.
         // orig: MainCamera follows the teleporter exit while it flies.
-        let target = match self.game.teleports.exit {
-            Some(e) => e.x,
-            None => self.game.monarch.x + self.game.monarch.velocity * 0.5,
-        };
-        self.camera_x +=
-            (target - self.camera_x) * (1.0 - (-4.0 * TICK * ticks.max(1) as f32).exp());
+        if self.camera.is_none() {
+            let target = match self.game.teleports.exit {
+                Some(e) => e.x,
+                None => self.game.monarch.x + self.game.monarch.velocity * 0.5,
+            };
+            self.camera_x +=
+                (target - self.camera_x) * (1.0 - (-4.0 * TICK * ticks.max(1) as f32).exp());
+        }
         // orig: Water.Update: the maps drift and keep still against the ground
         // as the camera pans (a quarter of a map per unit, 4 maps per band).
         // No wind yet, so the fine map only follows the camera.

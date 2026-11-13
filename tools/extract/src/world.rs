@@ -83,6 +83,44 @@ fn has_any(node: &Value, types: &[&'static str]) -> Option<&'static str> {
     None
 }
 
+pub fn camera_def(main: &Value) -> Result<Option<scene::camera::CameraDef>, String> {
+    let Some((_, fields)) = find_component(main, "MainCamera") else {
+        return Ok(None);
+    };
+    use game::animation::{Key, Tangent};
+    let keys = |name: &str| -> Result<Vec<Key>, String> {
+        fields
+            .get(name)
+            .and_then(|field| field.get("m_Curve"))
+            .unwrap_or(&Value::Null)
+            .as_array()
+            .ok_or_else(|| format!("camera {name}: no curve"))?
+            .iter()
+            .map(|k| {
+                let f = |field: &str| {
+                    k[field]
+                        .as_f64()
+                        .map(|v| v as f32)
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("camera {name}.{field}: invalid key"))
+                };
+                Ok(Key {
+                    time: f("time")?,
+                    value: f("value")?,
+                    in_tangent: Tangent::Slope(f("inSlope")?),
+                    out_tangent: Tangent::Slope(f("outSlope")?),
+                })
+            })
+            .collect()
+    };
+    Ok(Some(scene::camera::CameraDef {
+        lead: flag(fields, "lead"),
+        max_lead_speed: num(fields, "maxLeadSpeed"),
+        lead_over_time: keys("leadOverTime")?,
+        seek_speed_by_distance: keys("seekSpeedByDistance")?,
+    }))
+}
+
 fn num(f: &Map<String, Value>, k: &str) -> f32 {
     f.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32
 }
