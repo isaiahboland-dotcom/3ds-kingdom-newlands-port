@@ -211,6 +211,7 @@ pub fn on_event(
             _ => {}
         },
         GameEvent::Greed(e) => match e {
+            GreedEvent::BoulderThrown { x } => cue(w.audio.sound("Boss.throwSound"), Some(x)),
             GreedEvent::Charge(t) => cue(w.audio.sound("Troll.chargeSound"), troll_x(g, t)),
             GreedEvent::PortalOpened(id) => cue(
                 w.audio.sound("EnemyManager.enemiesSpawnedSound"),
@@ -236,6 +237,10 @@ pub fn on_event(
             ),
             _ => {}
         },
+        GameEvent::BoulderBurst { x, .. } => cue(w.audio.sound("Boulder.explosionSound"), Some(x)),
+        GameEvent::Catapult(game::siege::CatapultEvent::Fired { x, .. }) => {
+            cue(w.audio.sound("Catapult.fireSound"), Some(x))
+        }
         GameEvent::CrownLost => cue(w.audio.sound("Player.lostCrownSound"), None),
         GameEvent::CrownRecovered => cue(w.audio.sound("Player.pickupCrownSound"), None),
         GameEvent::GameOver => {

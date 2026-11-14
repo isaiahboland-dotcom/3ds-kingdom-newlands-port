@@ -142,6 +142,8 @@ pub struct Sheet {
     pub names: Vec<String>,
     pub clips: Vec<(String, Clip)>,
     #[serde(skip)]
+    authored: Option<crate::authored::AssetAnimation>,
+    #[serde(skip)]
     index: Map<String, u32>,
     #[serde(skip)]
     clip_index: Map<String, usize>,
@@ -153,6 +155,49 @@ pub struct Sheet {
 }
 
 impl Sheet {
+    /// Installs optional presentation data after linking the legacy sheet.
+    pub fn install_authored(
+        &mut self,
+        bytes: &[u8],
+        world_id: u32,
+        world: &game::data::WorldData,
+    ) -> Result<(), String> {
+        self.authored = None;
+        let authored = crate::authored::AssetAnimation::decode(bytes, world_id)?;
+        authored.validate(world, self)?;
+        self.authored = Some(authored);
+        Ok(())
+    }
+
+    /// Bind gameplay data only when the same sidecar was fully accepted for drawing.
+    pub fn install_gameplay(&self, world: &mut game::data::WorldData) {
+        world.catapult_physics = self
+            .authored
+            .as_ref()
+            .map_or_else(Vec::new, |a| a.catapults.clone());
+        world.boss_throw = self.authored.as_ref().and_then(|a| a.boss_throw.clone());
+        world.boulder_walls = self
+            .authored
+            .as_ref()
+            .map_or_else(Vec::new, |a| a.boulder_walls.clone());
+    }
+
+    pub fn authored(&self) -> Option<&crate::authored::AssetAnimation> {
+        self.authored.as_ref()
+    }
+
+    /// An authored frame can explicitly hide its renderer. With no authored
+    /// track, fall back to the packed clip as before.
+    pub(crate) fn frame(&self, clip: &str, path: &str, time: f32) -> Option<Option<u32>> {
+        if let Some(frame) = self
+            .authored()
+            .and_then(|a| a.clips.clip(clip))
+            .and_then(|clip| clip.sprite_frame(path, time))
+        {
+            return Some(frame.and_then(|name| self.id(name)));
+        }
+        self.clip(clip)?.sprite(path, time).map(Some)
+    }
     /// Checks references in JSON and packed sheets before rendering.
     pub fn validate(&self) -> Result<(), String> {
         let valid = |id: u32| (id as usize) < self.sprites.len();
