@@ -188,15 +188,18 @@ fn main() {
             chorded = false;
         }
         let select = held.contains(KeyPad::SELECT);
-        // Compare the depth-sorted renderer with plain painter's order.
-        if down.contains(KeyPad::X) {
-            gpu.painter = !gpu.painter;
-        }
-        // Dev: if the water's reflection comes out mirrored or misplaced,
-        // Y tries the other ways of reading the copied screen.
-        if down.contains(KeyPad::Y) && !select {
-            gpu.reflect_mode = (gpu.reflect_mode + 1) % 4;
-        }
+        let mut diagnostics = platform::diagnostics::RenderDiagnostics {
+            painter: gpu.painter,
+            reflection: gpu.reflect_mode,
+        };
+        diagnostics.update(
+            s.debug,
+            down.contains(KeyPad::X),
+            down.contains(KeyPad::Y),
+            select,
+        );
+        gpu.painter = diagnostics.painter;
+        gpu.reflect_mode = diagnostics.reflection;
         let raw = if map_open || s.paused {
             RawInput::default()
         } else {

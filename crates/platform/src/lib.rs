@@ -5,6 +5,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+pub mod diagnostics;
+
 /// Where saves live: files on desktop, the SD card on 3DS
 /// (`sdmc:/3ds/kingdom-3ds/`). Slots are short names like `game::save::GAME_SLOT`.
 pub trait Storage {

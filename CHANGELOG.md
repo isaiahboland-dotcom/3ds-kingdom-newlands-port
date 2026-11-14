@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Restrict 3DS rendering diagnostics to debug mode and restore defaults on exit.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added
