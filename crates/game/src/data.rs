@@ -1007,6 +1007,8 @@ pub struct WorldData {
     pub water: WaterDef,
     pub audio: AudioDef,
     pub fire: FireStyleDef,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub bear_gallop: Option<crate::animation::GallopAbility>,
 }
 
 pub type SoundId = u16;

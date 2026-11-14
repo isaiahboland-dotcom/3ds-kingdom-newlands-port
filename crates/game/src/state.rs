@@ -784,51 +784,76 @@ impl GameState {
             self.steed_attack = 0.0;
             return;
         }
-        self.steed_attack -= dt;
-        if self.steed_attack > 0.0 {
-            return;
+        let attacks = if let Some(ability) = world.bear_gallop {
+            // Upstream stores a nonnegative countdown in this field. A negative
+            // value identifies an authored clip clock without changing the v5
+            // layout. A legacy countdown begins a fresh authored gallop.
+            let before = (-self.steed_attack).max(0.0);
+            let after = before + dt * ability.speed;
+            self.steed_attack = -after;
+            crate::animation::event_occurrences(
+                ability.marker,
+                ability.duration,
+                ability.looping,
+                before,
+                after,
+                before == 0.0,
+            )
+        } else {
+            self.steed_attack = self.steed_attack.max(0.0) - dt;
+            if self.steed_attack > 0.0 {
+                return;
+            }
+            self.steed_attack = BEAR_SWIPE_INTERVAL;
+            1
+        };
+        for _ in 0..attacks {
+            let f = self.monarch.facing as f32;
+            let (hx, _, hw, _) = def.hit_box;
+            let (a, b) = (self.monarch.x + hx * f, self.monarch.x + (hx + hw) * f);
+            let (lo, hi) = (a.min(b), a.max(b));
+            let mut hit = false;
+            let trolls: Vec<usize> = (0..self.greed.trolls.len())
+                .filter(|&i| {
+                    let t = &self.greed.trolls[i];
+                    !t.is_dead() && t.x > lo && t.x < hi
+                })
+                .collect();
+            for i in trolls {
+                hit = true;
+                let mut ge = Vec::new();
+                self.greed.hurt(i, def.attack_damage, &mut |e| ge.push(e));
+                events.extend(ge.into_iter().map(GameEvent::Greed));
+            }
+            let animals: Vec<u32> = self
+                .wildlife
+                .animals
+                .iter()
+                .filter(|w| !w.is_dead() && w.x > lo && w.x < hi)
+                .map(|w| w.id)
+                .collect();
+            for id in animals {
+                hit = true;
+                let mut we = Vec::new();
+                self.wildlife.hurt(
+                    id,
+                    def.attack_damage,
+                    self.monarch.x,
+                    &mut self.coins,
+                    &mut self.rng,
+                    &mut |e| we.push(e),
+                );
+                events.extend(we.into_iter().map(GameEvent::Wild));
+            }
+            if hit {
+                self.monarch.stamina -= def.attack_stamina_cost;
+            }
         }
-        self.steed_attack = BEAR_SWIPE_INTERVAL;
-        let f = self.monarch.facing as f32;
-        let (hx, _, hw, _) = def.hit_box;
-        let (a, b) = (self.monarch.x + hx * f, self.monarch.x + (hx + hw) * f);
-        let (lo, hi) = (a.min(b), a.max(b));
-        let mut hit = false;
-        let trolls: Vec<usize> = (0..self.greed.trolls.len())
-            .filter(|&i| {
-                let t = &self.greed.trolls[i];
-                !t.is_dead() && t.x > lo && t.x < hi
-            })
-            .collect();
-        for i in trolls {
-            hit = true;
-            let mut ge = Vec::new();
-            self.greed.hurt(i, def.attack_damage, &mut |e| ge.push(e));
-            events.extend(ge.into_iter().map(GameEvent::Greed));
-        }
-        let animals: Vec<u32> = self
-            .wildlife
-            .animals
-            .iter()
-            .filter(|w| !w.is_dead() && w.x > lo && w.x < hi)
-            .map(|w| w.id)
-            .collect();
-        for id in animals {
-            hit = true;
-            let mut we = Vec::new();
-            self.wildlife.hurt(
-                id,
-                def.attack_damage,
-                self.monarch.x,
-                &mut self.coins,
-                &mut self.rng,
-                &mut |e| we.push(e),
-            );
-            events.extend(we.into_iter().map(GameEvent::Wild));
-        }
-        if hit {
-            self.monarch.stamina -= def.attack_stamina_cost;
-        }
+    }
+
+    /// Clip time of the mounted bear's authored gallop.
+    pub fn bear_gallop_time(&self) -> f32 {
+        (-self.steed_attack).max(0.0)
     }
 
     /// Loaded ballistas aim at the toughest greed in front and fire.
@@ -1116,6 +1141,7 @@ impl GameState {
         self.monarch.stamina = 1.0;
         self.monarch.tired_timer = 0.0;
         self.steed_ability = 0.0;
+        self.steed_attack = 0.0;
         self.payables_dirty = true;
     }
 
@@ -2238,6 +2264,8 @@ impl GameState {
         }
         self.level.objects[i].hp -= damage;
         if self.level.objects[i].hp > 0 {
+            self.greed
+                .portal_hit(object, &mut |event| events.push(GameEvent::Greed(event)));
             return;
         }
         let mut out = Vec::new();
@@ -2715,6 +2743,106 @@ mod tests {
             g.tick(w, &Controls::default(), &mut ev);
         }
         ev
+    }
+
+    fn bear_marker_fixture() -> (WorldData, GameState) {
+        let mut w = fight_world();
+        w.steeds.push(crate::data::SteedDef {
+            clips: "player_bear".into(),
+            attacks_while_running: true,
+            hit_box: (0.0, 0.0, 2.0, 2.0),
+            attack_damage: 1,
+            run_speed: 2.0,
+            forest_speed_multiplier: 1.0,
+            ..Default::default()
+        });
+        w.bear_gallop = Some(crate::animation::GallopAbility {
+            duration: 0.8,
+            looping: true,
+            marker: 0.3,
+            speed: 2.0,
+        });
+        let mut g = GameState::new(&w, 0, 71);
+        g.tick(
+            &w,
+            &Controls {
+                direction: 1,
+                start_sprint: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        );
+        assert!(g.monarch.is_running());
+        // Fixture starts at the action entry; subsequent advancement uses the
+        // production mount update, including collisions and recovery effects.
+        g.steed_attack = 0.0;
+        g.greed.spawn_troll(
+            crate::greed::EnemyKind::Troll,
+            g.monarch.x + 0.5,
+            0,
+            false,
+            &mut g.rng,
+        );
+        g.greed.trolls[0].hp = 100;
+        (w, g)
+    }
+
+    #[test]
+    fn bear_swipes_use_authored_marker_speed_and_multi_loop_crossings() {
+        let (w, mut g) = bear_marker_fixture();
+        let mut ev = Vec::new();
+        g.update_steeds(&w, 0.14, &mut ev);
+        assert_eq!(g.greed.trolls[0].hp, 100);
+        g.update_steeds(&w, 0.02, &mut ev);
+        assert_eq!(g.greed.trolls[0].hp, 99, "0.3 clip seconds at 2x speed");
+        let (_, mut one_batch) = bear_marker_fixture();
+        let mut split = one_batch.clone();
+        one_batch.update_steeds(&w, 1.25, &mut Vec::new());
+        for _ in 0..125 {
+            split.update_steeds(&w, 0.01, &mut Vec::new());
+        }
+        assert_eq!(one_batch.greed.trolls[0].hp, 97);
+        assert_eq!(split.greed.trolls[0].hp, one_batch.greed.trolls[0].hp);
+        // Leaving gallop discards its pending marker; re-entry starts a new clip.
+        g.tick(&w, &Controls::default(), &mut Vec::new());
+        assert_eq!(g.bear_gallop_time(), 0.0);
+        g.tick(
+            &w,
+            &Controls {
+                direction: 1,
+                start_sprint: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        );
+        let hp = g.greed.trolls[0].hp;
+        g.update_steeds(&w, 0.10, &mut Vec::new());
+        assert_eq!(g.greed.trolls[0].hp, hp);
+        g.update_steeds(&w, 0.05, &mut Vec::new());
+        assert_eq!(g.greed.trolls[0].hp, hp - 1);
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn saved_bear_marker_phase_resumes_without_replaying_and_v5_accepts_countdown() {
+        let (w, mut g) = bear_marker_fixture();
+        g.update_steeds(&w, 0.14, &mut Vec::new());
+        let bytes = crate::save::save_game(&g, 91);
+        let mut old = g.clone();
+        old.steed_attack = 0.5;
+        let legacy = crate::save::save_game(&old, 91);
+        let mut resumed = crate::save::load_game(&bytes, 91, &w).unwrap();
+        for dt in [0.02, 0.03, 0.50] {
+            g.update_steeds(&w, dt, &mut Vec::new());
+            resumed.update_steeds(&w, dt, &mut Vec::new());
+        }
+        assert_eq!(
+            crate::save::save_game(&g, 91),
+            crate::save::save_game(&resumed, 91)
+        );
+        let migrated = crate::save::load_game(&legacy, 91, &w).unwrap();
+        assert_eq!(migrated.bear_gallop_time(), 0.0);
+        assert_eq!(migrated.greed.trolls[0].hp, 100);
     }
 
     #[test]

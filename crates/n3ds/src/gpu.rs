@@ -666,33 +666,39 @@ impl Gpu {
     fn sprite_part(&mut self, id: u32, at: (f32, f32), d: &Draw, tint: Color) {
         let s = *self.sheet.get(id);
         let (pw, ph) = self.page_size[s.page as usize];
-        let k = d.scale;
-        let px = if d.flip { s.w as f32 - s.px } else { s.px };
-        // Corners relative to the pivot, before rotation.
-        let (x0, y0) = (-px * k, -s.py * k);
-        let (x1, y1) = (x0 + s.w as f32 * k, y0 + s.h as f32 * k);
-        let rel = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
-        let corners = if d.angle == 0.0 {
-            let mut c = rel.map(|(x, y)| (at.0 + x, at.1 + y));
-            if k == 1.0 {
-                for p in &mut c {
-                    *p = (p.0.round(), p.1.round());
-                }
-            }
-            c
+        let authored = d.basis.is_some() || d.flip_y;
+        let corners = if authored {
+            scene::render::sprite_corners(&s, at, d)
         } else {
-            let (sin, cos) = d.angle.sin_cos();
-            rel.map(|(x, y)| (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos))
+            let k = d.scale;
+            let px = if d.flip { s.w as f32 - s.px } else { s.px };
+            // Corners relative to the pivot, before rotation.
+            let (x0, y0) = (-px * k, -s.py * k);
+            let (x1, y1) = (x0 + s.w as f32 * k, y0 + s.h as f32 * k);
+            let rel = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+            if d.angle == 0.0 {
+                let mut c = rel.map(|(x, y)| (at.0 + x, at.1 + y));
+                if k == 1.0 {
+                    for p in &mut c {
+                        *p = (p.0.round(), p.1.round());
+                    }
+                }
+                c
+            } else {
+                let (sin, cos) = d.angle.sin_cos();
+                rel.map(|(x, y)| (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos))
+            }
         };
         // Texture v runs bottom-up.
         let (u0, u1) = (s.x as f32 / pw, (s.x + s.w) as f32 / pw);
         let (v0, v1) = (1.0 - s.y as f32 / ph, 1.0 - (s.y + s.h) as f32 / ph);
         let (ul, ur) = if d.flip { (u1, u0) } else { (u0, u1) };
-        let uv = [(ul, v0), (ur, v0), (ur, v1), (ul, v1)];
+        let (vt, vb) = if d.flip_y { (v1, v0) } else { (v0, v1) };
+        let uv = [(ul, vt), (ur, vt), (ur, vb), (ul, vb)];
         let state = State {
             page: Some(s.page),
             additive: d.additive,
-            smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0),
+            smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0 || authored),
         };
         self.quad(state, corners, uv, [tint; 4]);
     }

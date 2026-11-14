@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Synchronize the bear's gallop swipe with its authored animation marker.
+
+- Extract and draw authored sprite transforms and animation curves from an
+  optional animation pack extension. Existing world data, sheets, and
+  saves keep their formats.
+- Play authored portal opening, closing and destruction transitions. Persist
+  their phase and pending triggers across saves.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added
