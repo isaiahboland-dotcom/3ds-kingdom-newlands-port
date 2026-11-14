@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Play a coin’s first ground impact at the point of contact.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added

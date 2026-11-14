@@ -58,7 +58,12 @@ impl EventLog {
     }
 
     pub fn push(&mut self, tick: u32, e: &GameEvent) {
-        let detail = format!("{e:?}");
+        // Contact position only affects playback. Keep the simulation event
+        // identity and trajectory of earlier recordings.
+        let detail = match e {
+            GameEvent::Coin(game::coins::CoinEvent::HitGroundAt { .. }) => "Coin(HitGround)".into(),
+            _ => format!("{e:?}"),
+        };
         let kind = kind_of(&detail);
         let line = format!("{tick} {kind} {detail}");
         for b in line.bytes().chain(std::iter::once(b'\n')) {
