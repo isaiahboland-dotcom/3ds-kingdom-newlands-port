@@ -4,8 +4,10 @@
 use std::path::Path;
 use std::rc::Rc;
 
-use ::scene::render::{Color, Draw, Rect, Renderer};
+use ::scene::authored::{read_file, FILENAME};
+use ::scene::render::{sprite_corners, Color, Draw, Rect, Renderer};
 use ::scene::sheet::Sheet;
+use game::data::WorldData;
 use macroquad::miniquad::{BlendFactor, BlendState, BlendValue, Equation};
 use macroquad::prelude as mq;
 use macroquad::prelude::{
@@ -91,8 +93,7 @@ void main() {
 "#;
 
 impl Assets {
-    /// `world_sprites`: `WorldData::sprites`, so the sheet can map its ids.
-    pub async fn load(dir: &Path, world_sprites: &[String]) -> Result<Assets, String> {
+    pub async fn load(dir: &Path, world: &WorldData, world_id: u32) -> Result<Assets, String> {
         let read = |name: &str| {
             std::fs::read_to_string(dir.join(name))
                 .map_err(|e| format!("{}: {e}", dir.join(name).display()))
@@ -102,7 +103,16 @@ impl Assets {
             &read("clips.json")?,
             &read("font.json")?,
         )?;
-        sheet.link(world_sprites);
+        sheet.link(&world.sprites);
+        let authored_path = dir.join(FILENAME);
+        let authored_error = match read_file(&authored_path) {
+            Ok(bytes) => sheet.install_authored(&bytes, world_id, world).err(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(e) = authored_error {
+            eprintln!("ignoring {}: {e}", authored_path.display());
+        }
         let mut pages = Vec::new();
         let mut smooth = Vec::new();
         for p in &sheet.pages {
@@ -202,28 +212,47 @@ impl Renderer for Assets {
         } else if d.additive {
             gl_use_material(&self.additive);
         }
-        let px = if d.flip { s.w as f32 - s.px } else { s.px };
-        let (mut x, mut y) = (at.0 - px * d.scale, at.1 - s.py * d.scale);
-        if d.scale == 1.0 && d.angle == 0.0 {
-            (x, y) = (x.round(), y.round());
+        let pages = if d.smooth { &self.smooth } else { &self.pages };
+        let texture = &pages[s.page as usize];
+        if d.basis.is_some() || d.flip_y {
+            let (pw, ph) = (texture.width(), texture.height());
+            let (u0, u1) = (s.x as f32 / pw, (s.x + s.w) as f32 / pw);
+            let (v0, v1) = (s.y as f32 / ph, (s.y + s.h) as f32 / ph);
+            let (ul, ur) = if d.flip { (u1, u0) } else { (u0, u1) };
+            let (vt, vb) = if d.flip_y { (v1, v0) } else { (v0, v1) };
+            let vertices = sprite_corners(&s, at, &d)
+                .into_iter()
+                .zip([(ul, vt), (ur, vt), (ur, vb), (ul, vb)])
+                .map(|((x, y), (u, v))| Vertex::new(x, y, 0.0, u, v, mc(d.tint)))
+                .collect();
+            draw_mesh(&Mesh {
+                vertices,
+                indices: vec![0, 1, 2, 0, 2, 3],
+                texture: Some(texture.clone()),
+            });
+        } else {
+            let px = if d.flip { s.w as f32 - s.px } else { s.px };
+            let (mut x, mut y) = (at.0 - px * d.scale, at.1 - s.py * d.scale);
+            if d.scale == 1.0 && d.angle == 0.0 {
+                (x, y) = (x.round(), y.round());
+            }
+            draw_texture_ex(
+                texture,
+                x,
+                y,
+                mc(d.tint),
+                DrawTextureParams {
+                    source: Some(mq::Rect::new(
+                        s.x as f32, s.y as f32, s.w as f32, s.h as f32,
+                    )),
+                    dest_size: Some(vec2(s.w as f32 * d.scale, s.h as f32 * d.scale)),
+                    rotation: d.angle,
+                    pivot: (d.angle != 0.0).then_some(vec2(at.0, at.1)),
+                    flip_x: d.flip,
+                    ..Default::default()
+                },
+            );
         }
-        let page = if d.smooth { &self.smooth } else { &self.pages };
-        draw_texture_ex(
-            &page[s.page as usize],
-            x,
-            y,
-            mc(d.tint),
-            DrawTextureParams {
-                source: Some(mq::Rect::new(
-                    s.x as f32, s.y as f32, s.w as f32, s.h as f32,
-                )),
-                dest_size: Some(vec2(s.w as f32 * d.scale, s.h as f32 * d.scale)),
-                rotation: d.angle,
-                pivot: (d.angle != 0.0).then_some(vec2(at.0, at.1)),
-                flip_x: d.flip,
-                ..Default::default()
-            },
-        );
         if d.recolor.is_some() || d.additive {
             gl_use_default_material();
         }

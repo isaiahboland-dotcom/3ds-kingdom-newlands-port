@@ -1007,6 +1007,9 @@ pub struct WorldData {
     pub water: WaterDef,
     pub audio: AudioDef,
     pub fire: FireStyleDef,
+    /// Optional data installed from the matching authored catapult asset.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub catapult_physics: Vec<(ProtoId, crate::siege::CatapultPhysics)>,
 }
 
 pub type SoundId = u16;
