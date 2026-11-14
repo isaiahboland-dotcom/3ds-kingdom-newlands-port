@@ -118,7 +118,7 @@ async fn main() {
     let previous_rt = target(TOP_W, TOP_H);
     let dir = std::env::var("KINGDOM_ASSETS").unwrap_or_else(|_| "assets".to_owned());
     let mut world_id = 0;
-    let world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))
+    let mut world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))
         .map_err(|e| e.to_string())
         .and_then(|b| {
             world_id = save::fingerprint(&b);
@@ -130,7 +130,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let mut assets = match Assets::load(std::path::Path::new(&dir), &world.sprites).await {
+    let mut assets = match Assets::load(std::path::Path::new(&dir), &world, world_id).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("could not load assets from {dir}/: {e}");
@@ -139,6 +139,9 @@ async fn main() {
         }
     };
     let sheet = assets.sheet.clone();
+    world.worker_hammer = sheet
+        .authored()
+        .and_then(|authored| game::animation::HammerTiming::from_library(&authored.clips));
     let seed = std::env::args()
         .skip_while(|a| a != "--seed")
         .nth(1)
@@ -513,7 +516,7 @@ async fn main() {
                 }
             }
             if frame == shot_frame && std::env::var_os("KINGDOM_DUMP").is_some() {
-                for (key, item) in draw_list(&app) {
+                for (key, item) in draw_list(&app, &sheet) {
                     if let DrawItem::Part(oi, pi) = item {
                         let o = &app.game.level.objects[oi];
                         let proto = &app.world.protos[o.proto as usize];

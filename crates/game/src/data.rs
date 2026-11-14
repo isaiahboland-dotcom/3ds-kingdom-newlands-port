@@ -1007,6 +1007,9 @@ pub struct WorldData {
     pub water: WaterDef,
     pub audio: AudioDef,
     pub fire: FireStyleDef,
+    /// Audio timing derived from the optional authored animation data.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub worker_hammer: Option<crate::animation::HammerTiming>,
 }
 
 pub type SoundId = u16;

@@ -1549,10 +1549,26 @@ impl Population {
         } else {
             Anim::Idle
         };
-        if anim != u.anim {
+        let entered = anim != u.anim;
+        if entered {
             u.anim = anim;
             u.anim_t = 0.0;
-        } else {
+        }
+        if let Some(timing) = ctx
+            .world
+            .worker_hammer
+            .as_ref()
+            .filter(|_| anim == Anim::Hammer)
+        {
+            // Worker.OnAnimHammerHit plays sound at the animation marker.
+            // Construction still uses Workable.FinishWork's work timer.
+            for _ in 0..timing.advance(&mut u.anim_t, dt, entered) {
+                events(UnitEvent::WorkSound {
+                    x: u.x,
+                    tree: false,
+                });
+            }
+        } else if !entered {
             u.anim_t += dt;
         }
         tool_hit
@@ -2479,10 +2495,12 @@ fn worker_work(
     }
     // A stroke finished. orig: Workable.FinishWork → OnWorkFinish.
     u.works_before_moving -= 1;
-    events(UnitEvent::WorkSound {
-        x: u.x,
-        tree: is_tree,
-    });
+    if is_tree || ctx.world.worker_hammer.is_none() {
+        events(UnitEvent::WorkSound {
+            x: u.x,
+            tree: is_tree,
+        });
+    }
     if is_tree {
         let o = &mut level.objects[i];
         o.chops_left -= 1;
@@ -3104,6 +3122,190 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit_ctx(world: &WorldData) -> Ctx<'_> {
+        Ctx {
+            world,
+            borders: Borders {
+                left: -10.0,
+                right: 10.0,
+            },
+            shelter: Borders {
+                left: -10.0,
+                right: 10.0,
+            },
+            campfire: 0.0,
+            daytime: true,
+            safe: true,
+            monarch_x: 0.0,
+            monarch_running: false,
+            forests: &[],
+            enemies: &[],
+            walls: &[],
+            farmlands: &[],
+            slots: &[],
+            archer_statue: false,
+            knight_statue: false,
+            worker_statue: false,
+            portals: &[],
+            knights: KnightCtx::default(),
+            coat: crate::kingdom::CoatOfArms {
+                primary: [1.0; 3],
+                secondary: [0.5; 3],
+                emblem: [0.0; 3],
+            },
+            wildlife: &[],
+            closest_forest: (-20.0, 20.0),
+            boat: None,
+        }
+    }
+
+    #[test]
+    fn hammer_impact_sound_uses_clip_marker_without_finishing_work_early() {
+        use crate::animation::{Clip, Event, EventKind};
+        let mut world = WorldData::default();
+        world.protos.push(crate::data::Proto {
+            building: Some(crate::data::BuildingDef {
+                build_points: 20,
+                auto_build_rate: 0.0,
+                scaffold: vec![],
+            }),
+            ..Default::default()
+        });
+        let mut library = crate::animation::Library::default();
+        library.clips.push((
+            "worker_hammer".into(),
+            Clip {
+                length: 1.0,
+                looping: true,
+                events: vec![Event {
+                    time: 0.41666666,
+                    kind: EventKind::HammerHit,
+                    float_parameter: 0.0,
+                    int_parameter: 0,
+                    string_parameter: Default::default(),
+                }],
+                ..Default::default()
+            },
+        ));
+        world.worker_hammer = crate::animation::HammerTiming::from_library(&library);
+        assert!(world.worker_hammer.is_some());
+        let ctx = unit_ctx(&world);
+        let mut level = Level::empty(-20.0, 40.0);
+        let target = level.add(crate::level::instantiate(
+            &world,
+            0,
+            crate::data::Layer::Game,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ));
+        level.objects[0].build = Some(0.0);
+        let mut p = Population::default();
+        let mut rng = Rng::new(73);
+        p.spawn(Role::Worker, 0.0, &mut rng);
+        p.units[0].ai = Ai::Work {
+            target,
+            working: true,
+            t: 0.0,
+        };
+        p.units[0].anim = Anim::Hammer;
+        p.units[0].works_before_moving = 10;
+        let mut legacy_population = p.clone();
+        let mut legacy_level = level.clone();
+        let mut legacy_rng = rng.clone();
+        let mut legacy_world = world.clone();
+        legacy_world.worker_hammer = None;
+        let legacy_ctx = unit_ctx(&legacy_world);
+        let mut legacy_coins = Coins::default();
+        let mut legacy_events = Vec::new();
+        for _ in 0..27 {
+            legacy_population.update(
+                1.0 / 60.0,
+                &legacy_ctx,
+                &mut legacy_level,
+                &mut legacy_coins,
+                &mut legacy_rng,
+                |e| legacy_events.push(e),
+            );
+        }
+        assert!(legacy_events.is_empty());
+        for _ in 0..20 {
+            legacy_population.update(
+                1.0 / 60.0,
+                &legacy_ctx,
+                &mut legacy_level,
+                &mut legacy_coins,
+                &mut legacy_rng,
+                |e| legacy_events.push(e),
+            );
+        }
+        assert_eq!(
+            legacy_events
+                .iter()
+                .filter(|e| matches!(e, UnitEvent::WorkSound { tree: false, .. }))
+                .count(),
+            1
+        );
+
+        let mut coins = Coins::default();
+        let mut ev = Vec::new();
+        for _ in 0..24 {
+            p.update(1.0 / 60.0, &ctx, &mut level, &mut coins, &mut rng, |e| {
+                ev.push(e)
+            });
+        }
+        assert!(!ev.iter().any(|e| matches!(e, UnitEvent::WorkSound { .. })));
+        assert_eq!(level.objects[0].build, Some(0.0));
+        #[cfg(feature = "save")]
+        {
+            // anim_t was already in the save prefix. Reload just before the
+            // marker and drive the same update without replaying the hit.
+            let saved = postcard::to_allocvec(&p).unwrap();
+            p = postcard::from_bytes(&saved).unwrap();
+        }
+        for _ in 0..3 {
+            p.update(1.0 / 60.0, &ctx, &mut level, &mut coins, &mut rng, |e| {
+                ev.push(e)
+            });
+        }
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, UnitEvent::WorkSound { tree: false, .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            level.objects[0].build,
+            Some(0.0),
+            "hammer sound is not FinishWork"
+        );
+        for _ in 0..20 {
+            p.update(1.0 / 60.0, &ctx, &mut level, &mut coins, &mut rng, |e| {
+                ev.push(e)
+            });
+        }
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, UnitEvent::BuildPoint(_)))
+                .count(),
+            1
+        );
+        assert_eq!(level.objects[0].build, legacy_level.objects[0].build);
+        assert_eq!(
+            ev.iter()
+                .filter(|e| matches!(e, UnitEvent::WorkSound { .. }))
+                .count(),
+            1
+        );
+        // Inert/stunned interrupts animation and cannot emit a pending hit.
+        p.units[0].anim_t = 0.4;
+        p.units[0].stunned = 1.0;
+        ev.clear();
+        p.update(0.1, &ctx, &mut level, &mut coins, &mut rng, |e| ev.push(e));
+        assert!(!ev.iter().any(|e| matches!(e, UnitEvent::WorkSound { .. })));
+    }
 
     #[test]
     fn citizens_lose_friction_and_drag_at_a_held_speed() {

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Extract and draw authored sprite transforms and animation curves from an
+  optional animation pack extension. Existing world data, sheets, and
+  saves keep their formats.
+- Play worker hammer sounds at the authored animation markers when the
+  animation pack is available.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added
