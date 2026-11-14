@@ -118,7 +118,7 @@ async fn main() {
     let previous_rt = target(TOP_W, TOP_H);
     let dir = std::env::var("KINGDOM_ASSETS").unwrap_or_else(|_| "assets".to_owned());
     let mut world_id = 0;
-    let world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))
+    let mut world: WorldData = match std::fs::read(std::path::Path::new(&dir).join("world.bin"))
         .map_err(|e| e.to_string())
         .and_then(|b| {
             world_id = save::fingerprint(&b);
@@ -130,7 +130,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let mut assets = match Assets::load(std::path::Path::new(&dir), &world.sprites).await {
+    let mut assets = match Assets::load(std::path::Path::new(&dir), &world, world_id).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("could not load assets from {dir}/: {e}");
@@ -139,6 +139,7 @@ async fn main() {
         }
     };
     let sheet = assets.sheet.clone();
+    sheet.install_gameplay(&mut world);
     let seed = std::env::args()
         .skip_while(|a| a != "--seed")
         .nth(1)
@@ -223,6 +224,21 @@ async fn main() {
     }
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
+    match ::scene::boulder_fx::BoulderFxDef::read(
+        std::path::Path::new(&dir).join(::scene::boulder_fx::FILENAME),
+        world_id,
+    ) {
+        Ok(def) => app.boulder_effects = def,
+        Err(e) => eprintln!("ignoring Boulder effects: {e}"),
+    }
+    match ::scene::camera::CameraDef::read_file(
+        std::path::Path::new(&dir).join(::scene::camera::FILENAME),
+        world_id,
+    ) {
+        Ok(Some(camera)) => app.install_camera(camera),
+        Ok(None) => {}
+        Err(e) => eprintln!("ignoring camera data: {e}"),
+    }
     app.slot = slot;
     if std::env::args().any(|a| a == "--paused") {
         app.set_paused(true);
@@ -513,7 +529,7 @@ async fn main() {
                 }
             }
             if frame == shot_frame && std::env::var_os("KINGDOM_DUMP").is_some() {
-                for (key, item) in draw_list(&app) {
+                for (key, item) in draw_list(&app, &sheet) {
                     if let DrawItem::Part(oi, pi) = item {
                         let o = &app.game.level.objects[oi];
                         let proto = &app.world.protos[o.proto as usize];

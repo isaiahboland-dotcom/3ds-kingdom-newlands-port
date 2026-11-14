@@ -22,6 +22,7 @@ use game::data::WorldData;
 use game::save;
 use game::state::TICK;
 use platform::Storage;
+use scene::authored::{read_file, FILENAME};
 use scene::session::Session;
 use scene::sheet::Sheet;
 use scene::{top, touch};
@@ -48,7 +49,8 @@ fn fail(gfx: &Gfx, hid: &mut Hid, apt: &Apt, msg: &str) {
 fn load() -> Result<(WorldData, u32, Sheet), String> {
     let bytes =
         std::fs::read(format!("{ROMFS}/world.bin")).map_err(|e| format!("world.bin: {e}"))?;
-    let world: WorldData = postcard::from_bytes(&bytes).map_err(|e| format!("world.bin: {e}"))?;
+    let mut world: WorldData =
+        postcard::from_bytes(&bytes).map_err(|e| format!("world.bin: {e}"))?;
     let world_id = save::fingerprint(&bytes);
     let sheet_bytes =
         std::fs::read(format!("{ROMFS}/sheet.bin")).map_err(|e| format!("sheet.bin: {e}"))?;
@@ -56,6 +58,15 @@ fn load() -> Result<(WorldData, u32, Sheet), String> {
         postcard::from_bytes(&sheet_bytes).map_err(|e| format!("sheet.bin: {e}"))?;
     sheet.validate()?;
     sheet.link(&world.sprites);
+    let authored_error = match read_file(format!("{ROMFS}/{FILENAME}")) {
+        Ok(bytes) => sheet.install_authored(&bytes, world_id, &world).err(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(e) = authored_error {
+        eprintln!("ignoring {FILENAME}: {e}");
+    }
+    sheet.install_gameplay(&mut world);
     Ok((world, world_id, sheet))
 }
 
@@ -105,6 +116,21 @@ fn main() {
     s.slot = slot;
     s.debug_lines = false;
     s.world_id = world_id;
+    match scene::boulder_fx::BoulderFxDef::read(
+        format!("{ROMFS}/{}", scene::boulder_fx::FILENAME),
+        world_id,
+    ) {
+        Ok(def) => s.boulder_effects = def,
+        Err(e) => eprintln!("ignoring Boulder effects: {e}"),
+    }
+    match scene::camera::CameraDef::read_file(
+        format!("{ROMFS}/{}", scene::camera::FILENAME),
+        world_id,
+    ) {
+        Ok(Some(camera)) => s.install_camera(camera),
+        Ok(None) => {}
+        Err(e) => eprintln!("ignoring camera data: {e}"),
+    }
     if let Some(g) = saved {
         s.resume(g);
     }

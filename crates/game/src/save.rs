@@ -14,6 +14,10 @@ use crate::state::GameState;
 /// Bumped whenever the saved state's layout changes.
 pub const VERSION: u16 = 5;
 const MAGIC: [u8; 4] = *b"KNL1";
+const EXTENSIONS: [u8; 4] = *b"KNEX";
+const PORTALS: [u8; 4] = *b"PORT";
+const CATAPULTS: [u8; 4] = *b"CATA";
+const THROWBACK: [u8; 4] = *b"BOSS";
 
 /// The slot names the backends store under. orig: `"AUTO"`, `"unlocks"`.
 pub const GAME_SLOT: &str = "game";
@@ -82,7 +86,117 @@ pub fn save_game(g: &GameState, world: u32) -> Vec<u8> {
     let mut out = header(world);
     // Serializing plain data into a Vec can't fail.
     out.extend(postcard::to_allocvec(g).expect("plain-data serialization cannot fail"));
+    let recoil = g.siege.save_recoil();
+    let boss = g.greed.save_bosses();
+    let boulders = g.siege.save_boulders();
+    if !g.greed.portal_visuals().is_empty()
+        || recoil.is_some()
+        || boss.is_some()
+        || boulders.is_some()
+    {
+        out.extend_from_slice(&EXTENSIONS);
+        if !g.greed.portal_visuals().is_empty() {
+            write_extension(&mut out, PORTALS, g.greed.portal_visuals());
+        }
+        if let Some(recoil) = recoil {
+            write_extension(&mut out, CATAPULTS, &recoil);
+        }
+        if boss.is_some() || boulders.is_some() {
+            write_extension(&mut out, THROWBACK, &(boss, boulders));
+        }
+    }
     out
+}
+
+fn write_extension<T: serde::Serialize + ?Sized>(out: &mut Vec<u8>, tag: [u8; 4], value: &T) {
+    let payload = postcard::to_allocvec(value).expect("plain-data serialization cannot fail");
+    let length = u32::try_from(payload.len()).expect("save extension exceeds 4 GiB");
+    out.extend_from_slice(&tag);
+    out.extend_from_slice(&length.to_le_bytes());
+    out.extend(payload);
+}
+
+fn extension<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, LoadError> {
+    let (value, rest) = postcard::take_from_bytes(data).map_err(|_| LoadError::Corrupt)?;
+    if rest.is_empty() {
+        Ok(value)
+    } else {
+        Err(LoadError::Corrupt)
+    }
+}
+
+fn load_extensions(
+    game: &mut GameState,
+    world: &crate::data::WorldData,
+    data: &[u8],
+) -> Result<(), LoadError> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let mut rest = data
+        .strip_prefix(&EXTENSIONS)
+        .filter(|data| !data.is_empty())
+        .ok_or(LoadError::Corrupt)?;
+    let mut seen_portals = false;
+    let mut seen_catapults = false;
+    let mut seen_throwback = false;
+    while !rest.is_empty() {
+        let (header, data) = rest.split_at_checked(8).ok_or(LoadError::Corrupt)?;
+        let length = u32::from_le_bytes(header[4..].try_into().expect("header size")) as usize;
+        let (payload, next) = data.split_at_checked(length).ok_or(LoadError::Corrupt)?;
+        match &header[..4] {
+            tag if tag == PORTALS && !seen_portals => {
+                let visuals = extension(payload)?;
+                if !game
+                    .greed
+                    .restore_portal_visuals(visuals, world, &game.level)
+                {
+                    return Err(LoadError::Corrupt);
+                }
+                seen_portals = true;
+            }
+            tag if tag == CATAPULTS && !seen_catapults => {
+                let (states, clocks) = extension(payload)?;
+                if !game
+                    .siege
+                    .restore_recoil(states, clocks, world, &game.level)
+                {
+                    return Err(LoadError::Corrupt);
+                }
+                seen_catapults = true;
+            }
+            tag if tag == THROWBACK && !seen_throwback => {
+                let (boss, boulders): (
+                    Option<crate::greed::BossSave>,
+                    Option<crate::siege::BoulderSave>,
+                ) = extension(payload)?;
+                if (boss.is_none() && boulders.is_none())
+                    || boulders.is_some_and(|saved| !game.siege.restore_boulders(saved))
+                {
+                    return Err(LoadError::Corrupt);
+                }
+                let owners_valid = if let Some(saved) = boss {
+                    game.greed
+                        .restore_bosses(saved, &game.siege, world.boss_throw.as_ref())
+                } else {
+                    game.greed.held_boulders_have_owners(&game.siege)
+                };
+                if !owners_valid {
+                    return Err(LoadError::Corrupt);
+                }
+                if world.boss_throw.is_none() {
+                    game.siege.discard_throwback();
+                }
+                seen_throwback = true;
+            }
+            tag if tag == PORTALS || tag == CATAPULTS || tag == THROWBACK => {
+                return Err(LoadError::Corrupt)
+            }
+            _ => return Err(LoadError::Format),
+        }
+        rest = next;
+    }
+    Ok(())
 }
 
 /// orig: `PersistentManager.Load()`.
@@ -104,19 +218,20 @@ pub fn load_game(
         for t in tails {
             old.extend_from_slice(t);
         }
-        postcard::from_bytes(&old)
+        extension(&old)
     };
-    let g: GameState = if stored == VERSION {
-        postcard::from_bytes(body)
+    let (mut g, rest): (GameState, &[u8]) = if stored == VERSION {
+        postcard::take_from_bytes(body).map_err(|_| LoadError::Corrupt)?
     } else {
-        postcard::from_bytes(body)
+        extension(body)
             .or_else(|_| with(&[&look]))
             .or_else(|_| with(&[&tutorial, &look]))
-    }
-    .map_err(|_| LoadError::Corrupt)?;
+            .map(|g| (g, &[][..]))?
+    };
     if !g.ids_valid(world) {
         return Err(LoadError::Corrupt);
     }
+    load_extensions(&mut g, world, rest)?;
     Ok(g)
 }
 

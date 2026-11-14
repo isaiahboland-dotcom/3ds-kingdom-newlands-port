@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use game::animation::Pose;
 use game::data::{
     BlockDef, BuildingDef, CampDef, DayDef, DirectorDef, FixedTransform, ForestItemDef, Kind,
     Layer, LayerDef, LevelConfigDef, LightPreset, Part, PayableDef, Placed, Proto, ProtoId,
@@ -13,6 +14,7 @@ use game::data::{
     UpgradeDef, WorldData, LIGHT_COLORS, LIGHT_FLOATS, TILE_SCATTER_FLAGS,
 };
 use game::data::{Curve, PortalDef, WallDef, WaveDef};
+use scene::authored::{PartVisual, PrefabVisual, TransformNode};
 use serde_json::{Map, Value};
 
 /// Components deriving from `Payable` (for overlap regions and half widths).
@@ -81,6 +83,68 @@ fn has_any(node: &Value, types: &[&'static str]) -> Option<&'static str> {
     None
 }
 
+pub fn camera_def(main: &Value) -> Result<Option<scene::camera::CameraDef>, String> {
+    let Some((_, fields)) = find_component(main, "MainCamera") else {
+        return Ok(None);
+    };
+    use game::animation::{Key, Tangent};
+    let keys = |name: &str| -> Result<Vec<Key>, String> {
+        fields
+            .get(name)
+            .and_then(|field| field.get("m_Curve"))
+            .unwrap_or(&Value::Null)
+            .as_array()
+            .ok_or_else(|| format!("camera {name}: no curve"))?
+            .iter()
+            .map(|k| {
+                let f = |field: &str| {
+                    k[field]
+                        .as_f64()
+                        .map(|v| v as f32)
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("camera {name}.{field}: invalid key"))
+                };
+                Ok(Key {
+                    time: f("time")?,
+                    value: f("value")?,
+                    in_tangent: Tangent::Slope(f("inSlope")?),
+                    out_tangent: Tangent::Slope(f("outSlope")?),
+                })
+            })
+            .collect()
+    };
+    let number = |name: &str| {
+        fields
+            .get(name)
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
+            .ok_or_else(|| format!("missing MainCamera.{name}"))
+    };
+    let strength = |axis| {
+        fields
+            .get("shakeStrength")
+            .and_then(|strength| strength[axis].as_f64())
+            .map(|v| v as f32)
+            .ok_or_else(|| format!("missing MainCamera.shakeStrength.{axis}"))
+    };
+    Ok(Some(scene::camera::CameraDef {
+        lead: flag(fields, "lead"),
+        max_lead_speed: num(fields, "maxLeadSpeed"),
+        lead_over_time: keys("leadOverTime")?,
+        seek_speed_by_distance: keys("seekSpeedByDistance")?,
+        shake: Some(scene::camera::CameraShakeDef {
+            duration: number("shakeDuration")?,
+            strength: [strength("x")?, strength("y")?],
+            vibrato: fields
+                .get("shakeVibrato")
+                .and_then(Value::as_u64)
+                .and_then(|v| u8::try_from(v).ok())
+                .ok_or("invalid shakeVibrato")?,
+            randomness: number("shakeRandomness")?,
+        }),
+    }))
+}
+
 fn num(f: &Map<String, Value>, k: &str) -> f32 {
     f.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32
 }
@@ -95,6 +159,104 @@ fn vec3(v: &Value) -> [f32; 3] {
 
 fn asset_path(v: Option<&Value>) -> Option<&str> {
     v?.get("asset")?.as_str()
+}
+
+// Scaffold modules have their own draw path. Layer 29 is seen by the
+// water reflection camera, whose extra pass is outside these visual parts.
+fn skip_part_subtree(node: &Value) -> bool {
+    comp(node, "ScaffoldModule").is_some() || node["layer"].as_i64() == Some(29)
+}
+
+fn active_part_children(node: &Value) -> impl Iterator<Item = &Value> {
+    node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|child| child["active"] == true)
+}
+
+fn local_pose(node: &Value, renderer: Option<&Map<String, Value>>) -> Pose {
+    let mut pose = Pose {
+        position: vec3(&node["pos"]),
+        scale: [0, 1, 2].map(|i| node["scale"][i].as_f64().unwrap_or(1.0) as f32),
+        rotation: [0, 1, 2, 3].map(|i| {
+            node["rot"][i]
+                .as_f64()
+                .unwrap_or(if i == 3 { 1.0 } else { 0.0 }) as f32
+        }),
+        ..Default::default()
+    };
+    if let Some(renderer) = renderer {
+        pose.color = ["r", "g", "b", "a"].map(|channel| {
+            renderer
+                .get("m_Color")
+                .and_then(|color| color[channel].as_f64())
+                .unwrap_or(1.0) as f32
+        });
+        pose.visible = flag(renderer, "m_Enabled");
+    }
+    pose
+}
+
+/// Collect visual metadata independently of the legacy sprite interning and
+/// world fields. The part list follows the same active renderer traversal.
+fn authored_prefab(node: &Value, legacy_parts: usize) -> Result<PrefabVisual, String> {
+    fn collect(
+        node: &Value,
+        path: String,
+        parent: Option<u16>,
+        visual: &mut PrefabVisual,
+    ) -> Result<(), String> {
+        if skip_part_subtree(node) {
+            return Ok(());
+        }
+        let index = u16::try_from(visual.nodes.len())
+            .map_err(|_| format!("too many authored transform nodes at {path}"))?;
+        let renderer = comp(node, "SpriteRenderer");
+        let mut local = local_pose(node, renderer);
+        if parent.is_none() {
+            // Object placement and its facing own the root translation and
+            // X reflection. Keep the authored rotation and scale magnitudes.
+            local.position = [0.0; 3];
+            local.scale[0] = local.scale[0].abs();
+        }
+        let animator = comp(node, "Animator")
+            .filter(|animator| flag(animator, "m_Enabled"))
+            .and_then(|animator| asset_path(animator.get("m_Controller")))
+            .map(str::to_owned);
+        if let Some(renderer) = renderer.filter(|renderer| flag(renderer, "m_Enabled")) {
+            visual.parts.push(PartVisual {
+                node: index,
+                flip_x: flag(renderer, "m_FlipX"),
+                flip_y: flag(renderer, "m_FlipY"),
+            });
+        }
+        visual.nodes.push(TransformNode {
+            path,
+            parent,
+            local,
+            animator,
+        });
+        for child in active_part_children(node) {
+            let path = &visual.nodes[index as usize].path;
+            let name = child["name"].as_str().unwrap_or_default();
+            let child_path = if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path}/{name}")
+            };
+            collect(child, child_path, Some(index), visual)?;
+        }
+        Ok(())
+    }
+
+    let mut visual = PrefabVisual::default();
+    collect(node, String::new(), None, &mut visual)?;
+    if visual.parts.len() != legacy_parts {
+        let name = node["name"].as_str().unwrap_or_default();
+        return Err(format!("authored renderer count differs for {name}"));
+    }
+    Ok(visual)
 }
 
 /// Materials with the `Recolor` toggle on.
@@ -122,6 +284,7 @@ fn recolor_materials(assets: &Path) -> HashSet<String> {
 struct Builder<'a> {
     inp: &'a Inputs<'a>,
     world: WorldData,
+    visuals: Vec<Result<PrefabVisual, String>>,
     sprite_ids: HashMap<String, SpriteId>,
     prefab_protos: HashMap<String, ProtoId>,
     recolor: HashSet<String>,
@@ -159,6 +322,7 @@ impl<'a> Builder<'a> {
     fn reserve(&mut self) -> ProtoId {
         let id = self.world.protos.len() as ProtoId;
         self.world.protos.push(Proto::default());
+        self.visuals.push(Ok(PrefabVisual::default()));
         id
     }
 
@@ -261,13 +425,7 @@ impl<'a> Builder<'a> {
         in_scaffold: bool,
     ) {
         let in_scaffold = in_scaffold || comp(node, "Scaffolding").is_some();
-        // Scaffold modules are exported separately (BuildingDef::scaffold).
-        if comp(node, "ScaffoldModule").is_some() {
-            return;
-        }
-        // Layer 29 is only seen by the water reflection camera (the boat's
-        // `Reflection`); the reflection pass isn't ported.
-        if node["layer"].as_i64() == Some(29) {
+        if skip_part_subtree(node) {
             return;
         }
         let mut me = parent;
@@ -329,10 +487,7 @@ impl<'a> Builder<'a> {
                 });
             }
         }
-        for child in node["children"].as_array().into_iter().flatten() {
-            if child["active"] != true {
-                continue;
-            }
+        for child in active_part_children(node) {
             let p = vec3(&child["pos"]);
             let s = vec3(&child["scale"]);
             let cat = [at[0] + scale.0 * p[0], at[1] + scale.1 * p[1], at[2] + p[2]];
@@ -360,6 +515,7 @@ impl<'a> Builder<'a> {
             &mut parts,
             &mut part_ids,
         );
+        self.visuals[id as usize] = authored_prefab(node, parts.len());
 
         let root_sprite = comp(node, "SpriteRenderer").and_then(|sr| {
             let r = sr.get("m_Sprite");
@@ -1844,11 +2000,21 @@ fn level_config(name: &str, f: &Map<String, Value>, waves: &HashMap<&str, u16>) 
     }
 }
 
-/// The world, and the asset path of each audio clip (`AudioDef::clips`).
-pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
+/// Legacy world data, audio clip source paths, and visual metadata by prototype ID.
+pub struct Export {
+    pub world: WorldData,
+    pub audio_paths: Vec<String>,
+    pub visuals: Vec<PrefabVisual>,
+    pub catapults: Vec<(ProtoId, game::siege::CatapultPhysics)>,
+    pub boss_throw: Option<game::data::BossThrowDef>,
+    pub boulder_walls: Vec<(ProtoId, Vec<game::data::BoulderWallPolygon>)>,
+}
+
+pub fn build(inp: &Inputs, animations: &game::animation::Library) -> Result<Export, String> {
     let mut b = Builder {
         inp,
         world: WorldData::default(),
+        visuals: Vec::new(),
         sprite_ids: HashMap::new(),
         prefab_protos: HashMap::new(),
         recolor: recolor_materials(inp.assets_dir),
@@ -2122,7 +2288,71 @@ pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
             .collect();
     }
     b.world.audio = found.audio;
-    Ok((b.world, found.clip_paths))
+    let visuals = b.visuals.into_iter().collect::<Result<Vec<_>, _>>()?;
+    let mut catapults = Vec::new();
+    let mut boss_throw = None;
+    let mut boulder_walls = Vec::new();
+    let boss = inp.prefabs.get("Resources/prefabs/enemies/Boss.prefab");
+    if boss.is_some() || b.world.protos.iter().any(|p| p.catapult.is_some()) {
+        let settings = inp
+            .assets_dir
+            .parent()
+            .ok_or("assets have no project directory")?
+            .join("ProjectSettings");
+        let physics =
+            read_physics_settings(&settings, "Physics2DSettings.asset", "Physics2DSettings")?;
+        let time = read_physics_settings(&settings, "TimeManager.asset", "TimeManager")?;
+        let ground = catapult_ground(inp.main)?;
+        if let Some(boss) = boss {
+            let boulder = inp
+                .prefabs
+                .get("Resources/prefabs/objects/Boulder.prefab")
+                .ok_or("missing authored Boulder prefab")?;
+            let definition =
+                boss_throw_definition(boss, boulder, &physics, &time, ground, inp.assets_dir)?;
+            boss_throw = Some(boss_throw_animation(definition, animations)?);
+            for (path, &id) in &b.prefab_protos {
+                if b.world.protos[id as usize].wall_def.is_some() {
+                    let polygons =
+                        obstacle_shapes(&inp.prefabs[path]).map_err(|e| format!("{path}: {e}"))?;
+                    if !polygons.is_empty() {
+                        boulder_walls.push((id, polygons));
+                    }
+                }
+            }
+            boulder_walls.sort_unstable_by_key(|(id, _)| *id);
+        }
+        for (path, &id) in &b.prefab_protos {
+            if b.world.protos[id as usize].catapult.is_none() {
+                continue;
+            }
+            let body = catapult_recoil(&inp.prefabs[path], &physics, &time, ground)
+                .map_err(|e| format!("{path}: {e}"))?;
+            catapults.push((
+                id,
+                catapult_animation(body, &visuals[id as usize], animations)
+                    .map_err(|e| format!("{path}: {e}"))?,
+            ));
+        }
+        catapults.sort_unstable_by_key(|(id, _)| *id);
+        if catapults.len()
+            != b.world
+                .protos
+                .iter()
+                .filter(|p| p.catapult.is_some())
+                .count()
+        {
+            return Err("catapult physics missing from an unlinked scene prototype".into());
+        }
+    }
+    Ok(Export {
+        world: b.world,
+        audio_paths: found.clip_paths,
+        visuals,
+        catapults,
+        boss_throw,
+        boulder_walls,
+    })
 }
 
 /// Data assets of `ty`, sorted by path, as (path, fields).
@@ -2237,4 +2467,1114 @@ fn lighting_and_days(world: &mut WorldData, inp: &Inputs) -> Result<(), String> 
             .collect(),
     };
     Ok(())
+}
+
+/// The arm's clip and prefab hierarchy are also used by the renderer. At
+/// extraction sample the identical local Spoon pose at the release marker.
+fn catapult_animation(
+    body: game::recoil::Definition,
+    visual: &PrefabVisual,
+    animations: &game::animation::Library,
+) -> Result<game::siege::CatapultPhysics, String> {
+    use game::animation::EventKind;
+    let fire = animations
+        .state("catapult", "Fire")
+        .ok_or("missing catapult Fire state")?;
+    let clip = animations
+        .state_clip("catapult", "Fire")
+        .ok_or("missing catapult Fire clip")?;
+    if fire.speed != 1.0
+        || fire.cycle_offset != 0.0
+        || fire.speed_parameter.is_some()
+        || clip.looping
+    {
+        return Err("unsupported catapult Fire timing".into());
+    }
+    let marker = |kind| {
+        let mut events = clip.events.iter().filter(|event| event.kind == kind);
+        let time = events
+            .next()
+            .ok_or_else(|| format!("missing catapult marker {kind:?}"))?
+            .time;
+        if events.next().is_some() {
+            return Err(format!("duplicate catapult marker {kind:?}"));
+        }
+        Ok(time)
+    };
+    let release = marker(EventKind::ProjectileRelease)?;
+    let node = visual
+        .nodes
+        .iter()
+        .position(|node| node.path == "Flippable/Arm/Spoon")
+        .ok_or("missing animated catapult Spoon")?;
+    let spoon = visual
+        .sampled_transform(node as u16, |_, node| {
+            clip.pose(&node.path, release, node.local)
+        })
+        .ok_or("invalid animated catapult Spoon pose")?
+        .0
+        .translation;
+    let definition = game::siege::CatapultPhysics {
+        body,
+        spoon,
+        release,
+        impact: marker(EventKind::ArmImpact)?,
+        done: marker(EventKind::FiringDone)?,
+    };
+    if !definition.valid() {
+        return Err("invalid catapult marker order or timing".into());
+    }
+    Ok(definition)
+}
+
+fn obstacle_shapes(node: &Value) -> Result<Vec<game::data::BoulderWallPolygon>, String> {
+    use game::animation::Affine2;
+
+    fn walk(
+        node: &Value,
+        at: Affine2,
+        out: &mut Vec<game::data::BoulderWallPolygon>,
+    ) -> Result<(), String> {
+        if node["active"].as_bool() == Some(false) {
+            return Ok(());
+        }
+        if node["layer"].as_u64() == Some(20) {
+            for c in node["components"].as_array().into_iter().flatten() {
+                let ty = c["type"].as_str().unwrap_or("");
+                if !ty.ends_with("Collider2D") {
+                    continue;
+                }
+                let f = c["fields"].as_object().ok_or("missing obstacle fields")?;
+                if !flag(f, "m_Enabled") {
+                    continue;
+                }
+                if flag(f, "m_UsedByComposite")
+                    || flag(f, "m_UsedByEffector")
+                    || flag(f, "m_IsTrigger")
+                {
+                    return Err("unsupported obstacle composite, effector or trigger".into());
+                }
+                if asset_path(f.get("m_Material"))
+                    != Some("PhysicsMaterial2D/Walls.physicsMaterial2D")
+                {
+                    return Err("unsupported obstacle material".into());
+                }
+                let offset = physics_xy(&f["m_Offset"])?;
+                let paths: Vec<Vec<[f32; 2]>> = match ty {
+                    "PolygonCollider2D" => f["m_Points"]["m_Paths"]
+                        .as_array()
+                        .ok_or("missing obstacle polygon")?
+                        .iter()
+                        .map(|path| {
+                            path.as_array()
+                                .ok_or_else(|| "missing obstacle vertices".to_owned())?
+                                .iter()
+                                .map(physics_xy)
+                                .collect()
+                        })
+                        .collect::<Result<_, _>>()?,
+                    "BoxCollider2D" => {
+                        let size = physics_xy(&f["m_Size"])?;
+                        if size.iter().any(|v| *v <= 0.0) {
+                            return Err("invalid obstacle box".into());
+                        }
+                        vec![vec![
+                            [-size[0] * 0.5, -size[1] * 0.5],
+                            [size[0] * 0.5, -size[1] * 0.5],
+                            [size[0] * 0.5, size[1] * 0.5],
+                            [-size[0] * 0.5, size[1] * 0.5],
+                        ]]
+                    }
+                    _ => return Err(format!("unsupported obstacle collider {ty}")),
+                };
+                for path in paths {
+                    let points: Vec<_> = path
+                        .iter()
+                        .map(|v| at.point([v[0] + offset[0], v[1] + offset[1]]))
+                        .collect();
+                    if points.len() < 3 || points.iter().flatten().any(|v| !v.is_finite()) {
+                        return Err("invalid obstacle vertices".into());
+                    }
+                    out.push(points);
+                }
+            }
+        }
+        for child in node["children"].as_array().into_iter().flatten() {
+            walk(
+                child,
+                at.compose(Affine2::from_pose(local_pose(child, None))),
+                out,
+            )?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(node, Affine2::IDENTITY, &mut out)?;
+    Ok(out)
+}
+
+/// Resolve Boss.hand through its authored reference and follow the projectile's
+/// actual collider material. The throwback solver expects a circular body with
+/// a centered collider and the game's normal and ghost collision layers.
+fn boss_throw_definition(
+    boss: &Value,
+    boulder: &Value,
+    physics: &Value,
+    time: &Value,
+    ground_y: f32,
+    assets_dir: &Path,
+) -> Result<game::data::BossThrowDef, String> {
+    let boss_script = comp(boss, "Boss").ok_or("missing Boss component")?;
+    let hand_id = boss_script
+        .get("hand")
+        .and_then(|hand| hand["local"].as_i64())
+        .ok_or("unlinked Boss.hand")?;
+    let hand = boss["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|node| node["transform_id"].as_i64() == Some(hand_id))
+        .ok_or("missing direct Boss.hand child")?;
+    let boss_pose = local_pose(boss, None);
+    let hand_pose = local_pose(hand, None);
+    if hand["name"] != "Hand"
+        || !hand["pos"].as_array().is_some_and(|position| {
+            position.len() == 3 && position.iter().all(|value| value.as_f64().is_some())
+        })
+        || hand_pose.scale != [1.0; 3]
+        || hand_pose.rotation != [0.0, 0.0, 0.0, 1.0]
+        || boss_pose.scale != [1.0; 3]
+        || boss_pose.rotation != [0.0, 0.0, 0.0, 1.0]
+    {
+        return Err("unsupported Boss.hand hierarchy or pose".into());
+    }
+    if comp(boss, "Animator").and_then(|a| asset_path(a.get("m_Controller")))
+        != Some("AnimatorController/boss.controller")
+    {
+        return Err("unsupported Boss animator controller".into());
+    }
+
+    let script = comp(boulder, "Boulder").ok_or("missing Boulder component")?;
+    let body = comp(boulder, "Rigidbody2D").ok_or("missing Boulder body")?;
+    let circle = comp(boulder, "CircleCollider2D").ok_or("missing Boulder circle")?;
+    let value = |fields: &Map<String, Value>, key: &str| -> Result<f32, String> {
+        fields
+            .get(key)
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("missing or invalid Boulder {key}"))
+    };
+    if boulder["layer"].as_u64() != Some(11)
+        || !flag(body, "m_Simulated")
+        || value(body, "m_BodyType")? != 0.0
+        || value(body, "m_GravityScale")? != 1.0
+        || value(body, "m_Constraints")? != 0.0
+        || value(body, "m_CollisionDetection")? != 0.0
+        || !flag(circle, "m_Enabled")
+        || flag(circle, "m_IsTrigger")
+        || flag(circle, "m_UsedByComposite")
+        || flag(circle, "m_UsedByEffector")
+        || physics_xy(
+            circle
+                .get("m_Offset")
+                .ok_or("missing Boulder collider offset")?,
+        )? != [0.0; 2]
+    {
+        return Err("unsupported Boulder body or collider".into());
+    }
+    for layer in [0, 8, 9, 10, 16, 20] {
+        if !physics_layers_collide(physics, 11, layer)?
+            || !physics_layers_collide(physics, layer, 11)?
+            || physics_layers_collide(physics, 17, layer)? != (layer == 0)
+            || physics_layers_collide(physics, layer, 17)? != (layer == 0)
+        {
+            return Err("unsupported Boulder normal/ghost collision layers".into());
+        }
+    }
+    if physics_xy(&physics["m_Gravity"])?[0] != 0.0
+        || physics_number(physics, "m_AutoSimulation")? != 1.0
+        || physics_number(time, "m_TimeScale")? != 1.0
+    {
+        return Err("unsupported Boulder simulation mode".into());
+    }
+    let material = asset_path(circle.get("m_Material")).ok_or("unlinked Boulder material")?;
+    let material = read_physics_settings(assets_dir, material, "PhysicsMaterial2D")?;
+    let force = boss_script
+        .get("throwForce")
+        .ok_or("missing Boss.throwForce")?;
+    let def = game::data::BossThrowDef {
+        force: (physics_number(force, "min")?, physics_number(force, "max")?),
+        hand: hand_pose.position,
+        boulder_radius: value(circle, "m_Radius")?,
+        boulder_ghost: value(script, "ghostTime")?,
+        boulder_damage: script
+            .get("hitDamage")
+            .and_then(Value::as_i64)
+            .and_then(|x| i32::try_from(x).ok())
+            .ok_or("invalid Boulder.hitDamage")?,
+        boulder_max_hits: script
+            .get("maxHitCitizens")
+            .and_then(Value::as_u64)
+            .and_then(|x| u8::try_from(x).ok())
+            .ok_or("invalid Boulder.maxHitCitizens")?,
+        boulder_linear_drag: value(body, "m_LinearDrag")?,
+        boulder_angular_drag: value(body, "m_AngularDrag")?,
+        boulder_restitution: physics_number(&material, "bounciness")?,
+        boulder_friction: physics_number(&material, "friction")?,
+        gravity: -physics_xy(&physics["m_Gravity"])?[1],
+        fixed_step: physics_number(time, "Fixed Timestep")?,
+        ground_y,
+        ..Default::default()
+    };
+    if !def.valid() {
+        return Err("invalid Boss throwback definition".into());
+    }
+    Ok(def)
+}
+
+fn boss_throw_animation(
+    mut definition: game::data::BossThrowDef,
+    animations: &game::animation::Library,
+) -> Result<game::data::BossThrowDef, String> {
+    let state = animations
+        .state("boss", "Throw")
+        .ok_or("missing boss Throw state")?;
+    let clip = animations
+        .state_clip("boss", "Throw")
+        .ok_or("missing boss Throw clip")?;
+    if state.speed != 1.0
+        || state.cycle_offset != 0.0
+        || state.speed_parameter.is_some()
+        || clip.looping
+    {
+        return Err("unsupported boss Throw timing".into());
+    }
+    let track = clip
+        .tracks
+        .iter()
+        .find(|track| track.path == "Hand")
+        .ok_or("missing boss Throw Hand track")?;
+    if track.position[0].is_empty() || track.position[1].is_empty() {
+        return Err("missing boss Throw Hand position curves".into());
+    }
+    let mut markers = clip
+        .events
+        .iter()
+        .filter(|event| event.kind == game::animation::EventKind::BoulderRelease);
+    definition.release = markers
+        .next()
+        .ok_or("missing boss Throw release marker")?
+        .time;
+    definition.clip_length = clip.length;
+    definition.hand_track = track.position.clone();
+    if markers.next().is_some() || !definition.valid() {
+        return Err("invalid boss Throw animation".into());
+    }
+    Ok(definition)
+}
+
+fn read_physics_settings(dir: &Path, name: &str, key: &str) -> Result<Value, String> {
+    let text = std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+    let body = text
+        .lines()
+        .filter(|l| !l.starts_with('%') && !l.starts_with("---"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value: Value = serde_yaml::from_str(&body).map_err(|e| format!("{name}: {e}"))?;
+    Ok(value[key].clone())
+}
+
+fn physics_number(v: &Value, key: &str) -> Result<f32, String> {
+    v[key]
+        .as_f64()
+        .map(|v| v as f32)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| format!("missing or invalid physics {key}"))
+}
+
+fn physics_xy(v: &Value) -> Result<[f32; 2], String> {
+    Ok([physics_number(v, "x")?, physics_number(v, "y")?])
+}
+
+fn default_physics_material(v: &Value) -> bool {
+    v.is_null() || v["fileID"].as_i64() == Some(0)
+}
+
+fn physics_layers_collide(physics: &Value, a: u32, b: u32) -> Result<bool, String> {
+    if a >= 32 || b >= 32 {
+        return Err("invalid physics layer".into());
+    }
+    let matrix = physics["m_LayerCollisionMatrix"]
+        .as_str()
+        .ok_or("missing physics layer collision matrix")?;
+    if matrix.len() != 256 || !matrix.is_ascii() {
+        return Err("invalid physics layer collision matrix".into());
+    }
+    let row = matrix
+        .get(a as usize * 8..a as usize * 8 + 8)
+        .ok_or("invalid physics layer collision matrix")?;
+    let mut bytes = [0; 4];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&row[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "invalid physics layer collision matrix")?;
+    }
+    Ok(u32::from_le_bytes(bytes) & (1 << b) != 0)
+}
+
+/// Level.GenerateInternal (original CIL 0x06000fe5) places the ground transform
+/// at world Y=0 and replaces its edge points with Y=.875*.5. Collider offset is
+/// still applied. The workshop's spawn Y=1 is above this surface, not the floor.
+fn catapult_ground(main: &Value) -> Result<f32, String> {
+    let (level_node, level) = find_component(main, "Level").ok_or("missing ground Level")?;
+    let id = level["ground"]["local"]
+        .as_i64()
+        .ok_or("unlinked Level.ground")?;
+    let ground = level_node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["id"].as_i64() == Some(id))
+        .ok_or("missing direct ground child")?;
+    for node in [level_node, ground] {
+        let pose = local_pose(node, None);
+        if pose.rotation != [0.0, 0.0, 0.0, 1.0] || pose.scale != [1.0; 3] {
+            return Err("unsupported transformed catapult ground".into());
+        }
+    }
+    if comp(ground, "Rigidbody2D").is_some() {
+        return Err("catapult ground must be static".into());
+    }
+    if ground["layer"].as_u64() != Some(0) {
+        return Err("unsupported catapult ground layer".into());
+    }
+    let edge = comp(ground, "EdgeCollider2D").ok_or("missing ground edge")?;
+    if !flag(edge, "m_Enabled")
+        || flag(edge, "m_IsTrigger")
+        || flag(edge, "m_UsedByComposite")
+        || flag(edge, "m_UsedByEffector")
+        || num(edge, "m_EdgeRadius") != 0.0
+        || !default_physics_material(&edge["m_Material"])
+    {
+        return Err("unsupported ground collider or material".into());
+    }
+    Ok(physics_xy(&edge["m_Offset"])?[1] + 0.875 * 0.5)
+}
+
+/// Extract the three dynamic bodies, free wheel hinges and flat-ground settings.
+/// Fail unsupported topology/materials instead of silently changing PC physics.
+fn catapult_recoil(
+    node: &Value,
+    physics: &Value,
+    time: &Value,
+    ground_height: f32,
+) -> Result<game::recoil::Definition, String> {
+    let p = |key| physics_number(physics, key);
+    let body_settings = |body: &Map<String, Value>| -> Result<(), String> {
+        if num(body, "m_BodyType") != 0.0
+            || !flag(body, "m_Simulated")
+            || flag(body, "m_UseAutoMass")
+            || num(body, "m_GravityScale") != 1.0
+            || num(body, "m_Constraints") != 0.0
+            || num(body, "m_SleepingMode") != 1.0
+            || num(body, "m_CollisionDetection") != 0.0
+            || num(body, "m_Interpolate") != 0.0
+            || !default_physics_material(&body["m_Material"])
+        {
+            return Err("unsupported dynamic body settings or material".into());
+        }
+        Ok(())
+    };
+    if physics_xy(&physics["m_Gravity"])?[0] != 0.0
+        || !default_physics_material(&physics["m_DefaultMaterial"])
+        || p("m_AutoSimulation")? != 1.0
+        || physics_number(time, "m_TimeScale")? != 1.0
+    {
+        return Err("unsupported project gravity, material or simulation mode".into());
+    }
+    let iterations = |key| -> Result<u8, String> {
+        physics[key]
+            .as_u64()
+            .filter(|v| *v > 0 && *v <= 255)
+            .map(|v| v as u8)
+            .ok_or_else(|| format!("unsupported physics {key}"))
+    };
+    let cat = comp(node, "Catapult").ok_or("missing Catapult")?;
+    fn count_physics(node: &Value, counts: &mut [u32; 3]) {
+        for c in node["components"].as_array().into_iter().flatten() {
+            let ty = c["type"].as_str().unwrap_or("");
+            if ty == "Rigidbody2D" {
+                counts[0] += 1;
+            }
+            if ty.ends_with("Collider2D") {
+                counts[1] += 1;
+            }
+            if ty.ends_with("Joint2D") {
+                counts[2] += 1;
+            }
+        }
+        for child in node["children"].as_array().into_iter().flatten() {
+            count_physics(child, counts);
+        }
+    }
+    let mut counts = [0; 3];
+    count_physics(node, &mut counts);
+    if counts != [3, 3, 2] {
+        return Err("unsupported extra/missing catapult bodies, colliders or joints".into());
+    }
+    let body = comp(node, "Rigidbody2D").ok_or("missing chassis body")?;
+    let body_id = comp_id(node, "Rigidbody2D").ok_or("missing chassis id")?;
+    body_settings(body)?;
+    // Catapult.Start forces root scale to one; direction only mirrors Flippable.
+    if local_pose(node, None).rotation != [0.0, 0.0, 0.0, 1.0] {
+        return Err("unsupported initial chassis rotation".into());
+    }
+    let children = node["children"]
+        .as_array()
+        .ok_or("missing catapult children")?;
+    let flippable = cat["flippable"]["local"]
+        .as_i64()
+        .ok_or("unlinked flippable transform")?;
+    let shape_node = children
+        .iter()
+        .find(|c| c["transform_id"].as_i64() == Some(flippable))
+        .ok_or("missing direct flippable child")?;
+    let mut wheels = Vec::new();
+    let mut wheel_layers = Vec::new();
+    for name in ["frontWheel", "rearWheel"] {
+        let id = cat[name]["local"].as_i64().ok_or("unlinked wheel body")?;
+        let wheel = children
+            .iter()
+            .find(|c| comp_id(c, "Rigidbody2D") == Some(id))
+            .ok_or("wheel must be a direct root child outside Flippable")?;
+        let rb = comp(wheel, "Rigidbody2D").ok_or("missing wheel body")?;
+        let layer = wheel["layer"]
+            .as_u64()
+            .filter(|v| *v < 32)
+            .ok_or("invalid wheel layer")? as u32;
+        if !physics_layers_collide(physics, layer, 0)?
+            || !physics_layers_collide(physics, 0, layer)?
+        {
+            return Err("wheel does not collide with the ground layer".into());
+        }
+        wheel_layers.push(layer);
+        let hinge = comp(wheel, "HingeJoint2D").ok_or("missing wheel hinge")?;
+        let circle = comp(wheel, "CircleCollider2D").ok_or("missing wheel circle")?;
+        body_settings(rb)?;
+        if wheel["transform_id"].as_i64() == Some(flippable)
+            || !flag(hinge, "m_Enabled")
+            || flag(hinge, "m_EnableCollision")
+            || flag(hinge, "m_UseMotor")
+            || flag(hinge, "m_UseLimits")
+            || flag(hinge, "m_AutoConfigureConnectedAnchor")
+            || hinge["m_BreakForce"].as_str() != Some("Infinity")
+            || hinge["m_BreakTorque"].as_str() != Some("Infinity")
+            || !flag(circle, "m_Enabled")
+            || flag(circle, "m_IsTrigger")
+            || flag(circle, "m_UsedByComposite")
+            || flag(circle, "m_UsedByEffector")
+            || !default_physics_material(&circle["m_Material"])
+            || hinge["m_ConnectedRigidBody"]["local"].as_i64() != Some(body_id)
+        {
+            return Err("unsupported wheel collider, material or hinge settings".into());
+        }
+        let pose = local_pose(wheel, None);
+        let anchor = physics_xy(&hinge["m_ConnectedAnchor"])?;
+        if [pose.position[0], pose.position[1]] != anchor
+            || pose.rotation != [0.0, 0.0, 0.0, 1.0]
+            || pose.scale != [1.0; 3]
+            || physics_xy(&hinge["m_Anchor"])? != [0.0; 2]
+            || physics_xy(&circle["m_Offset"])? != [0.0; 2]
+        {
+            return Err("unsupported wheel or hinge transform".into());
+        }
+        wheels.push((
+            num(rb, "m_Mass"),
+            num(circle, "m_Radius"),
+            anchor,
+            num(rb, "m_LinearDrag"),
+            num(rb, "m_AngularDrag"),
+        ));
+    }
+    if wheels[0].0 != wheels[1].0
+        || wheels[0].1 != wheels[1].1
+        || wheels[0].3 != wheels[1].3
+        || wheels[0].4 != wheels[1].4
+    {
+        return Err("asymmetric wheel mass, radius or drag".into());
+    }
+    if physics_layers_collide(physics, wheel_layers[0], wheel_layers[1])?
+        || physics_layers_collide(physics, wheel_layers[1], wheel_layers[0])?
+    {
+        return Err("unsupported wheel-to-wheel contacts".into());
+    }
+    let pose = local_pose(shape_node, None);
+    if pose.position != [0.0; 3] || pose.rotation != [0.0, 0.0, 0.0, 1.0] || pose.scale != [1.0; 3]
+    {
+        return Err("unsupported transformed chassis collider".into());
+    }
+    let shape = comp(shape_node, "PolygonCollider2D").ok_or("missing flippable chassis polygon")?;
+    // This sensor contributes mass, but the wheels alone contact the ground.
+    if !flag(shape, "m_Enabled")
+        || !flag(shape, "m_IsTrigger")
+        || flag(shape, "m_UsedByComposite")
+        || flag(shape, "m_UsedByEffector")
+        || !default_physics_material(&shape["m_Material"])
+    {
+        return Err("unsupported chassis sensor or material".into());
+    }
+    let paths = shape["m_Points"]["m_Paths"]
+        .as_array()
+        .ok_or("missing chassis polygon paths")?;
+    if paths.len() != 1 || physics_xy(&shape["m_Offset"])? != [0.0; 2] {
+        return Err("unsupported compound/offset chassis polygon".into());
+    }
+    let vertices = paths[0]
+        .as_array()
+        .ok_or("missing chassis vertices")?
+        .iter()
+        .map(physics_xy)
+        .collect::<Result<Vec<_>, _>>()?;
+    // Catapult.set_direction mirrors the polygon before moving centerOfMass to
+    // the physical rear wheel. Translating the unmirrored polygon is incorrect.
+    let reflected: Vec<_> = vertices.iter().map(|v| [-v[0], v[1]]).collect();
+    let mass = num(body, "m_Mass");
+    let d = game::recoil::Definition {
+        body_mass: mass,
+        body_inertia: game::recoil::polygon_inertia(&vertices, mass, wheels[0].2)
+            .ok_or("invalid chassis inertia")?,
+        rear_body_inertia: game::recoil::polygon_inertia(&reflected, mass, wheels[1].2)
+            .ok_or("invalid reflected chassis inertia")?,
+        body_linear_drag: num(body, "m_LinearDrag"),
+        body_angular_drag: num(body, "m_AngularDrag"),
+        wheel_linear_drag: wheels[0].3,
+        wheel_angular_drag: wheels[0].4,
+        wheel_mass: wheels[0].0,
+        wheel_radius: wheels[0].1,
+        front_anchor: wheels[0].2,
+        rear_anchor: wheels[1].2,
+        gravity: -physics_xy(&physics["m_Gravity"])?[1],
+        ground_height,
+        fixed_step: physics_number(time, "Fixed Timestep")?,
+        // Unity 2017.1 Rigidbody2D.sharedMaterial docs: absent collider, body
+        // and global materials use friction .4 and bounciness 0.
+        // https://docs.unity3d.com/2017.1/Documentation/ScriptReference/Rigidbody2D-sharedMaterial.html
+        friction: 0.4,
+        restitution: 0.0,
+        velocity_iterations: iterations("m_VelocityIterations")?,
+        position_iterations: iterations("m_PositionIterations")?,
+        velocity_threshold: p("m_VelocityThreshold")?,
+        max_linear_correction: p("m_MaxLinearCorrection")?,
+        max_angular_correction: p("m_MaxAngularCorrection")?.to_radians(),
+        max_linear_speed: p("m_MaxTranslationSpeed")?,
+        max_angular_speed: p("m_MaxRotationSpeed")?.to_radians(),
+        baumgarte: p("m_BaumgarteScale")?,
+        contact_offset: p("m_DefaultContactOffset")?,
+        sleep_time: p("m_TimeToSleep")?,
+        linear_sleep_tolerance: p("m_LinearSleepTolerance")?,
+        angular_sleep_tolerance: p("m_AngularSleepTolerance")?.to_radians(),
+    };
+    if !d.valid() {
+        return Err("invalid or unsupported recoil geometry/settings".into());
+    }
+    Ok(d)
+}
+
+#[cfg(test)]
+mod recoil_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn prefab() -> Value {
+        let component = |id, name, fields| json!({"id":id,"type":name,"fields":fields});
+        let rb = |mass, drag| {
+            json!({"m_Mass":mass,"m_BodyType":0,"m_LinearDrag":drag,"m_Simulated":1,
+                "m_UseAutoMass":0,"m_SleepingMode":1,"m_Material":null,
+                "m_AngularDrag":0,"m_GravityScale":1,"m_Constraints":0})
+        };
+        let wheel = |id, x| {
+            json!({"transform_id":id+100,"layer":17,"pos":[x,0.171875,0.0],"components":[
+                component(id,"Rigidbody2D",rb(1.0,0.0)),
+                component(id+10,"CircleCollider2D",json!({"m_Radius":0.171875,"m_IsTrigger":0,
+                    "m_Enabled":1,"m_Material":null,"m_Offset":{"x":0,"y":0}})),
+                component(id+20,"HingeJoint2D",json!({"m_UseMotor":0,"m_UseLimits":0,
+                    "m_Enabled":1,"m_BreakForce":"Infinity","m_BreakTorque":"Infinity",
+                    "m_ConnectedRigidBody":{"local":1},"m_Anchor":{"x":0,"y":0},
+                    "m_ConnectedAnchor":{"x":x,"y":0.171875}}))],"children":[]})
+        };
+        json!({"components":[component(1,"Rigidbody2D",rb(5.0,1.0)),
+            component(2,"Catapult",json!({"frontWheel":{"local":3},"rearWheel":{"local":4},
+                "flippable":{"local":105}}))],
+            "children":[wheel(3,0.421875),wheel(4,-0.421875),
+            {"transform_id":105,"pos":[0,0,0],"rot":[0,0,0,1],"scale":[1,1,1],
+                "children":[],"components":[component(5,"PolygonCollider2D",json!({
+                    "m_Enabled":1,"m_IsTrigger":1,"m_Material":null,"m_Offset":{"x":0,"y":0},
+                    "m_Points":{"m_Paths":[[
+                        {"x":0.29107857,"y":0.80594754},{"x":0.6120415,"y":0.03996277},
+                        {"x":-0.256279,"y":0.0318774},{"x":-0.35272598,"y":0.18773437}]]}}))]}]})
+    }
+
+    pub(super) fn physics() -> Value {
+        json!({"m_Gravity":{"x":0,"y":-15},"m_DefaultMaterial":{"fileID":0},
+            "m_VelocityIterations":8,"m_PositionIterations":3,"m_VelocityThreshold":1,
+            "m_MaxLinearCorrection":0.2,"m_MaxAngularCorrection":8,"m_MaxTranslationSpeed":100,
+            "m_MaxRotationSpeed":360,"m_BaumgarteScale":0.2,"m_TimeToSleep":0.5,
+            "m_LinearSleepTolerance":0.01,"m_AngularSleepTolerance":2,"m_DefaultContactOffset":0.01,
+            "m_AutoSimulation":1,
+            "m_LayerCollisionMatrix":"c98bbf00c8000000c8000000ffffffffc8000000c8000000ffffffffffffffffc95c0100c9080000c8590100c9071100c8250500c8100100c8051100c9800000c97d1000c9000000c9100000c9000800c9482100c9001000c8008000c9004000c8000000c8000000c8000000c8000000c8000000c8000000c8000000c8000000"})
+    }
+    pub(super) fn time() -> Value {
+        json!({"Fixed Timestep":0.02,"m_TimeScale":1})
+    }
+    fn extract(node: &Value) -> Result<game::recoil::Definition, String> {
+        catapult_recoil(node, &physics(), &time(), 0.8675)
+    }
+    fn main_scene() -> Value {
+        json!({"roots":[{"components":[{"type":"Level","fields":{"ground":{"local":59}}}],
+            "children":[{"id":59,"layer":0,"pos":[10,0,0],"components":[{"type":"EdgeCollider2D", "fields":{
+                "m_Enabled":1,"m_IsTrigger":0,"m_Material":null,"m_EdgeRadius":0,
+                "m_Offset":{"x":0,"y":0.43},"m_Points":[{"x":-0.5,"y":0},{"x":0.5,"y":0}]}}]}]}]})
+    }
+
+    #[test]
+    fn catapult_physics_retains_three_body_geometry_drag_and_settings() {
+        let d = extract(&prefab()).unwrap();
+        assert_eq!(d.body_mass, 5.0);
+        assert_eq!(d.front_anchor, [0.421875, 0.171875]);
+        assert_eq!(d.rear_anchor, [-0.421875, 0.171875]);
+        assert_eq!(
+            (d.wheel_mass, d.wheel_radius, d.gravity, d.fixed_step),
+            (1.0, 0.171875, 15.0, 0.02)
+        );
+        assert!((d.body_inertia - 0.8364514).abs() < 1e-6);
+        assert!((d.body_inertia - d.rear_body_inertia).abs() < 1e-6);
+        assert_eq!(
+            (
+                d.body_linear_drag,
+                d.body_angular_drag,
+                d.wheel_linear_drag,
+                d.wheel_angular_drag
+            ),
+            (1.0, 0.0, 0.0, 0.0)
+        );
+        assert_eq!((d.velocity_iterations, d.position_iterations), (8, 3));
+        assert_eq!(
+            (d.friction, d.restitution, d.velocity_threshold),
+            (0.4, 0.0, 1.0)
+        );
+        assert_eq!(
+            (d.max_linear_correction, d.max_linear_speed, d.baumgarte),
+            (0.2, 100.0, 0.2)
+        );
+        assert!((d.max_angular_correction - 8f32.to_radians()).abs() < 1e-6);
+        assert!((d.max_angular_speed - core::f32::consts::TAU).abs() < 1e-6);
+        assert_eq!(
+            (d.contact_offset, d.sleep_time, d.linear_sleep_tolerance),
+            (0.01, 0.5, 0.01)
+        );
+        assert!((d.angular_sleep_tolerance - 2f32.to_radians()).abs() < 1e-6);
+        assert_eq!(d.ground_height, 0.8675);
+        let mut changed = prefab();
+        changed["components"][0]["fields"]["m_Mass"] = json!(10.0);
+        let heavier = extract(&changed).unwrap();
+        assert!((heavier.body_inertia - d.body_inertia * 2.0).abs() < 1e-6);
+        assert!((heavier.rear_body_inertia - d.rear_body_inertia * 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn extraction_rejects_topology_that_the_three_body_solver_cannot_represent() {
+        for (pointer, value) in [
+            ("/children/0/components/2/fields/m_UseMotor", json!(1)),
+            ("/children/0/components/2/fields/m_UseLimits", json!(1)),
+            ("/children/0/components/2/fields/m_BreakForce", json!(100)),
+            (
+                "/children/0/components/2/fields/m_EnableCollision",
+                json!(1),
+            ),
+            (
+                "/children/0/components/1/fields/m_Material",
+                json!({"asset":"custom"}),
+            ),
+            ("/components/0/fields/m_Material", json!({"asset":"custom"})),
+            ("/components/0/fields/m_Simulated", json!(0)),
+            ("/components/0/fields/m_Constraints", json!(1)),
+            ("/children/2/components/0/fields/m_IsTrigger", json!(0)),
+            ("/children/2/transform_id", json!(999)),
+            ("/children/0/pos/0", json!(0.5)),
+        ] {
+            let mut node = prefab();
+            if let Some(slot) = node.pointer_mut(pointer) {
+                *slot = value;
+            } else {
+                let (parent, key) = pointer.rsplit_once('/').unwrap();
+                node.pointer_mut(parent).unwrap()[key] = value;
+            }
+            assert!(extract(&node).is_err(), "accepted {pointer}");
+        }
+        let mut node = prefab();
+        let wheel = node["children"].as_array_mut().unwrap().remove(0);
+        node["children"][1]["children"]
+            .as_array_mut()
+            .unwrap()
+            .push(wheel);
+        assert!(
+            extract(&node).is_err(),
+            "wheel under Flippable would mirror physical bodies"
+        );
+        let mut node = prefab();
+        node["components"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"BoxCollider2D","fields":{}}));
+        assert!(
+            extract(&node).is_err(),
+            "an extra shape changes mass/contact geometry"
+        );
+    }
+
+    #[test]
+    fn extraction_retains_changed_solver_settings_and_rejects_unsupported_defaults() {
+        let mut p = physics();
+        p["m_VelocityIterations"] = json!(12);
+        p["m_PositionIterations"] = json!(6);
+        p["m_Gravity"]["y"] = json!(-12);
+        p["m_MaxAngularCorrection"] = json!(4);
+        let d = catapult_recoil(&prefab(), &p, &time(), 0.8675).unwrap();
+        assert_eq!(
+            (d.velocity_iterations, d.position_iterations, d.gravity),
+            (12, 6, 12.0)
+        );
+        assert_eq!(d.max_angular_correction, 4f32.to_radians());
+        p["m_DefaultMaterial"] = json!({"fileID":123});
+        assert!(catapult_recoil(&prefab(), &p, &time(), 0.8675).is_err());
+        let mut t = time();
+        t["Fixed Timestep"] = json!(0);
+        assert!(catapult_recoil(&prefab(), &physics(), &t, 0.8675).is_err());
+        p = physics();
+        p["m_VelocityIterations"] = json!(256);
+        assert!(catapult_recoil(&prefab(), &p, &time(), 0.8675).is_err());
+        p = physics();
+        p["m_LayerCollisionMatrix"] = json!("00000000".repeat(32));
+        assert!(catapult_recoil(&prefab(), &p, &time(), 0.8675).is_err());
+        p["m_LayerCollisionMatrix"] = json!("ffffffff".repeat(32));
+        assert!(catapult_recoil(&prefab(), &p, &time(), 0.8675).is_err());
+    }
+
+    #[test]
+    fn physical_ground_uses_runtime_edge_points_plus_authored_offset() {
+        let mut main = main_scene();
+        assert_eq!(catapult_ground(&main).unwrap(), 0.8675);
+        // Serialized editor points and Y position are replaced by GenerateInternal.
+        main["roots"][0]["children"][0]["pos"][1] = json!(99);
+        main["roots"][0]["children"][0]["components"][0]["fields"]["m_Points"][0]["y"] = json!(88);
+        assert_eq!(catapult_ground(&main).unwrap(), 0.8675);
+        main["roots"][0]["children"][0]["components"][0]["fields"]["m_Offset"]["y"] = json!(0.5);
+        assert_eq!(catapult_ground(&main).unwrap(), 0.9375);
+        main["roots"][0]["children"][0]["components"][0]["fields"]["m_IsTrigger"] = json!(1);
+        assert!(catapult_ground(&main).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires the user's private PC asset export; set KINGDOM_RECOIL_REFERENCE_ASSETS"]
+    fn local_reference_catapult_physics_export() {
+        let assets =
+            std::path::PathBuf::from(std::env::var("KINGDOM_RECOIL_REFERENCE_ASSETS").unwrap());
+        let guids = crate::guid_map(&assets);
+        let resolver = crate::scenes::Resolver::new(&guids, &assets);
+        let tree = crate::scenes::export_file(
+            &assets.join("Resources/prefabs/objects/Catapult.prefab"),
+            &resolver,
+        )
+        .unwrap();
+        let main = crate::scenes::export_file(&assets.join("main.unity"), &resolver).unwrap();
+        let settings = assets.parent().unwrap().join("ProjectSettings");
+        let p = read_physics_settings(&settings, "Physics2DSettings.asset", "Physics2DSettings")
+            .unwrap();
+        let t = read_physics_settings(&settings, "TimeManager.asset", "TimeManager").unwrap();
+        let def =
+            catapult_recoil(&tree["roots"][0], &p, &t, catapult_ground(&main).unwrap()).unwrap();
+        assert_eq!(def.body_mass, 5.0);
+        assert!((def.body_inertia - 0.8364514).abs() < 1e-6);
+        assert!((def.rear_body_inertia - 0.8364514).abs() < 1e-6);
+        assert_eq!(def.ground_height, 0.8675);
+        assert_eq!((def.velocity_iterations, def.position_iterations), (8, 3));
+        assert_eq!(
+            (def.body_linear_drag, def.friction, def.restitution),
+            (1.0, 0.4, 0.0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use scene::authored::Affine2;
+    use serde_json::json;
+
+    fn extract(node: &Value) -> (Proto, PrefabVisual, Vec<String>) {
+        let empty = json!({});
+        let maps = Map::new();
+        let names = HashMap::from([
+            ("sprite".into(), "panel".into()),
+            ("other-sprite".into(), "trim".into()),
+        ]);
+        let sizes = HashMap::from([("panel".into(), (4, 4, 32.0))]);
+        let inp = Inputs {
+            main: &empty,
+            blocks: &empty,
+            loader: &empty,
+            prefabs: &maps,
+            data: &maps,
+            sprite_names: &names,
+            sprite_sizes: &sizes,
+            assets_dir: Path::new("."),
+        };
+        let mut builder = Builder {
+            inp: &inp,
+            world: WorldData::default(),
+            visuals: Vec::new(),
+            sprite_ids: HashMap::new(),
+            prefab_protos: HashMap::new(),
+            recolor: HashSet::new(),
+        };
+        let index = builder.proto(node) as usize;
+        (
+            builder.world.protos.remove(index),
+            builder.visuals.remove(index).unwrap(),
+            builder.world.sprites,
+        )
+    }
+
+    fn node(
+        name: &str,
+        pos: [f32; 3],
+        scale: [f32; 3],
+        rot: [f32; 4],
+        children: Vec<Value>,
+        sprite: bool,
+    ) -> Value {
+        json!({
+            "name": name, "active": true, "pos": pos, "scale": scale, "rot": rot, "layer": 0,
+            "components": if sprite { vec![json!({"id": 31, "type": "SpriteRenderer", "fields": {
+                "m_Enabled": 1, "m_Sprite": {"asset": "sprite"}, "m_FlipX": 1, "m_FlipY": 1
+            }})] } else { vec![] },
+            "children": children,
+        })
+    }
+
+    const IDENTITY_ROTATION: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    fn plain(name: &str, children: Vec<Value>, sprite: bool) -> Value {
+        node(
+            name,
+            [0.0; 3],
+            [1.0; 3],
+            IDENTITY_ROTATION,
+            children,
+            sprite,
+        )
+    }
+
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-5, "{a} != {b}");
+    }
+
+    fn composed(visual: &PrefabVisual, part: usize) -> Affine2 {
+        visual
+            .sampled_transform(visual.parts[part].node, |_, node| node.local)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn composed_parts_keep_nonrendered_parent_rotation_scale_and_renderer_flips() {
+        let c = core::f32::consts::FRAC_1_SQRT_2;
+        let panel = node(
+            "Panel",
+            [2.0, 0.0, 0.0],
+            [-1.0, 1.0, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let mut pivot = node(
+            "Pivot",
+            [1.0, 2.0, 0.0],
+            [1.0, 3.0, 1.0],
+            [
+                0.0,
+                0.0,
+                (core::f32::consts::PI / 8.0).sin(),
+                (core::f32::consts::PI / 8.0).cos(),
+            ],
+            vec![panel],
+            false,
+        );
+        pivot["components"] = json!([{"type": "Animator", "fields": {
+            "m_Enabled": 1, "m_Controller": {"asset": "AnimatorController/panel.controller"}
+        }}]);
+        let root = node(
+            "Root",
+            [7.0, 8.0, 0.0],
+            [-2.0, 1.0, 1.0],
+            [0.0, 0.0, c, c],
+            vec![pivot],
+            false,
+        );
+        let (legacy, visual, _) = extract(&root);
+        assert_eq!(
+            visual
+                .nodes
+                .iter()
+                .map(|node| node.path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "Pivot", "Pivot/Panel"]
+        );
+        assert_eq!(visual.nodes[2].parent, Some(1));
+        assert_eq!(
+            visual.nodes[1].animator.as_deref(),
+            Some("AnimatorController/panel.controller")
+        );
+        assert_eq!(visual.parts[0].node, 2);
+        assert!(visual.parts[0].flip_x && visual.parts[0].flip_y);
+        assert_eq!((legacy.parts[0].x, legacy.parts[0].y), (6.0, 2.0));
+        assert!(
+            !legacy.parts[0].flip,
+            "old pack keeps the folded reflection"
+        );
+        let transform = composed(&visual, 0);
+        close(transform.translation[0], -2.0 - 2.0 * c);
+        close(transform.translation[1], 2.0 + 4.0 * c);
+        for (actual, expected) in transform
+            .basis
+            .into_iter()
+            .zip([c, -3.0 * c, -2.0 * c, -6.0 * c])
+        {
+            close(actual, expected);
+        }
+    }
+
+    #[test]
+    fn visual_parts_match_legacy_indices_without_interning_sprites() {
+        let mut inactive = plain("Inactive", vec![plain("Sprite", vec![], true)], false);
+        inactive["active"] = false.into();
+        let mut reflection = plain("Reflection", vec![plain("Sprite", vec![], true)], false);
+        reflection["layer"] = 29.into();
+        let mut scaffold = plain("Scaffold", vec![plain("Sprite", vec![], true)], true);
+        scaffold["components"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "ScaffoldModule", "fields": {}}));
+        let mut child = plain("Child", vec![], true);
+        child["components"][0]["fields"]["m_Sprite"]["asset"] = "other-sprite".into();
+        let mut disabled = plain("Disabled", vec![child], true);
+        disabled["components"][0]["fields"]["m_Enabled"] = 0.into();
+        let root = plain(
+            "Root",
+            vec![
+                inactive,
+                reflection,
+                scaffold,
+                disabled,
+                plain("Normal", vec![], true),
+            ],
+            false,
+        );
+        let (legacy, visual, sprite_names) = extract(&root);
+        assert_eq!(sprite_names, ["trim", "panel"]);
+        assert_eq!(
+            legacy
+                .parts
+                .iter()
+                .map(|part| part.sprite)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            visual
+                .parts
+                .iter()
+                .map(|part| visual.nodes[part.node as usize].path.as_str())
+                .collect::<Vec<_>>(),
+            ["Disabled/Child", "Normal"]
+        );
+        assert!(!visual.nodes[1].local.visible);
+    }
+
+    #[test]
+    fn portal_surface_goo_and_catapult_rope_keep_authored_transform_magnitudes() {
+        let surface = node(
+            "Surface",
+            [0.0; 3],
+            [1.0, 1.5, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let goo = node(
+            "Goo Spin",
+            [0.0; 3],
+            [-1.3, 1.1, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let rope = node(
+            "Rope",
+            [0.0; 3],
+            [6.659998, 1.0, 1.0],
+            [0.0, 0.0, 0.36361992, 0.9315474],
+            vec![],
+            true,
+        );
+        let (_, visual, _) = extract(&plain("Root", vec![surface, goo, rope], false));
+        assert_eq!(composed(&visual, 0).basis, [1.0, 0.0, 0.0, 1.5]);
+        assert_eq!(composed(&visual, 1).basis, [-1.3, 0.0, 0.0, 1.1]);
+        let [a, b, c, d] = composed(&visual, 2).basis;
+        close((a * a + c * c).sqrt(), 6.659998);
+        close((b * b + d * d).sqrt(), 1.0);
+        assert!(c > 4.0 && b < -0.6, "rope rotation was discarded");
+    }
+}
+#[cfg(test)]
+mod boss_throw_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires the user's private PC asset export; set KINGDOM_RECOIL_REFERENCE_ASSETS"]
+    fn local_reference_boss_throwback_export() {
+        let assets =
+            std::path::PathBuf::from(std::env::var_os("KINGDOM_RECOIL_REFERENCE_ASSETS").unwrap());
+        let guids = crate::guid_map(&assets);
+        let resolver = crate::scenes::Resolver::new(&guids, &assets);
+        let read = |path: &str| crate::scenes::export_file(&assets.join(path), &resolver).unwrap();
+        let settings = assets.parent().unwrap().join("ProjectSettings");
+        let physics =
+            read_physics_settings(&settings, "Physics2DSettings.asset", "Physics2DSettings")
+                .unwrap();
+        let time = read_physics_settings(&settings, "TimeManager.asset", "TimeManager").unwrap();
+        let ground = catapult_ground(&read("main.unity")).unwrap();
+        let boss = read("Resources/prefabs/enemies/Boss.prefab")["roots"][0].clone();
+        let boulder = read("Resources/prefabs/objects/Boulder.prefab")["roots"][0].clone();
+        let extract =
+            |boss: &Value| boss_throw_definition(boss, &boulder, &physics, &time, ground, &assets);
+        assert_eq!(extract(&boss).unwrap(), game::data::BossThrowDef::default());
+        let mut altered = boss;
+        let script = altered["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["type"] == "Boss")
+            .unwrap();
+        script["fields"]["throwForce"]["min"] = Value::from(5);
+        assert_eq!(extract(&altered).unwrap().force, (5.0, 7.0));
+        let script = altered["components"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|component| component["type"] == "Boss")
+            .unwrap();
+        script["fields"]["hand"]["local"] = Value::from(-1);
+        assert!(extract(&altered).unwrap_err().contains("Boss.hand"));
+    }
 }

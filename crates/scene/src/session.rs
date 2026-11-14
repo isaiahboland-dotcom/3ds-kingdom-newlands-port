@@ -13,6 +13,37 @@ use platform::Storage;
 
 use crate::touch::MapChoice;
 
+/// PC target routing: TeleporterExit and Boat disable lead; dropped crowns
+/// are tracked until pickup/despawn. Target changes preserve the old screen
+/// position and seek, except startup/resume which explicitly snaps.
+fn camera_target(game: &GameState) -> crate::camera::Target {
+    use crate::camera::{Subject, Target};
+    let (subject, x, lead) = if let Some(exit) = game.teleports.exit {
+        (Subject::Teleporter, exit.x, false)
+    } else if let Some(crown) = &game.greed.crown {
+        (Subject::Crown, crown.x, false)
+    } else if let Some(o) = game
+        .harbor
+        .boat
+        .as_ref()
+        .and_then(|b| game.level.index_of(b.object))
+        .map(|i| &game.level.objects[i])
+        .filter(|o| o.mode == game::boat::mode::SAILING)
+    {
+        (Subject::Boat(o.id), o.x, false)
+    } else if game.game_over {
+        (Subject::Inactive, game.monarch.x, false)
+    } else {
+        (Subject::Monarch, game.monarch.x, true)
+    };
+    Target {
+        subject,
+        x,
+        direction: game.monarch.facing as f32,
+        lead,
+    }
+}
+
 pub struct Session {
     pub game: GameState,
     pub world: WorldData,
@@ -23,6 +54,10 @@ pub struct Session {
     pub paused: bool,
     pub debug: bool,
     pub camera_x: f32,
+    camera: Option<(crate::camera::CameraDef, crate::camera::Camera)>,
+    camera_end_time: f32,
+    pub boulder_effects: Option<crate::boulder_fx::BoulderFxDef>,
+    pub boulder_particles: crate::boulder_fx::BoulderParticles,
     pub bag_bounce: f32,
     pub day_banner: Option<(u32, f32)>,
     /// Animator state for the monarch: current action and time in its clip.
@@ -119,6 +154,10 @@ impl Session {
             paused: false,
             debug: false,
             camera_x,
+            camera: None,
+            camera_end_time: 0.0,
+            boulder_effects: None,
+            boulder_particles: Default::default(),
             bag_bounce: 0.0,
             day_banner: None,
             anim: (Action::Stand, 0.0),
@@ -151,6 +190,30 @@ impl Session {
         s
     }
 
+    pub fn install_camera(&mut self, definition: crate::camera::CameraDef) {
+        let camera = crate::camera::Camera::new(camera_target(&self.game));
+        self.camera_x = camera.position();
+        self.water_camera = self.camera_x;
+        self.camera = Some((definition, camera));
+    }
+
+    pub fn camera_shake_offset(&self) -> [f32; 2] {
+        self.camera
+            .as_ref()
+            .map_or([0.0; 2], |(_, camera)| camera.shake_offset())
+    }
+
+    fn reset_camera(&mut self) {
+        self.boulder_particles = Default::default();
+        self.camera_end_time = 0.0;
+        self.camera_x = if let Some((_, camera)) = &mut self.camera {
+            *camera = crate::camera::Camera::new(camera_target(&self.game));
+            camera.position()
+        } else {
+            self.game.monarch.x
+        };
+    }
+
     /// Picks up a saved run. orig: `Loader` → `PersistentManager.Load()`.
     pub fn resume(&mut self, game: GameState) {
         self.game = game;
@@ -158,7 +221,7 @@ impl Session {
         if let Some((coat, look)) = self.progress.chosen {
             (self.game.coat, self.game.look) = (coat, look);
         }
-        self.camera_x = self.game.monarch.x;
+        self.reset_camera();
         self.water_camera = self.camera_x;
         self.music_cues.clear();
     }
@@ -348,7 +411,7 @@ impl Session {
         if voyage.is_some() {
             self.game.look = look;
         }
-        self.camera_x = self.game.monarch.x;
+        self.reset_camera();
         self.won_for = 0.0;
         // orig: UnlockManager.Restore → AutoSave.
         if voyage.is_some() {
@@ -381,6 +444,7 @@ impl Session {
             raw.bag_tap = false;
             self.events.clear();
             self.game.tick(&self.world, &controls, &mut self.events);
+            self.boulder_particles.advance(TICK);
             for e in &self.events {
                 crate::sound::on_event(
                     &self.world,
@@ -390,6 +454,42 @@ impl Session {
                     &mut self.music_cues,
                 );
                 match *e {
+                    GameEvent::BoulderImpact {
+                        x,
+                        y,
+                        shake_y,
+                        side,
+                        ..
+                    } => {
+                        if let Some(def) = &self.boulder_effects {
+                            self.boulder_particles.spawn(
+                                def,
+                                crate::boulder_fx::BoulderParticleKind::Dust,
+                                x,
+                                y,
+                                side,
+                            );
+                        }
+                        if let Some((def, camera)) = &mut self.camera {
+                            camera.shake(def, [x, shake_y + game::build::WALK_Y]);
+                        }
+                    }
+                    GameEvent::BoulderBurst { x, y, side, .. } => {
+                        if let Some(def) = &self.boulder_effects {
+                            self.boulder_particles.spawn(
+                                def,
+                                crate::boulder_fx::BoulderParticleKind::Fragments,
+                                x,
+                                y,
+                                side,
+                            );
+                        }
+                    }
+                    GameEvent::CameraShake { x, y } => {
+                        if let Some((def, camera)) = &mut self.camera {
+                            camera.shake(def, [x, y + game::build::WALK_Y]);
+                        }
+                    }
                     GameEvent::Day(time::DayEvent::Started {
                         day,
                         show_counter: true,
@@ -412,15 +512,29 @@ impl Session {
                 (action, 0.0)
             };
             self.t += TICK;
+            if let Some((definition, camera)) = &mut self.camera {
+                let mut target = camera_target(&self.game);
+                if self.game.game_over && !self.game.won {
+                    self.camera_end_time += TICK;
+                    if self.camera_end_time >= 4.0 {
+                        target.subject = crate::camera::Subject::Monarch;
+                        target.x = self.game.monarch.x;
+                        target.lead = false;
+                    }
+                }
+                self.camera_x = camera.step(definition, target, TICK);
+            }
         }
         // orig: MainCamera follows the monarch with a lead; plain follow for now.
         // orig: MainCamera follows the teleporter exit while it flies.
-        let target = match self.game.teleports.exit {
-            Some(e) => e.x,
-            None => self.game.monarch.x + self.game.monarch.velocity * 0.5,
-        };
-        self.camera_x +=
-            (target - self.camera_x) * (1.0 - (-4.0 * TICK * ticks.max(1) as f32).exp());
+        if self.camera.is_none() {
+            let target = match self.game.teleports.exit {
+                Some(e) => e.x,
+                None => self.game.monarch.x + self.game.monarch.velocity * 0.5,
+            };
+            self.camera_x +=
+                (target - self.camera_x) * (1.0 - (-4.0 * TICK * ticks.max(1) as f32).exp());
+        }
         // orig: Water.Update: the maps drift and keep still against the ground
         // as the camera pans (a quarter of a map per unit, 4 maps per band).
         // No wind yet, so the fine map only follows the camera.
@@ -455,5 +569,91 @@ impl Session {
                 self.day_banner = None;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use game::data::{DayDef, DirectorDef, LevelConfigDef};
+    fn world() -> WorldData {
+        WorldData {
+            days: vec![DayDef {
+                name: "day".into(),
+                seasons: 7,
+                weathers: 1,
+                tracks: vec![],
+            }],
+            director: DirectorDef {
+                regular_days: vec![0],
+                boss_days: vec![0],
+                recovery_days: vec![0],
+                num_regular_days: (3, 4),
+                ..Default::default()
+            },
+            levels: vec![LevelConfigDef {
+                name: "island".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 5,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            steeds: vec![Default::default()],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn boss_bash_marker_shakes_world_projection_and_pause_freezes_the_offset() {
+        let mut w = world();
+        w.boss_bash_impact = Some(0.65);
+        let mut s = Session::new(w, 0, 1, Progress::everything());
+        s.game.monarch.x = 0.0;
+        s.resume(s.game.clone());
+        s.install_camera(crate::camera::tests::definition());
+        s.game
+            .greed
+            .spawn_troll(game::greed::EnemyKind::Boss, 2.0, 1, true, &mut s.game.rng);
+        s.game.greed.trolls[0].bash = Some((0.59, false));
+        let input = RawInput::default();
+        let before = crate::top::layer_to_screen(&s, 0.0, 1.0, 1.0);
+        s.step_ticks(input, 3);
+        assert_eq!(
+            s.camera_shake_offset(),
+            [0.0; 2],
+            "wait for the authored marker"
+        );
+        s.step_ticks(input, 1);
+        assert!(s
+            .events
+            .iter()
+            .any(|e| matches!(e, GameEvent::CameraShake { x: 2.0, y: 0.0 })));
+        let [dx, dy] = s.camera_shake_offset();
+        assert_ne!([dx, dy], [0.0; 2]);
+        assert_eq!(s.camera_x, 0.0);
+        assert_eq!(
+            crate::top::layer_to_screen(&s, 0.0, 1.0, 1.0),
+            (before.0 - dx * 32.0, before.1 + dy * 32.0)
+        );
+        assert_eq!(
+            crate::top::layer_to_screen(&s, 0.0, 1.0, 0.0),
+            (before.0, before.1 + dy * 32.0)
+        );
+        s.paused = true;
+        s.step_ticks(input, 120);
+        assert_eq!(s.camera_shake_offset(), [dx, dy]);
+        s.resume(s.game.clone());
+        assert_eq!(s.camera_shake_offset(), [0.0; 2]);
     }
 }

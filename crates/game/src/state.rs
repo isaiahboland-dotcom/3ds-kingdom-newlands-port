@@ -65,6 +65,24 @@ pub enum GameEvent {
     Music(crate::data::SoundId),
     /// Two hired and a wall up: the ghost fades. orig: `TutorialManager.CompleteTutorial()`.
     TutorialDone,
+    Catapult(crate::siege::CatapultEvent),
+    BoulderImpact {
+        x: f32,
+        y: f32,
+        shake_y: f32,
+        side: i8,
+        collision_sound: bool,
+    },
+    BoulderBurst {
+        x: f32,
+        y: f32,
+        side: i8,
+        impact: bool,
+    },
+    CameraShake {
+        x: f32,
+        y: f32,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -925,12 +943,19 @@ impl GameState {
                 (c.object, n)
             })
             .collect();
-        let enemies: Vec<(u32, f32)> = self
+        let enemies: Vec<_> = self
             .greed
             .trolls
             .iter()
             .filter(|t| !t.is_dead())
-            .map(|t| (t.id, t.x))
+            .map(|t| crate::siege::BoulderEnemy {
+                id: t.id,
+                x: t.x,
+                huge: t
+                    .kind
+                    .is_boss()
+                    .then(|| crate::coins::Rect::centered(0.75, 0.9, 1.5).at(t.x, t.y, false)),
+            })
             .collect();
         let hits = self.siege.update(
             dt,
@@ -940,12 +965,215 @@ impl GameState {
             &pushers,
             &enemies,
             &mut self.rng,
+            |event| events.push(GameEvent::Catapult(event)),
         );
-        for crate::siege::BoulderHit::Troll(id, damage) in hits {
+        for hit in hits {
+            let crate::siege::BoulderHit::Troll(id, damage) = hit else {
+                Self::boulder_effect(hit, events);
+                continue;
+            };
             if let Some(i) = self.greed.trolls.iter().position(|t| t.id == id) {
                 let mut ge = Vec::new();
                 self.greed.hurt(i, damage, &mut |e| ge.push(e));
                 events.extend(ge.into_iter().map(GameEvent::Greed));
+            }
+        }
+    }
+
+    fn boulder_effect(hit: crate::siege::BoulderHit, events: &mut Vec<GameEvent>) {
+        use crate::siege::BoulderHit;
+        match hit {
+            BoulderHit::Impact {
+                x,
+                y,
+                shake_y,
+                side,
+                collision_sound,
+            } => {
+                events.push(GameEvent::BoulderImpact {
+                    x,
+                    y,
+                    shake_y,
+                    side,
+                    collision_sound,
+                });
+            }
+            BoulderHit::Burst { x, y, side, impact } => {
+                events.push(GameEvent::BoulderBurst { x, y, side, impact });
+            }
+            _ => {}
+        }
+    }
+
+    fn update_returned_boulders(
+        &mut self,
+        world: &WorldData,
+        dt: f32,
+        definition: &crate::data::BossThrowDef,
+        events: &mut Vec<GameEvent>,
+    ) {
+        use crate::coins::Rect;
+        use crate::siege::{BoulderHit, BoulderTarget, BoulderTargetKind as Kind};
+
+        let mut walls = Vec::new();
+        for o in &self.level.objects {
+            if world.protos[o.proto as usize].wall_def.is_none()
+                || build::under_construction(world, o)
+            {
+                continue;
+            }
+            let Some((_, polygons)) = world
+                .boulder_walls
+                .iter()
+                .find(|(proto, _)| *proto == o.proto)
+            else {
+                continue;
+            };
+            let sx = if o.flip { -1.0 } else { 1.0 };
+            for polygon in polygons {
+                walls.push(crate::siege::BoulderWall {
+                    object: o.id,
+                    polygon: polygon
+                        .iter()
+                        .map(|&[x, y]| [o.x + sx * x, o.y + y - build::WALK_Y])
+                        .collect(),
+                });
+            }
+        }
+        let trigger = |target, rect, takes_damage, huge| BoulderTarget {
+            target,
+            rect,
+            takes_damage,
+            huge,
+            physical: false,
+        };
+        let mut player = Rect::centered(0.61, 0.74, 1.14);
+        player.x -= 0.05;
+        let mut targets = alloc::vec![trigger(
+            Kind::Monarch,
+            player.at(self.monarch.x, self.monarch_y, self.monarch.facing < 0),
+            self.has_crown && !self.god,
+            false
+        )];
+        targets.extend(
+            self.population
+                .units
+                .iter()
+                .filter(|u| u.role != crate::data::Role::Beggar)
+                .map(|u| {
+                    let mut rect = Rect::centered(0.32, 0.33, 0.64);
+                    if u.role == crate::data::Role::Knight {
+                        rect = Rect::centered(0.45, 0.5, 0.9);
+                        rect.x += 0.07;
+                    }
+                    trigger(
+                        Kind::Unit(u.id),
+                        rect.at(u.x, u.y, u.mover.facing < 0),
+                        u.stunned <= 0.0,
+                        false,
+                    )
+                }),
+        );
+        targets.extend(self.merchants.list.iter().map(|m| {
+            let mut rect = Rect::centered(0.3, 0.69, 0.6);
+            rect.x -= 0.08;
+            trigger(
+                Kind::Object(m.object),
+                rect.at(m.mule_x, 0.0, m.mule.facing < 0),
+                true,
+                false,
+            )
+        }));
+        targets.extend(
+            self.wildlife
+                .animals
+                .iter()
+                .filter(|a| !a.is_dead())
+                .map(|a| {
+                    let rect = if a.species == Species::Bunny {
+                        Rect::centered(0.1, 0.26, 0.14).at(a.x, 0.0, false)
+                    } else {
+                        let (x0, y0, x1, y1) = a.hit_box();
+                        Rect {
+                            x: x0,
+                            y: y0,
+                            w: x1 - x0,
+                            h: y1 - y0,
+                        }
+                    };
+                    trigger(Kind::Wildlife(a.id), rect, true, false)
+                }),
+        );
+        targets.extend(self.greed.trolls.iter().filter(|t| !t.is_dead()).map(|t| {
+            let huge = t.kind.is_boss();
+            let rect = if huge {
+                Rect::centered(0.75, 0.9, 1.5).at(t.x, t.y, false)
+            } else {
+                t.box_at()
+            };
+            trigger(Kind::Enemy(t.id), rect, false, huge)
+        }));
+        for hit in self
+            .siege
+            .update_returned_boulders(dt, definition, &targets, &walls)
+        {
+            match hit {
+                BoulderHit::Returned {
+                    target: Kind::Monarch,
+                    damage,
+                    direction,
+                } => {
+                    self.hurt_monarch_heavy(damage, direction, events);
+                }
+                BoulderHit::Returned {
+                    target: Kind::Unit(id),
+                    damage,
+                    direction,
+                } => {
+                    self.population.hurt(
+                        id,
+                        damage,
+                        direction,
+                        &mut self.coins,
+                        &mut self.rng,
+                        &mut |e| events.push(GameEvent::Unit(e)),
+                    );
+                    self.payables_dirty = true;
+                }
+                BoulderHit::Returned {
+                    target: Kind::Object(id),
+                    damage,
+                    ..
+                } => {
+                    if self.merchants.list.iter().any(|m| m.object == id) {
+                        self.merchants.mule_hit(id, &mut self.coins, &mut self.rng);
+                    } else {
+                        self.hurt_wall(world, id, damage);
+                    }
+                }
+                BoulderHit::Returned {
+                    target: Kind::Wildlife(id),
+                    damage,
+                    direction,
+                } => {
+                    if let Some(x) = self
+                        .wildlife
+                        .animals
+                        .iter()
+                        .find(|a| a.id == id)
+                        .map(|a| a.x)
+                    {
+                        self.wildlife.hurt(
+                            id,
+                            damage,
+                            x - direction,
+                            &mut self.coins,
+                            &mut self.rng,
+                            &mut |e| events.push(GameEvent::Wild(e)),
+                        );
+                    }
+                }
+                effect => Self::boulder_effect(effect, events),
             }
         }
     }
@@ -2020,14 +2248,25 @@ impl GameState {
         };
         let mut out: Vec<GreedEvent> = Vec::new();
         let hours = self.clock.date();
-        self.greed
-            .update(dt, hours, &ctx, &self.level, &mut self.rng, |e| out.push(e));
+        self.greed.update_with_siege(
+            dt,
+            hours,
+            &ctx,
+            &self.level,
+            &mut self.rng,
+            &mut self.siege,
+            |e| out.push(e),
+        );
 
         let mut coin_removals: Vec<usize> = Vec::new();
         let mut part_removals: Vec<usize> = Vec::new();
         let mut tool_removals: Vec<usize> = Vec::new();
         for e in out {
             match e {
+                GreedEvent::BossBashImpact { x, y } => {
+                    events.push(GameEvent::CameraShake { x, y });
+                    continue;
+                }
                 GreedEvent::Hit { by, target, damage } => {
                     let dir = self
                         .greed
@@ -2063,6 +2302,7 @@ impl GameState {
                                 self.level.objects[i].hp -= damage;
                                 if self.level.objects[i].hp <= 0 {
                                     self.level.objects.remove(i);
+                                    self.siege.remove(id);
                                     self.payables_dirty = true;
                                 }
                             }
@@ -2152,6 +2392,14 @@ impl GameState {
             self.payables_dirty = true;
         }
 
+        if let Some(definition) = world
+            .boss_throw
+            .as_ref()
+            .filter(|_| self.siege.boulders.iter().any(|b| b.runtime.hostile))
+        {
+            self.update_returned_boulders(world, dt, definition, events);
+        }
+
         // orig: the monarch picks the crown back up by touching it.
         if let Some(c) = self.greed.crown {
             let box_ = crate::coins::MONARCH_BOX.at(self.monarch.x, 0.0, false);
@@ -2238,6 +2486,8 @@ impl GameState {
         }
         self.level.objects[i].hp -= damage;
         if self.level.objects[i].hp > 0 {
+            self.greed
+                .portal_hit(object, &mut |event| events.push(GameEvent::Greed(event)));
             return;
         }
         let mut out = Vec::new();
@@ -2267,6 +2517,23 @@ impl GameState {
 
     /// orig: `Player.HandleOnReceiveDamage()`: coins fly out (half into the
     /// water); with none left, the crown falls off.
+    fn hurt_monarch_heavy(&mut self, damage: i32, dir: f32, events: &mut Vec<GameEvent>) {
+        // Damageable becomes invulnerable after crown loss. The collider can
+        // still count against a boulder's target limit.
+        if self.god || !self.has_crown {
+            return;
+        }
+        events.push(GameEvent::CameraShake {
+            x: self.monarch.x,
+            y: self.monarch_y,
+        });
+        if self.passenger.is_some() {
+            self.dump_passenger();
+        } else {
+            self.hurt_monarch(damage, dir, events);
+        }
+    }
+
     fn hurt_monarch(&mut self, damage: i32, dir: f32, events: &mut Vec<GameEvent>) {
         if self.god {
             return;
@@ -2688,6 +2955,218 @@ mod tests {
         assert!(turns < 6, "the worker turned {turns} times in 10 s");
         let o = &g.level.objects[g.level.index_of(wall).unwrap()];
         assert_eq!(o.build, Some(0.0));
+    }
+
+    fn boss_throw_fixture(side: i8) -> (WorldData, GameState) {
+        use crate::animation::{Key, Tangent};
+        let mut w = fight_world();
+        let mut definition = crate::data::BossThrowDef::default();
+        for (axis, at) in [0.4, 0.125].into_iter().enumerate() {
+            definition.hand_track[axis] = [
+                (0.0, at),
+                (definition.release, [0.963, 0.876][axis]),
+                (1.0, 1.5),
+            ]
+            .into_iter()
+            .map(|(time, value)| Key {
+                time,
+                value,
+                in_tangent: Tangent::Step,
+                out_tangent: Tangent::Step,
+            })
+            .collect();
+        }
+        let hand_x = definition.hand[0];
+        w.boss_throw = Some(definition);
+        if w.steeds.is_empty() {
+            w.steeds.push(Default::default());
+        }
+        let mut g = GameState::new(&w, 0, 23);
+        g.campfire = 0.0;
+        g.monarch.x = 100.0;
+        g.has_crown = false;
+        let kind = if side > 0 {
+            crate::greed::EnemyKind::Boss
+        } else {
+            crate::greed::EnemyKind::KillerBoss
+        };
+        g.greed.spawn_troll(kind, 0.0, 1, true, &mut g.rng);
+        g.greed.trolls[0].mover.facing = side;
+        g.siege
+            .boulders
+            .push(crate::siege::Boulder::test_lodged(f32::from(side) * hand_x));
+        for _ in 0..15 {
+            g.update_greed(&w, TICK, &mut Vec::new());
+            if g.siege.boulders[0].runtime.held_by.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            g.siege.boulders[0].runtime.held_by,
+            Some(g.greed.trolls[0].id)
+        );
+        (w, g)
+    }
+
+    #[test]
+    fn boss_relaunches_same_boulder_from_mirrored_marker_and_resumes_saved_flight() {
+        for side in [-1, 1] {
+            let (w, mut g) = boss_throw_fixture(side);
+            let mut events = Vec::new();
+            let id = g.siege.boulders[0].runtime.id;
+            g.update_greed(&w, 0.7, &mut events);
+            assert!(!g.siege.boulders[0].runtime.hostile);
+            #[cfg(feature = "save")]
+            {
+                let save = crate::save::save_game(&g, 1);
+                g = crate::save::load_game(&save, 1, &w).unwrap();
+                assert_eq!(crate::save::save_game(&g, 1), save);
+            }
+            assert!(events.is_empty());
+            g.update_greed(&w, 0.14, &mut events);
+            let b = &g.siege.boulders[0];
+            assert_eq!(b.runtime.id, id);
+            assert_eq!(b.runtime.held_by, None);
+            assert!(b.runtime.hostile);
+            assert_eq!(b.x, f32::from(side) * 0.963);
+            assert_eq!(b.y, 0.876);
+            assert!((4.0..=7.0).contains(&b.vy));
+            assert_eq!(b.vx, f32::from(side) * b.vy);
+            assert_eq!(
+                events,
+                [GameEvent::Greed(GreedEvent::BoulderThrown { x: 0.0 })]
+            );
+            #[cfg(feature = "save")]
+            let mut resumed =
+                crate::save::load_game(&crate::save::save_game(&g, 1), 1, &w).unwrap();
+            events.clear();
+            g.update_greed(&w, 1.5, &mut events);
+            assert!(g.siege.boulders.is_empty());
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    GameEvent::BoulderImpact { .. },
+                    GameEvent::BoulderBurst { impact: true, .. }
+                ]
+            ));
+            #[cfg(feature = "save")]
+            {
+                let mut resumed_events = Vec::new();
+                resumed.update_greed(&w, 1.5, &mut resumed_events);
+                assert_eq!(events, resumed_events);
+                assert_eq!(
+                    crate::save::save_game(&g, 1),
+                    crate::save::save_game(&resumed, 1)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boss_death_cancels_release_and_removes_held_stone_with_corpse() {
+        let (w, mut g) = boss_throw_fixture(1);
+        let owner = g.greed.trolls[0].id;
+        g.update_greed(&w, 0.7, &mut Vec::new());
+        g.greed.hurt(0, 1000, &mut |_| {});
+        #[cfg(feature = "save")]
+        {
+            g = crate::save::load_game(&crate::save::save_game(&g, 1), 1, &w).unwrap();
+        }
+        let mut events = Vec::new();
+        g.update_greed(&w, 1.0, &mut events);
+        let b = &g.siege.boulders[0];
+        assert_eq!(b.runtime.held_by, Some(owner));
+        assert!(!b.runtime.hostile);
+        assert_eq!([b.x, b.y], g.greed.trolls[0].boss_hand(&w));
+        assert!(events.is_empty());
+        g.update_greed(&w, 9.0, &mut events);
+        assert!(g.greed.trolls.is_empty() && g.siege.boulders.is_empty());
+        assert!(events.is_empty());
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn save_rejects_missing_duplicate_and_orphaned_held_boulders() {
+        let (w, g) = boss_throw_fixture(1);
+        for mutation in 0..3 {
+            let mut invalid = g.clone();
+            match mutation {
+                0 => invalid.siege.boulders.clear(),
+                1 => invalid.siege.boulders.push(g.siege.boulders[0].clone()),
+                _ => invalid.siege.boulders[0].runtime.held_by = Some(99),
+            }
+            let bytes = crate::save::save_game(&invalid, 1);
+            assert_eq!(
+                crate::save::load_game(&bytes, 1, &w).err(),
+                Some(crate::save::LoadError::Corrupt)
+            );
+        }
+    }
+
+    #[test]
+    fn returned_boulder_damages_a_citizen_and_a_passenger_absorbs_the_monarch_hit() {
+        for (has_passenger, has_crown) in [(false, true), (true, true), (false, false)] {
+            let definition = crate::data::BossThrowDef::default();
+            let mut w = fight_world();
+            w.boss_throw = Some(definition.clone());
+            let mut g = GameState::new(&w, 0, 3);
+            g.monarch.x = 1.8;
+            g.wallet.set(20);
+            g.has_crown = has_crown;
+            g.passenger = has_passenger.then_some(100);
+            let citizen = g.population.spawn(Role::Archer, 2.0, &mut g.rng);
+            let mut b = crate::siege::Boulder::test_lodged(0.0);
+            assert!(b.hold_by(99));
+            b.release_from_boss([0.0, 0.125], 1, 4.0, 0.0, &definition, &mut g.rng);
+            g.siege.boulders.push(b);
+            let mut events = Vec::new();
+            g.update_greed(&w, TICK, &mut events);
+            g.update_greed(&w, 0.6, &mut events);
+            assert_eq!(
+                g.wallet.coins(),
+                if has_passenger || !has_crown { 20 } else { 5 }
+            );
+            assert!(g.passenger.is_none());
+            assert!(events.iter().any(|e| matches!(e,
+                GameEvent::Unit(UnitEvent::Promoted { unit, role: Role::Peasant }) if *unit == citizen)));
+            assert!(events
+                .iter()
+                .any(|e| matches!(e, GameEvent::BoulderBurst { impact: true, .. })));
+        }
+    }
+
+    #[test]
+    fn returned_boulder_shakes_only_on_admitted_player_damage() {
+        let world = fight_world();
+        let mut game = GameState::new(&world, 0, 7);
+        let mut events = Vec::new();
+        game.god = true;
+        game.hurt_monarch_heavy(1, 1.0, &mut events);
+        game.god = false;
+        game.has_crown = false;
+        game.hurt_monarch_heavy(1, 1.0, &mut events);
+        assert!(events.is_empty());
+        game.has_crown = true;
+        game.hurt_monarch_heavy(1, 1.0, &mut events);
+        assert!(
+            matches!(events.first(), Some(GameEvent::CameraShake { x, y })
+            if *x == game.monarch.x && *y == game.monarch_y)
+        );
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn boss_throw_downgrade_drops_held_stone_and_keeps_v5_layout() {
+        let (mut world, game) = boss_throw_fixture(1);
+        let bytes = crate::save::save_game(&game, 1);
+        assert_eq!(&bytes[4..6], &5_u16.to_le_bytes());
+        let (base, tail): (GameState, _) = postcard::take_from_bytes(&bytes[10..]).unwrap();
+        assert_eq!(base.siege.boulders[0].runtime, Default::default());
+        assert!(tail.starts_with(b"KNEXBOSS"));
+        world.boss_throw = None;
+        let downgraded = crate::save::load_game(&bytes, 1, &world).unwrap();
+        assert!(downgraded.siege.boulders.is_empty());
+        assert_eq!(downgraded.greed.trolls.len(), 1);
     }
 
     fn fight_world() -> WorldData {

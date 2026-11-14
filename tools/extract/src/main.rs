@@ -13,6 +13,8 @@
 //! - `world.bin`: `game::data::WorldData` (postcard), what the game loads.
 
 mod audio;
+mod authored_clips;
+mod boulder_fx;
 mod clips;
 mod fonts;
 mod pack;
@@ -107,6 +109,13 @@ fn main() -> ExitCode {
         Err(e) => eprintln!("warning: font: {e}"),
     }
 
+    let boulder_effects = match boulder_fx::extract(&assets, &guids, &mut sheet) {
+        Ok(definition) => definition,
+        Err(e) => {
+            eprintln!("boulder effects: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(e) = pack::write_pages(&sheet, &out.join("sprites"), &out.join("sprites.json")) {
         eprintln!("packing: {e}");
         return ExitCode::FAILURE;
@@ -127,12 +136,27 @@ fn main() -> ExitCode {
         }
     }
 
+    let animations = match authored_clips::extract(&assets, &guids, &sheet.names_by_guid) {
+        Ok(animations) => animations,
+        Err(e) => {
+            eprintln!("authored animation: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let sizes: world::SpriteSizes = sheet
         .sprites
         .iter()
         .map(|s| (s.name.clone(), (s.img.w, s.img.h, s.ppu)))
         .collect();
-    if let Err(e) = export_scenes(&assets, &guids, &out, &sheet.names_by_path, &sizes) {
+    if let Err(e) = export_scenes(
+        &assets,
+        &guids,
+        &out,
+        &sheet.names_by_path,
+        &sizes,
+        animations,
+        boulder_effects,
+    ) {
         eprintln!("scenes: {e}");
         return ExitCode::FAILURE;
     }
@@ -160,6 +184,8 @@ fn export_scenes(
     out: &Path,
     sprite_names: &HashMap<String, String>,
     sprite_sizes: &world::SpriteSizes,
+    animations: game::animation::Library,
+    boulder_effects: scene::boulder_fx::BoulderFxDef,
 ) -> Result<(), String> {
     let r = scenes::Resolver::new(guids, assets);
     let main = scenes::export_file(&assets.join("main.unity"), &r)?;
@@ -203,17 +229,27 @@ fn export_scenes(
         &serde_json::Value::Object(data.clone()),
     )?;
 
-    let (mut world, clip_paths) = world::build(&world::Inputs {
-        main: &main,
-        blocks: &blocks,
-        loader: &loader,
-        prefabs: &prefabs,
-        data: &data,
-        sprite_names,
-        sprite_sizes,
-        assets_dir: assets,
-    })?;
-    audio::convert(assets, out, &mut world.audio, &clip_paths)?;
+    let world::Export {
+        mut world,
+        audio_paths,
+        visuals,
+        catapults,
+        boss_throw,
+        boulder_walls,
+    } = world::build(
+        &world::Inputs {
+            main: &main,
+            blocks: &blocks,
+            loader: &loader,
+            prefabs: &prefabs,
+            data: &data,
+            sprite_names,
+            sprite_sizes,
+            assets_dir: assets,
+        },
+        &animations,
+    )?;
+    audio::convert(assets, out, &mut world.audio, &audio_paths)?;
     println!(
         "audio: {} sounds, {} clips ({:.0} s), {} script fields",
         world.audio.sounds.len(),
@@ -223,6 +259,29 @@ fn export_scenes(
     );
     let bytes = postcard::to_allocvec(&world).map_err(|e| e.to_string())?;
     std::fs::write(out.join("world.bin"), &bytes).map_err(|e| e.to_string())?;
+    let authored = scene::authored::AssetAnimation {
+        prefabs: visuals,
+        clips: animations,
+        catapults,
+        boss_throw,
+        boulder_walls,
+    };
+    let world_id = game::save::fingerprint(&bytes);
+    std::fs::write(
+        out.join(scene::boulder_fx::FILENAME),
+        boulder_effects.encode(world_id)?,
+    )
+    .map_err(|e| e.to_string())?;
+    if let Some(camera) = world::camera_def(&main)? {
+        std::fs::write(out.join(scene::camera::FILENAME), camera.encode(world_id)?)
+            .map_err(|e| e.to_string())?;
+    } else if let Err(e) = std::fs::remove_file(out.join(scene::camera::FILENAME)) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.to_string());
+        }
+    }
+    let animation = authored.encode(world_id)?;
+    std::fs::write(out.join(scene::authored::FILENAME), animation).map_err(|e| e.to_string())?;
     println!(
         "world: {} blocks, {} protos, {} scatterables, {} islands, {} lights, {} days ({} KiB)",
         world.blocks.len(),

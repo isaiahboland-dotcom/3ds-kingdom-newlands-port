@@ -1007,6 +1007,16 @@ pub struct WorldData {
     pub water: WaterDef,
     pub audio: AudioDef,
     pub fire: FireStyleDef,
+    /// Optional data installed from the matching authored catapult asset.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub catapult_physics: Vec<(ProtoId, crate::siege::CatapultPhysics)>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub boss_throw: Option<BossThrowDef>,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub boss_bash_impact: Option<f32>,
+    /// Ground-relative local collider polygons for completed walls, keyed by prototype.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub boulder_walls: Vec<(ProtoId, Vec<BoulderWallPolygon>)>,
 }
 
 pub type SoundId = u16;
@@ -1479,3 +1489,90 @@ pub struct WallDef {
     /// What's left when it falls. orig: `wreckPrefab`.
     pub wreck: Option<ProtoId>,
 }
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct BossThrowDef {
+    pub force: (f32, f32),
+    /// Rest position of the direct Hand child, before facing is applied.
+    pub hand: [f32; 3],
+    pub hand_track: [Vec<crate::animation::Key>; 3],
+    pub clip_length: f32,
+    pub release: f32,
+    pub boulder_radius: f32,
+    pub boulder_ghost: f32,
+    pub boulder_damage: i32,
+    pub boulder_max_hits: u8,
+    pub boulder_linear_drag: f32,
+    pub boulder_angular_drag: f32,
+    pub boulder_restitution: f32,
+    pub boulder_friction: f32,
+    pub gravity: f32,
+    pub fixed_step: f32,
+    /// Absolute PC world height. Projectile state stores ground-relative Y.
+    pub ground_y: f32,
+}
+
+impl Default for BossThrowDef {
+    /// Shipped PC values for synthetic worlds. Extraction reads the assets.
+    fn default() -> Self {
+        Self {
+            force: (4.0, 7.0),
+            hand: [0.4, 0.125, 0.0],
+            hand_track: Default::default(),
+            clip_length: 2.0,
+            release: 0.8333333,
+            boulder_radius: 0.15625,
+            boulder_ghost: 0.3,
+            boulder_damage: 15,
+            boulder_max_hits: 5,
+            boulder_linear_drag: 0.1,
+            boulder_angular_drag: 1.5,
+            boulder_restitution: 0.5,
+            boulder_friction: 1.0,
+            gravity: 15.0,
+            fixed_step: 0.02,
+            ground_y: 0.8675,
+        }
+    }
+}
+
+impl BossThrowDef {
+    pub fn valid(&self) -> bool {
+        self.force.0 > 0.0
+            && self.force.0 <= self.force.1
+            && self.force.1 <= 100.0
+            && self.hand.iter().all(|x| x.abs() <= 10.0)
+            && (0.0..=2.6).contains(&self.clip_length)
+            && self.release > 0.0
+            && self.release < self.clip_length
+            && self.hand_track.iter().all(|keys| {
+                keys.windows(2).all(|keys| keys[0].time < keys[1].time)
+                    && keys.iter().all(|key| {
+                        (0.0..=self.clip_length).contains(&key.time)
+                            && key.value.abs() <= 10.0
+                            && [key.in_tangent, key.out_tangent]
+                                .into_iter()
+                                .all(|tangent| match tangent {
+                                    crate::animation::Tangent::Slope(slope) => slope.abs() <= 1e5,
+                                    crate::animation::Tangent::Step => true,
+                                })
+                    })
+            })
+            && self.boulder_radius > 0.0
+            && self.boulder_radius <= 10.0
+            && (0.0..=10.0).contains(&self.boulder_ghost)
+            && self.boulder_damage > 0
+            && self.boulder_max_hits > 0
+            && (0.0..=100.0).contains(&self.boulder_linear_drag)
+            && (0.0..=100.0).contains(&self.boulder_angular_drag)
+            && (0.0..=1.0).contains(&self.boulder_restitution)
+            && (0.0..=10.0).contains(&self.boulder_friction)
+            && self.gravity > 0.0
+            && self.gravity <= 100.0
+            && (0.001..=0.1).contains(&self.fixed_step)
+            && self.ground_y.abs() <= 10.0
+    }
+}
+
+pub type BoulderWallPolygon = Vec<[f32; 2]>;
