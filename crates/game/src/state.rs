@@ -1674,7 +1674,7 @@ impl GameState {
             match e {
                 // orig: EnemyManager.HandleOnDayStart (greed retreat), Kingdom.CheckBecomeSafe.
                 DayEvent::Started { .. } => {
-                    self.greed.dawn();
+                    self.greed.dawn(world);
                     self.treasure.dawn();
                     self.safe = !self.greed.is_dangerous(self.borders);
                     self.became_safe = self.safe;
@@ -1871,8 +1871,82 @@ impl GameState {
     }
 
     /// Troll targets, loot and the results of their attacks.
+    fn squid_obstacles(
+        &self,
+        world: &WorldData,
+    ) -> (
+        Vec<crate::greed::ObstacleInfo>,
+        Vec<crate::data::ObstacleDef>,
+    ) {
+        let Some(data) = &world.squid else {
+            return (Vec::new(), Vec::new());
+        };
+        let mut scans = Vec::new();
+        let mut solids = Vec::new();
+        for o in self.level.all() {
+            let Some(colliders) = data
+                .obstacles
+                .get(o.proto as usize)
+                .filter(|c| !c.is_empty())
+            else {
+                continue;
+            };
+            if build::under_construction(world, o) {
+                continue;
+            }
+            let direction = if o.flip { -1.0 } else { 1.0 };
+            let transform = |p: [f32; 2]| [o.x + direction * p[0], o.y + p[1] - build::WALK_Y];
+            for collider in colliders {
+                let points: Vec<_> = collider.points.iter().copied().map(transform).collect();
+                if points.is_empty() {
+                    continue;
+                }
+                let origin = transform(collider.origin);
+                let (mut min, mut max) = (points[0], points[0]);
+                for p in &points {
+                    for axis in 0..2 {
+                        min[axis] = min[axis].min(p[axis]);
+                        max[axis] = max[axis].max(p[axis]);
+                    }
+                }
+                scans.push(crate::greed::ObstacleInfo {
+                    object: o.id,
+                    x: origin[0],
+                    rect: crate::coins::Rect {
+                        x: min[0],
+                        y: min[1],
+                        w: max[0] - min[0],
+                        h: max[1] - min[1],
+                    },
+                });
+                solids.push(crate::data::ObstacleDef { origin, points });
+            }
+        }
+        (scans, solids)
+    }
+
     fn update_greed(&mut self, world: &WorldData, dt: f32, events: &mut Vec<GameEvent>) {
         use crate::coins::{Rect, MONARCH_BOX};
+        // PC Squid scans the Citizens layer independently of ground greed's
+        // damage targets. Embarked/inert and grabbed citizens have left this
+        // population; stunned peasants and elevated archers remain eligible.
+        let citizens: Vec<crate::greed::CitizenInfo> = if world.squid.is_some() {
+            self.population
+                .units
+                .iter()
+                .filter(|u| u.role != crate::data::Role::Beggar)
+                .map(|u| crate::greed::CitizenInfo {
+                    unit: u.id,
+                    x: u.x,
+                    y: u.y,
+                    z: u.z,
+                    rect: Rect::centered(0.32, 0.33, 0.64).at(u.x, u.y, false),
+                    grabbable: u.role != crate::data::Role::Knight,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut targets: Vec<TargetInfo> = Vec::new();
         if self.has_crown {
             targets.push(TargetInfo {
@@ -2002,7 +2076,11 @@ impl GameState {
                 })
                 .map(|u| u.x),
         );
+        let (obstacles, solid_obstacles) = self.squid_obstacles(world);
         let ctx = GreedCtx {
+            citizens: &citizens,
+            obstacles: &obstacles,
+            solid_obstacles: &solid_obstacles,
             portal_infos: &portal_infos,
             threats: &threats,
             season: self.season,
@@ -2238,6 +2316,8 @@ impl GameState {
         }
         self.level.objects[i].hp -= damage;
         if self.level.objects[i].hp > 0 {
+            self.greed
+                .portal_hit(object, &mut |event| events.push(GameEvent::Greed(event)));
             return;
         }
         let mut out = Vec::new();
@@ -2688,6 +2768,226 @@ mod tests {
         assert!(turns < 6, "the worker turned {turns} times in 10 s");
         let o = &g.level.objects[g.level.index_of(wall).unwrap()];
         assert_eq!(o.build, Some(0.0));
+    }
+
+    fn squid_citizen_fixture() -> (WorldData, GameState) {
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        w.squid = Some(crate::flight::AssetData {
+            obstacles: alloc::vec![Vec::new(); w.protos.len()],
+            ..Default::default()
+        });
+        let mut g = GameState::new(&w, 0, 81);
+        g.population = Default::default();
+        g.greed = Default::default();
+        g.monarch.x = 100.0;
+        g.campfire = 100.0;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 8.0, 1, false, &mut g.rng);
+        (w, g)
+    }
+
+    #[test]
+    fn squid_obstacle_snapshot_uses_actual_mirrored_collider_paths_and_build_activation() {
+        let (mut w, mut g) = squid_citizen_fixture();
+        w.protos.push(crate::data::Proto {
+            building: Some(crate::data::BuildingDef {
+                build_points: 10,
+                auto_build_rate: 0.,
+                scaffold: alloc::vec![],
+            }),
+            ..Default::default()
+        });
+        w.squid
+            .as_mut()
+            .unwrap()
+            .obstacles
+            .push(alloc::vec![crate::data::ObstacleDef {
+                origin: [0.5, 0.3],
+                points: alloc::vec![[-1., 0.], [2., 0.], [1., 3.]],
+            }]);
+        g.level = Level::empty(-20., 40.);
+        let proto = (w.protos.len() - 1) as u16;
+        let mut wall = level::instantiate(&w, proto, crate::data::Layer::Game, 4., 1., 0., -1.);
+        wall.build = Some(9.);
+        let id = g.level.add(wall);
+        assert!(g.squid_obstacles(&w).0.is_empty());
+        g.level.objects[0].build = Some(10.);
+        let (scan, solid) = g.squid_obstacles(&w);
+        assert_eq!(scan.len(), 1);
+        assert_eq!(scan[0].object, id);
+        assert_eq!(scan[0].x, 3.5);
+        assert_eq!(
+            solid[0].points,
+            alloc::vec![[5., 0.125], [2., 0.125], [3., 3.125]]
+        );
+        assert_eq!(
+            (
+                scan[0].rect.x,
+                scan[0].rect.y,
+                scan[0].rect.w,
+                scan[0].rect.h
+            ),
+            (2., 0.125, 3., 3.)
+        );
+        // A damageable with no layer-20 collider must not become a flight obstacle.
+        w.squid.as_mut().unwrap().obstacles[proto as usize].clear();
+        assert!(g.squid_obstacles(&w).0.is_empty());
+    }
+
+    #[test]
+    fn squid_grabs_tower_archers_and_stunned_citizens_through_independent_snapshot() {
+        for (role, height, stunned) in [(Role::Archer, 2.0, 0.0), (Role::Peasant, 0.0, 4.0)] {
+            let (w, mut g) = squid_citizen_fixture();
+            let id = g.population.spawn(role, 8.0, &mut g.rng);
+            let u = g.population.units.iter_mut().find(|u| u.id == id).unwrap();
+            u.y = height;
+            u.in_slot = role == Role::Archer;
+            u.stunned = stunned;
+            g.greed.trolls[0].y = height;
+            let mut events = Vec::new();
+            g.update_greed(&w, 0.0, &mut events);
+            assert!(
+                g.population.units.is_empty(),
+                "{role:?} at height {height} must remain squid prey"
+            );
+            assert_eq!(g.greed.trolls[0].victims, 1);
+            assert_eq!(events.iter().filter(|e| matches!(e, GameEvent::Greed(GreedEvent::Grabbed { unit, .. }) if *unit == id)).count(), 1);
+        }
+    }
+
+    #[test]
+    fn squid_checks_single_overlap_and_closest_citizen_before_grabbability() {
+        let (w, mut g) = squid_citizen_fixture();
+        let knight = g.population.spawn(Role::Knight, 8.0, &mut g.rng);
+        let peasant = g.population.spawn(Role::Peasant, 8.0, &mut g.rng);
+        g.population
+            .units
+            .iter_mut()
+            .find(|u| u.id == knight)
+            .unwrap()
+            .z = 0.0;
+        g.population
+            .units
+            .iter_mut()
+            .find(|u| u.id == peasant)
+            .unwrap()
+            .z = 1.0;
+        g.update_greed(&w, 0.0, &mut Vec::new());
+        assert_eq!(g.population.units.len(), 2);
+        assert_eq!(g.greed.trolls[0].victims, 0);
+        // Unity OverlapArea picks the lowest-Z collider, then checks CanBeGrabbedNow.
+        g.population
+            .units
+            .iter_mut()
+            .find(|u| u.id == peasant)
+            .unwrap()
+            .z = -1.0;
+        g.update_greed(&w, 0.0, &mut Vec::new());
+        assert_eq!(g.population.units.len(), 1);
+        assert_eq!(g.population.units[0].id, knight);
+        assert_eq!(g.greed.trolls[0].victims, 1);
+
+        let (_, mut g) = squid_citizen_fixture();
+        g.population.spawn(Role::Knight, 8.5, &mut g.rng);
+        g.population.spawn(Role::Peasant, 11.0, &mut g.rng);
+        g.greed.trolls[0].y = 2.0;
+        g.update_greed(&w, 0.5, &mut Vec::new());
+        assert_eq!(
+            g.greed.trolls[0].mover.goal.unwrap().0,
+            g.campfire,
+            "a non-grabbable closest citizen must not be skipped for a farther citizen"
+        );
+    }
+
+    #[test]
+    fn squid_chases_actual_citizen_height_and_two_squids_cannot_share_one_capture() {
+        let (w, mut g) = squid_citizen_fixture();
+        g.population.spawn(Role::Archer, 11.0, &mut g.rng);
+        g.population.units[0].y = 2.0;
+        g.population.units[0].in_slot = true;
+        g.greed.trolls[0].y = 2.5;
+        // Let the scanner's randomized initial 0..0.5s phase elapse before
+        // checking the held altitude selected by the Chase coroutine.
+        g.update_greed(&w, 0.5, &mut Vec::new());
+        g.greed.trolls[0].y = 2.5;
+        g.update_greed(&w, 0.1, &mut Vec::new());
+        #[cfg(feature = "save")]
+        assert_eq!(g.greed.squid_states().next().unwrap().altitude, 2.0);
+        assert!(
+            (g.greed.trolls[0].y - 2.4).abs() > 1e-4,
+            "altitude is reached through physical flight, not a fixed easing step"
+        );
+        assert_eq!(g.greed.trolls[0].mover.goal.unwrap().0, 11.0);
+
+        let (_, mut g) = squid_citizen_fixture();
+        g.population.spawn(Role::Peasant, 8.0, &mut g.rng);
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 8.0, 1, false, &mut g.rng);
+        let mut events = Vec::new();
+        g.update_greed(&w, 0.0, &mut events);
+        assert!(g.population.units.is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::Greed(GreedEvent::Grabbed { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            g.greed
+                .trolls
+                .iter()
+                .filter(|t| g
+                    .greed
+                    .squid_visual(t.id)
+                    .is_some_and(|v| v.clip == "squid_attack"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            g.greed.trolls.iter().map(|t| t.victims as u32).sum::<u32>(),
+            1
+        );
+    }
+
+    #[cfg(feature = "save")]
+    #[test]
+    fn squid_save_preserves_grab_marker_and_loads_legacy_world() {
+        let (mut world, mut game) = squid_citizen_fixture();
+        world.squid.as_mut().unwrap().grab_complete = Some(0.6);
+        let legacy = crate::save::save_game(&game, 51);
+        assert_eq!(u16::from_le_bytes([legacy[4], legacy[5]]), 5);
+        assert!(crate::save::load_game(&legacy, 51, &world).is_ok());
+
+        game.population.spawn(Role::Peasant, 8.0, &mut game.rng);
+        let mut events = Vec::new();
+        game.update_greed(&world, 0.0, &mut events);
+        game.update_greed(&world, 0.59, &mut events);
+        let bytes = crate::save::save_game(&game, 51);
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 5);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, GameEvent::Greed(GreedEvent::GrabComplete(_)))));
+        let mut resumed = crate::save::load_game(&bytes, 51, &world).unwrap();
+        assert!(game.greed.squid_states().eq(resumed.greed.squid_states()));
+        events.clear();
+        resumed.update_greed(&world, 0.02, &mut events);
+        resumed.update_greed(&world, 0.2, &mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::Greed(GreedEvent::GrabComplete(_))))
+                .count(),
+            1
+        );
+
+        world.squid = None;
+        let mut legacy_pack = crate::save::load_game(&bytes, 51, &world).unwrap();
+        assert_eq!(legacy_pack.greed.trolls[0].victims, 1);
+        assert!(legacy_pack.greed.squid_visual(0).is_none());
+        legacy_pack.update_greed(&world, 0.02, &mut Vec::new());
+        assert!(legacy_pack.greed.squid_visual(0).is_none());
     }
 
     fn fight_world() -> WorldData {

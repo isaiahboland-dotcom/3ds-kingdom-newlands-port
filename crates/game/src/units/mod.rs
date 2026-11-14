@@ -268,26 +268,36 @@ impl Mover {
         self.step(x, dt, Some(CITIZEN_DRAG));
     }
 
+    /// Resolve the Mover command without advancing ground physics.
+    pub(crate) fn flight_goal(&mut self, x: f32, dt: f32) -> Option<f32> {
+        self.pause = (self.pause - dt).max(0.0);
+        (self.pause == 0.0).then(|| self.goal_velocity(x))
+    }
+
+    fn goal_velocity(&mut self, x: f32) -> f32 {
+        if let Some((g, speed)) = self.goal {
+            let d = (x - g).abs();
+            if d > POSITION_EPSILON {
+                self.facing = if g > x { 1 } else { -1 };
+                let t = (d / RUBBER_BAND).min(1.0);
+                self.move_speed = 0.4 * speed + (speed - 0.4 * speed) * t;
+            } else {
+                self.move_speed = 0.0;
+                self.moving_to_goal = false;
+            }
+        }
+        self.move_speed * self.facing as f32
+    }
+
     /// `drag`: the body's `Rigidbody2D.linearDrag` when the physics step is
     /// modelled.
     fn step(&mut self, x: &mut f32, dt: f32, drag: Option<f32>) {
-        let mut target = None;
-        if self.pause > 0.0 {
+        let target = if self.pause > 0.0 {
             self.pause -= dt;
+            None
         } else {
-            if let Some((g, speed)) = self.goal {
-                let d = (*x - g).abs();
-                if d > POSITION_EPSILON {
-                    self.facing = if g > *x { 1 } else { -1 };
-                    let t = (d / RUBBER_BAND).min(1.0);
-                    self.move_speed = 0.4 * speed + (speed - 0.4 * speed) * t;
-                } else {
-                    self.move_speed = 0.0;
-                    self.moving_to_goal = false;
-                }
-            }
-            target = Some(self.move_speed * self.facing as f32);
-        }
+            Some(self.goal_velocity(*x))
+        };
         match target {
             Some(t) if (t > 0.0 && t > self.vx) || (t < 0.0 && t < self.vx) => self.vx = t,
             _ => {

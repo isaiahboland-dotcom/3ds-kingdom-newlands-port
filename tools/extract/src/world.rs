@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use game::animation::Pose;
 use game::data::{
     BlockDef, BuildingDef, CampDef, DayDef, DirectorDef, FixedTransform, ForestItemDef, Kind,
     Layer, LayerDef, LevelConfigDef, LightPreset, Part, PayableDef, Placed, Proto, ProtoId,
@@ -13,6 +14,7 @@ use game::data::{
     UpgradeDef, WorldData, LIGHT_COLORS, LIGHT_FLOATS, TILE_SCATTER_FLAGS,
 };
 use game::data::{Curve, PortalDef, WallDef, WaveDef};
+use scene::authored::{Affine2, PartVisual, PrefabVisual, TransformNode};
 use serde_json::{Map, Value};
 
 /// Components deriving from `Payable` (for overlap regions and half widths).
@@ -97,6 +99,104 @@ fn asset_path(v: Option<&Value>) -> Option<&str> {
     v?.get("asset")?.as_str()
 }
 
+// Scaffold modules have their own draw path. Layer 29 is seen by the
+// water reflection camera, whose extra pass is outside these visual parts.
+fn skip_part_subtree(node: &Value) -> bool {
+    comp(node, "ScaffoldModule").is_some() || node["layer"].as_i64() == Some(29)
+}
+
+fn active_part_children(node: &Value) -> impl Iterator<Item = &Value> {
+    node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|child| child["active"] == true)
+}
+
+fn local_pose(node: &Value, renderer: Option<&Map<String, Value>>) -> Pose {
+    let mut pose = Pose {
+        position: vec3(&node["pos"]),
+        scale: [0, 1, 2].map(|i| node["scale"][i].as_f64().unwrap_or(1.0) as f32),
+        rotation: [0, 1, 2, 3].map(|i| {
+            node["rot"][i]
+                .as_f64()
+                .unwrap_or(if i == 3 { 1.0 } else { 0.0 }) as f32
+        }),
+        ..Default::default()
+    };
+    if let Some(renderer) = renderer {
+        pose.color = ["r", "g", "b", "a"].map(|channel| {
+            renderer
+                .get("m_Color")
+                .and_then(|color| color[channel].as_f64())
+                .unwrap_or(1.0) as f32
+        });
+        pose.visible = flag(renderer, "m_Enabled");
+    }
+    pose
+}
+
+/// Collect visual metadata independently of the legacy sprite interning and
+/// world fields. The part list follows the same active renderer traversal.
+fn authored_prefab(node: &Value, legacy_parts: usize) -> Result<PrefabVisual, String> {
+    fn collect(
+        node: &Value,
+        path: String,
+        parent: Option<u16>,
+        visual: &mut PrefabVisual,
+    ) -> Result<(), String> {
+        if skip_part_subtree(node) {
+            return Ok(());
+        }
+        let index = u16::try_from(visual.nodes.len())
+            .map_err(|_| format!("too many authored transform nodes at {path}"))?;
+        let renderer = comp(node, "SpriteRenderer");
+        let mut local = local_pose(node, renderer);
+        if parent.is_none() {
+            // Object placement and its facing own the root translation and
+            // X reflection. Keep the authored rotation and scale magnitudes.
+            local.position = [0.0; 3];
+            local.scale[0] = local.scale[0].abs();
+        }
+        let animator = comp(node, "Animator")
+            .filter(|animator| flag(animator, "m_Enabled"))
+            .and_then(|animator| asset_path(animator.get("m_Controller")))
+            .map(str::to_owned);
+        if let Some(renderer) = renderer.filter(|renderer| flag(renderer, "m_Enabled")) {
+            visual.parts.push(PartVisual {
+                node: index,
+                flip_x: flag(renderer, "m_FlipX"),
+                flip_y: flag(renderer, "m_FlipY"),
+            });
+        }
+        visual.nodes.push(TransformNode {
+            path,
+            parent,
+            local,
+            animator,
+        });
+        for child in active_part_children(node) {
+            let path = &visual.nodes[index as usize].path;
+            let name = child["name"].as_str().unwrap_or_default();
+            let child_path = if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path}/{name}")
+            };
+            collect(child, child_path, Some(index), visual)?;
+        }
+        Ok(())
+    }
+
+    let mut visual = PrefabVisual::default();
+    collect(node, String::new(), None, &mut visual)?;
+    if visual.parts.len() != legacy_parts {
+        let name = node["name"].as_str().unwrap_or_default();
+        return Err(format!("authored renderer count differs for {name}"));
+    }
+    Ok(visual)
+}
+
 /// Materials with the `Recolor` toggle on.
 fn recolor_materials(assets: &Path) -> HashSet<String> {
     let mut out = HashSet::new();
@@ -122,6 +222,8 @@ fn recolor_materials(assets: &Path) -> HashSet<String> {
 struct Builder<'a> {
     inp: &'a Inputs<'a>,
     world: WorldData,
+    visuals: Vec<Result<PrefabVisual, String>>,
+    obstacles: Vec<Result<Vec<game::data::ObstacleDef>, String>>,
     sprite_ids: HashMap<String, SpriteId>,
     prefab_protos: HashMap<String, ProtoId>,
     recolor: HashSet<String>,
@@ -159,6 +261,8 @@ impl<'a> Builder<'a> {
     fn reserve(&mut self) -> ProtoId {
         let id = self.world.protos.len() as ProtoId;
         self.world.protos.push(Proto::default());
+        self.visuals.push(Ok(PrefabVisual::default()));
+        self.obstacles.push(Ok(Vec::new()));
         id
     }
 
@@ -261,13 +365,7 @@ impl<'a> Builder<'a> {
         in_scaffold: bool,
     ) {
         let in_scaffold = in_scaffold || comp(node, "Scaffolding").is_some();
-        // Scaffold modules are exported separately (BuildingDef::scaffold).
-        if comp(node, "ScaffoldModule").is_some() {
-            return;
-        }
-        // Layer 29 is only seen by the water reflection camera (the boat's
-        // `Reflection`); the reflection pass isn't ported.
-        if node["layer"].as_i64() == Some(29) {
+        if skip_part_subtree(node) {
             return;
         }
         let mut me = parent;
@@ -329,10 +427,7 @@ impl<'a> Builder<'a> {
                 });
             }
         }
-        for child in node["children"].as_array().into_iter().flatten() {
-            if child["active"] != true {
-                continue;
-            }
+        for child in active_part_children(node) {
             let p = vec3(&child["pos"]);
             let s = vec3(&child["scale"]);
             let cat = [at[0] + scale.0 * p[0], at[1] + scale.1 * p[1], at[2] + p[2]];
@@ -360,6 +455,9 @@ impl<'a> Builder<'a> {
             &mut parts,
             &mut part_ids,
         );
+        self.visuals[id as usize] = authored_prefab(node, parts.len());
+        self.obstacles[id as usize] =
+            obstacle_shapes(node).map_err(|e| format!("{} obstacle: {e}", node["name"]));
 
         let root_sprite = comp(node, "SpriteRenderer").and_then(|sr| {
             let r = sr.get("m_Sprite");
@@ -1844,11 +1942,13 @@ fn level_config(name: &str, f: &Map<String, Value>, waves: &HashMap<&str, u16>) 
     }
 }
 
-/// The world, and the asset path of each audio clip (`AudioDef::clips`).
-pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
+/// Legacy world data, audio clip source paths, and visual metadata by prototype ID.
+pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>, Vec<PrefabVisual>), String> {
     let mut b = Builder {
         inp,
         world: WorldData::default(),
+        visuals: Vec::new(),
+        obstacles: Vec::new(),
         sprite_ids: HashMap::new(),
         prefab_protos: HashMap::new(),
         recolor: recolor_materials(inp.assets_dir),
@@ -2122,7 +2222,354 @@ pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
             .collect();
     }
     b.world.audio = found.audio;
-    Ok((b.world, found.clip_paths))
+    b.world.squid = Some(game::flight::AssetData {
+        definition: authored_squid(inp)?,
+        obstacles: b.obstacles.into_iter().collect::<Result<_, _>>()?,
+        ..Default::default()
+    });
+    let visuals = b.visuals.into_iter().collect::<Result<_, _>>()?;
+    Ok((b.world, found.clip_paths, visuals))
+}
+
+fn authored_squid(inp: &Inputs) -> Result<game::flight::Definition, String> {
+    let settings = inp
+        .assets_dir
+        .parent()
+        .ok_or("missing project directory")?
+        .join("ProjectSettings");
+    let physics = read_physics_settings(&settings, "Physics2DSettings.asset", "Physics2DSettings")?;
+    let time = read_physics_settings(&settings, "TimeManager.asset", "TimeManager")?;
+    let material = read_physics_settings(
+        &inp.assets_dir.join("PhysicsMaterial2D"),
+        "Walls.physicsMaterial2D",
+        "PhysicsMaterial2D",
+    )?;
+    if physics_number(&material, "friction")? != 0.0
+        || physics_number(&material, "bounciness")? != 0.0
+    {
+        return Err("unsupported nonzero wall contact material".into());
+    }
+    let squid = inp
+        .prefabs
+        .get("Resources/prefabs/enemies/Squid.prefab")
+        .ok_or("missing authored Squid prefab")?;
+    squid_definition(squid, &physics, &time, squid_ground(inp.main)?)
+}
+
+/// Preserve the actual Obstacles-layer geometry independently of attack targets.
+fn obstacle_shapes(node: &Value) -> Result<Vec<game::data::ObstacleDef>, String> {
+    fn walk(
+        node: &Value,
+        at: Affine2,
+        out: &mut Vec<game::data::ObstacleDef>,
+    ) -> Result<(), String> {
+        if node["active"].as_bool() == Some(false) {
+            return Ok(());
+        }
+        if node["layer"].as_u64() == Some(20) {
+            for c in node["components"].as_array().into_iter().flatten() {
+                let ty = c["type"].as_str().unwrap_or("");
+                if !ty.ends_with("Collider2D") {
+                    continue;
+                }
+                let f = c["fields"].as_object().ok_or("missing obstacle fields")?;
+                if !flag(f, "m_Enabled") {
+                    continue;
+                }
+                if flag(f, "m_UsedByComposite")
+                    || flag(f, "m_UsedByEffector")
+                    || flag(f, "m_IsTrigger")
+                {
+                    return Err("unsupported obstacle composite, effector or trigger".into());
+                }
+                if asset_path(f.get("m_Material"))
+                    != Some("PhysicsMaterial2D/Walls.physicsMaterial2D")
+                {
+                    return Err("unsupported obstacle material".into());
+                }
+                let offset = physics_xy(&f["m_Offset"])?;
+                let paths: Vec<Vec<[f32; 2]>> = match ty {
+                    "PolygonCollider2D" => f["m_Points"]["m_Paths"]
+                        .as_array()
+                        .ok_or("missing obstacle polygon")?
+                        .iter()
+                        .map(|path| {
+                            path.as_array()
+                                .ok_or_else(|| "missing obstacle vertices".to_owned())?
+                                .iter()
+                                .map(physics_xy)
+                                .collect()
+                        })
+                        .collect::<Result<_, _>>()?,
+                    "BoxCollider2D" => {
+                        let size = physics_xy(&f["m_Size"])?;
+                        if size.iter().any(|v| *v <= 0.0) {
+                            return Err("invalid obstacle box".into());
+                        }
+                        vec![vec![
+                            [-size[0] * 0.5, -size[1] * 0.5],
+                            [size[0] * 0.5, -size[1] * 0.5],
+                            [size[0] * 0.5, size[1] * 0.5],
+                            [-size[0] * 0.5, size[1] * 0.5],
+                        ]]
+                    }
+                    _ => return Err(format!("unsupported obstacle collider {ty}")),
+                };
+                for path in paths {
+                    let points: Vec<_> = path
+                        .iter()
+                        .map(|v| at.point([v[0] + offset[0], v[1] + offset[1]]))
+                        .collect();
+                    if points.len() < 3 || points.iter().flatten().any(|v| !v.is_finite()) {
+                        return Err("invalid obstacle vertices".into());
+                    }
+                    out.push(game::data::ObstacleDef {
+                        origin: at.translation,
+                        points,
+                    });
+                }
+            }
+        }
+        for child in node["children"].as_array().into_iter().flatten() {
+            walk(
+                child,
+                at.compose(Affine2::from_pose(local_pose(child, None))),
+                out,
+            )?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(node, Affine2::IDENTITY, &mut out)?;
+    Ok(out)
+}
+
+fn squid_definition(
+    node: &Value,
+    physics: &Value,
+    time: &Value,
+    ground_height: f32,
+) -> Result<game::flight::Definition, String> {
+    let squid = comp(node, "Squid").ok_or("missing Squid component")?;
+    let body = comp(node, "Rigidbody2D").ok_or("missing Squid body")?;
+    let mover = comp(node, "Mover").ok_or("missing Squid mover")?;
+    let field = |f: &Map<String, Value>, key: &str| -> Result<f32, String> {
+        f.get(key)
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
+            .filter(|v| v.is_finite())
+            .ok_or_else(|| format!("missing/invalid Squid {key}"))
+    };
+    let physical = node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|n| n["tag"] == "PhysicalCollider")
+        .ok_or("missing Squid physical collider child")?;
+    let pose = local_pose(physical, None);
+    let circle = comp(physical, "CircleCollider2D").ok_or("missing Squid physical circle")?;
+    let sensor = comp(node, "PolygonCollider2D").ok_or("missing Squid hit sensor")?;
+    if num(body, "m_BodyType") != 0.0
+        || !flag(body, "m_Simulated")
+        || flag(body, "m_UseAutoMass")
+        || num(body, "m_Constraints") != 4.0
+        || num(body, "m_CollisionDetection") != 0.0
+        || !default_physics_material(&body["m_Material"])
+        || !default_physics_material(&circle["m_Material"])
+        || !default_physics_material(&physics["m_DefaultMaterial"])
+        || pose.position != [0.0; 3]
+        || pose.rotation != [0.0, 0.0, 0.0, 1.0]
+        || pose.scale != [1.0; 3]
+        || !flag(circle, "m_Enabled")
+        || flag(circle, "m_IsTrigger")
+        || flag(circle, "m_UsedByComposite")
+        || flag(circle, "m_UsedByEffector")
+        || !flag(sensor, "m_IsTrigger")
+        || !flag(sensor, "m_Enabled")
+        || physical["layer"].as_u64() != Some(21)
+    {
+        return Err("unsupported Squid rigidbody/collider topology or material".into());
+    }
+    for (a, b, collides) in [
+        (21, 0, true),
+        (21, 20, true),
+        (17, 0, true),
+        (17, 20, false),
+    ] {
+        if physics_layers_collide(physics, a, b)? != collides
+            || physics_layers_collide(physics, b, a)? != collides
+        {
+            return Err("unsupported Squid chase/retreat collision layers".into());
+        }
+    }
+    if physics_xy(&physics["m_Gravity"])?[0] != 0.0
+        || physics_number(physics, "m_AutoSimulation")? != 1.0
+        || physics_number(time, "m_TimeScale")? != 1.0
+    {
+        return Err("unsupported Squid simulation mode".into());
+    }
+    let positions = squid["carryPositions"]
+        .as_array()
+        .ok_or("missing Squid carry positions")?;
+    if positions.is_empty() || positions.len() > u8::MAX as usize {
+        return Err("invalid Squid carry capacity".into());
+    }
+    for reference in positions {
+        let id = reference["local"]
+            .as_i64()
+            .ok_or("unlinked Squid carry position")?;
+        if !node["children"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|n| n["transform_id"].as_i64() == Some(id))
+        {
+            return Err("missing direct Squid carry position".into());
+        }
+    }
+    let iterations = |key| -> Result<u8, String> {
+        physics[key]
+            .as_u64()
+            .filter(|v| *v > 0 && *v <= 255)
+            .map(|v| v as u8)
+            .ok_or_else(|| format!("invalid Squid {key}"))
+    };
+    let hit = &squid["hitBox"];
+    let d = game::flight::Definition {
+        mass: field(body, "m_Mass")?,
+        gravity: -physics_xy(&physics["m_Gravity"])?[1],
+        gravity_scale: field(body, "m_GravityScale")?,
+        // Squid.OnEnable overrides the authored body drag to .5 every spawn.
+        linear_drag: 0.5,
+        angular_drag: field(body, "m_AngularDrag")?,
+        fixed_step: physics_number(time, "Fixed Timestep")?,
+        max_linear_speed: physics_number(physics, "m_MaxTranslationSpeed")?,
+        max_acceleration_per_frame: field(mover, "maxAccelerationPerFrame")?,
+        fly_lift: field(squid, "flyLift")?,
+        fly_duration: field(squid, "flyDuration")?,
+        fly_cooldown: field(squid, "flyCooldown")?,
+        base_altitude: field(squid, "baseAltitude")?,
+        move_speed: field(squid, "moveSpeed")?,
+        scan_range: field(squid, "scanRange")?,
+        attack_cooldown: field(squid, "attackCooldown")?,
+        physical_radius: field(circle, "m_Radius")?,
+        physical_offset: physics_xy(&circle["m_Offset"])?,
+        dead_radius: field(squid, "deadRadius")?,
+        grab_bounds: [
+            physics_number(hit, "x")?,
+            physics_number(hit, "y")?,
+            physics_number(hit, "width")?,
+            physics_number(hit, "height")?,
+        ],
+        carry_capacity: positions.len() as u8,
+        spawn_overlay_color: ["r", "g", "b", "a"]
+            .map(|key| physics_number(&squid["spawnOverlayColor"], key))
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .try_into()
+            .map_err(|_| "invalid overlay color")?,
+        ground_height,
+        // Unity 2017.1 null collider/body/global material defaults.
+        friction: 0.4,
+        restitution: 0.0,
+        contact_offset: physics_number(physics, "m_DefaultContactOffset")?,
+        velocity_threshold: physics_number(physics, "m_VelocityThreshold")?,
+        max_linear_correction: physics_number(physics, "m_MaxLinearCorrection")?,
+        baumgarte: physics_number(physics, "m_BaumgarteScale")?,
+        velocity_iterations: iterations("m_VelocityIterations")?,
+        position_iterations: iterations("m_PositionIterations")?,
+    };
+    if !d.valid() {
+        return Err("invalid Squid flight definition".into());
+    }
+    Ok(d)
+}
+
+fn read_physics_settings(dir: &Path, name: &str, key: &str) -> Result<Value, String> {
+    let text = std::fs::read_to_string(dir.join(name)).map_err(|e| format!("{name}: {e}"))?;
+    let body = text
+        .lines()
+        .filter(|l| !l.starts_with('%') && !l.starts_with("---"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let value: Value = serde_yaml::from_str(&body).map_err(|e| format!("{name}: {e}"))?;
+    Ok(value[key].clone())
+}
+
+fn physics_number(v: &Value, key: &str) -> Result<f32, String> {
+    v[key]
+        .as_f64()
+        .map(|v| v as f32)
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| format!("missing or invalid physics {key}"))
+}
+
+fn physics_xy(v: &Value) -> Result<[f32; 2], String> {
+    Ok([physics_number(v, "x")?, physics_number(v, "y")?])
+}
+
+fn default_physics_material(v: &Value) -> bool {
+    v.is_null() || v["fileID"].as_i64() == Some(0)
+}
+
+fn physics_layers_collide(physics: &Value, a: u32, b: u32) -> Result<bool, String> {
+    if a >= 32 || b >= 32 {
+        return Err("invalid physics layer".into());
+    }
+    let matrix = physics["m_LayerCollisionMatrix"]
+        .as_str()
+        .ok_or("missing physics layer collision matrix")?;
+    if matrix.len() != 256 || !matrix.is_ascii() {
+        return Err("invalid physics layer collision matrix".into());
+    }
+    let row = matrix
+        .get(a as usize * 8..a as usize * 8 + 8)
+        .ok_or("invalid physics layer collision matrix")?;
+    let mut bytes = [0; 4];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&row[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "invalid physics layer collision matrix")?;
+    }
+    Ok(u32::from_le_bytes(bytes) & (1 << b) != 0)
+}
+
+/// Level.GenerateInternal (original CIL 0x06000fe5) places the ground transform
+/// at world Y=0 and replaces its edge points with Y=.875*.5. Collider offset is
+/// still applied. The workshop's spawn Y=1 is above this surface, not the floor.
+fn squid_ground(main: &Value) -> Result<f32, String> {
+    let (level_node, level) = find_component(main, "Level").ok_or("missing ground Level")?;
+    let id = level["ground"]["local"]
+        .as_i64()
+        .ok_or("unlinked Level.ground")?;
+    let ground = level_node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|c| c["id"].as_i64() == Some(id))
+        .ok_or("missing direct ground child")?;
+    for node in [level_node, ground] {
+        let pose = local_pose(node, None);
+        if pose.rotation != [0.0, 0.0, 0.0, 1.0] || pose.scale != [1.0; 3] {
+            return Err("unsupported transformed squid ground".into());
+        }
+    }
+    if comp(ground, "Rigidbody2D").is_some() {
+        return Err("squid ground must be static".into());
+    }
+    if ground["layer"].as_u64() != Some(0) {
+        return Err("unsupported squid ground layer".into());
+    }
+    let edge = comp(ground, "EdgeCollider2D").ok_or("missing ground edge")?;
+    if !flag(edge, "m_Enabled")
+        || flag(edge, "m_IsTrigger")
+        || flag(edge, "m_UsedByComposite")
+        || flag(edge, "m_UsedByEffector")
+        || num(edge, "m_EdgeRadius") != 0.0
+        || !default_physics_material(&edge["m_Material"])
+    {
+        return Err("unsupported ground collider or material".into());
+    }
+    Ok(physics_xy(&edge["m_Offset"])?[1] + 0.875 * 0.5)
 }
 
 /// Data assets of `ty`, sorted by path, as (path, fields).
@@ -2237,4 +2684,237 @@ fn lighting_and_days(world: &mut WorldData, inp: &Inputs) -> Result<(), String> 
             .collect(),
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use scene::authored::Affine2;
+    use serde_json::json;
+
+    fn extract(node: &Value) -> (Proto, PrefabVisual, Vec<String>) {
+        let empty = json!({});
+        let maps = Map::new();
+        let names = HashMap::from([
+            ("sprite".into(), "panel".into()),
+            ("other-sprite".into(), "trim".into()),
+        ]);
+        let sizes = HashMap::from([("panel".into(), (4, 4, 32.0))]);
+        let inp = Inputs {
+            main: &empty,
+            blocks: &empty,
+            loader: &empty,
+            prefabs: &maps,
+            data: &maps,
+            sprite_names: &names,
+            sprite_sizes: &sizes,
+            assets_dir: Path::new("."),
+        };
+        let mut builder = Builder {
+            inp: &inp,
+            world: WorldData::default(),
+            visuals: Vec::new(),
+            obstacles: Vec::new(),
+            sprite_ids: HashMap::new(),
+            prefab_protos: HashMap::new(),
+            recolor: HashSet::new(),
+        };
+        let index = builder.proto(node) as usize;
+        (
+            builder.world.protos.remove(index),
+            builder.visuals.remove(index).unwrap(),
+            builder.world.sprites,
+        )
+    }
+
+    fn node(
+        name: &str,
+        pos: [f32; 3],
+        scale: [f32; 3],
+        rot: [f32; 4],
+        children: Vec<Value>,
+        sprite: bool,
+    ) -> Value {
+        json!({
+            "name": name, "active": true, "pos": pos, "scale": scale, "rot": rot, "layer": 0,
+            "components": if sprite { vec![json!({"id": 31, "type": "SpriteRenderer", "fields": {
+                "m_Enabled": 1, "m_Sprite": {"asset": "sprite"}, "m_FlipX": 1, "m_FlipY": 1
+            }})] } else { vec![] },
+            "children": children,
+        })
+    }
+
+    const IDENTITY_ROTATION: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    fn plain(name: &str, children: Vec<Value>, sprite: bool) -> Value {
+        node(
+            name,
+            [0.0; 3],
+            [1.0; 3],
+            IDENTITY_ROTATION,
+            children,
+            sprite,
+        )
+    }
+
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-5, "{a} != {b}");
+    }
+
+    fn composed(visual: &PrefabVisual, part: usize) -> Affine2 {
+        visual
+            .sampled_transform(visual.parts[part].node, |_, node| node.local)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn composed_parts_keep_nonrendered_parent_rotation_scale_and_renderer_flips() {
+        let c = core::f32::consts::FRAC_1_SQRT_2;
+        let panel = node(
+            "Panel",
+            [2.0, 0.0, 0.0],
+            [-1.0, 1.0, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let mut pivot = node(
+            "Pivot",
+            [1.0, 2.0, 0.0],
+            [1.0, 3.0, 1.0],
+            [
+                0.0,
+                0.0,
+                (core::f32::consts::PI / 8.0).sin(),
+                (core::f32::consts::PI / 8.0).cos(),
+            ],
+            vec![panel],
+            false,
+        );
+        pivot["components"] = json!([{"type": "Animator", "fields": {
+            "m_Enabled": 1, "m_Controller": {"asset": "AnimatorController/panel.controller"}
+        }}]);
+        let root = node(
+            "Root",
+            [7.0, 8.0, 0.0],
+            [-2.0, 1.0, 1.0],
+            [0.0, 0.0, c, c],
+            vec![pivot],
+            false,
+        );
+        let (legacy, visual, _) = extract(&root);
+        assert_eq!(
+            visual
+                .nodes
+                .iter()
+                .map(|node| node.path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "Pivot", "Pivot/Panel"]
+        );
+        assert_eq!(visual.nodes[2].parent, Some(1));
+        assert_eq!(
+            visual.nodes[1].animator.as_deref(),
+            Some("AnimatorController/panel.controller")
+        );
+        assert_eq!(visual.parts[0].node, 2);
+        assert!(visual.parts[0].flip_x && visual.parts[0].flip_y);
+        assert_eq!((legacy.parts[0].x, legacy.parts[0].y), (6.0, 2.0));
+        assert!(
+            !legacy.parts[0].flip,
+            "old pack keeps the folded reflection"
+        );
+        let transform = composed(&visual, 0);
+        close(transform.translation[0], -2.0 - 2.0 * c);
+        close(transform.translation[1], 2.0 + 4.0 * c);
+        for (actual, expected) in transform
+            .basis
+            .into_iter()
+            .zip([c, -3.0 * c, -2.0 * c, -6.0 * c])
+        {
+            close(actual, expected);
+        }
+    }
+
+    #[test]
+    fn visual_parts_match_legacy_indices_without_interning_sprites() {
+        let mut inactive = plain("Inactive", vec![plain("Sprite", vec![], true)], false);
+        inactive["active"] = false.into();
+        let mut reflection = plain("Reflection", vec![plain("Sprite", vec![], true)], false);
+        reflection["layer"] = 29.into();
+        let mut scaffold = plain("Scaffold", vec![plain("Sprite", vec![], true)], true);
+        scaffold["components"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "ScaffoldModule", "fields": {}}));
+        let mut child = plain("Child", vec![], true);
+        child["components"][0]["fields"]["m_Sprite"]["asset"] = "other-sprite".into();
+        let mut disabled = plain("Disabled", vec![child], true);
+        disabled["components"][0]["fields"]["m_Enabled"] = 0.into();
+        let root = plain(
+            "Root",
+            vec![
+                inactive,
+                reflection,
+                scaffold,
+                disabled,
+                plain("Normal", vec![], true),
+            ],
+            false,
+        );
+        let (legacy, visual, sprite_names) = extract(&root);
+        assert_eq!(sprite_names, ["trim", "panel"]);
+        assert_eq!(
+            legacy
+                .parts
+                .iter()
+                .map(|part| part.sprite)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            visual
+                .parts
+                .iter()
+                .map(|part| visual.nodes[part.node as usize].path.as_str())
+                .collect::<Vec<_>>(),
+            ["Disabled/Child", "Normal"]
+        );
+        assert!(!visual.nodes[1].local.visible);
+    }
+
+    #[test]
+    fn portal_surface_goo_and_catapult_rope_keep_authored_transform_magnitudes() {
+        let surface = node(
+            "Surface",
+            [0.0; 3],
+            [1.0, 1.5, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let goo = node(
+            "Goo Spin",
+            [0.0; 3],
+            [-1.3, 1.1, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let rope = node(
+            "Rope",
+            [0.0; 3],
+            [6.659998, 1.0, 1.0],
+            [0.0, 0.0, 0.36361992, 0.9315474],
+            vec![],
+            true,
+        );
+        let (_, visual, _) = extract(&plain("Root", vec![surface, goo, rope], false));
+        assert_eq!(composed(&visual, 0).basis, [1.0, 0.0, 0.0, 1.5]);
+        assert_eq!(composed(&visual, 1).basis, [-1.3, 0.0, 0.0, 1.1]);
+        let [a, b, c, d] = composed(&visual, 2).basis;
+        close((a * a + c * c).sqrt(), 6.659998);
+        close((b * b + d * d).sqrt(), 1.0);
+        assert!(c > 4.0 && b < -0.6, "rope rotation was discarded");
+    }
 }

@@ -66,6 +66,7 @@ type Quad = [Vertex; 4];
 struct State {
     /// Texture page, or untextured.
     page: Option<u16>,
+    overlay: Option<u32>,
     additive: bool,
     /// Linear filtering (scaled glows).
     smooth: bool,
@@ -119,6 +120,7 @@ pub struct Gpu {
     pub painter: bool,
     bound_page: Option<(u16, bool)>,
     bound_textured: Option<Env>,
+    bound_overlay: Option<Option<u32>>,
     bound_additive: Option<bool>,
     /// Draw calls this frame.
     pub draws: u32,
@@ -303,6 +305,7 @@ impl Gpu {
                 painter: false,
                 bound_page: None,
                 bound_textured: None,
+                bound_overlay: None,
                 bound_additive: None,
                 draws: 0,
                 reflection,
@@ -344,6 +347,7 @@ impl Gpu {
     fn unbind(&mut self) {
         self.bound_page = None;
         self.bound_textured = None;
+        self.bound_overlay = None;
         self.bound_additive = None;
     }
 
@@ -514,6 +518,29 @@ impl Gpu {
             }
             self.bound_textured = Some(mode);
         }
+        if self.bound_overlay != Some(state.overlay) {
+            let env = c3d::C3D_GetTexEnv(1);
+            // Stage 0 computes coverage. Stage 1 changes RGB only.
+            c3d::C3D_TexEnvInit(env);
+            if let Some(overlay) = state.overlay {
+                c3d::C3D_TexEnvSrc(
+                    env,
+                    c3d::C3D_RGB,
+                    ctru::GPU_CONSTANT,
+                    ctru::GPU_PREVIOUS,
+                    ctru::GPU_CONSTANT,
+                );
+                c3d::C3D_TexEnvOpRgb(
+                    env,
+                    ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                    ctru::GPU_TEVOP_RGB_SRC_COLOR,
+                    ctru::GPU_TEVOP_RGB_SRC_ALPHA,
+                );
+                c3d::C3D_TexEnvFunc(env, c3d::C3D_RGB, ctru::GPU_INTERPOLATE);
+                c3d::C3D_TexEnvColor(env, overlay);
+            }
+            self.bound_overlay = Some(state.overlay);
+        }
         if let Some(p) = state.page {
             if self.bound_page != Some((p, state.smooth)) {
                 let tex = self.pages[p as usize].as_mut();
@@ -587,6 +614,7 @@ impl Gpu {
         self.draw(
             State {
                 page: None,
+                overlay: None,
                 additive: false,
                 smooth: false,
             },
@@ -599,6 +627,7 @@ impl Gpu {
             self.draw(
                 State {
                     page: Some(p as u16),
+                    overlay: None,
                     additive: false,
                     smooth: false,
                 },
@@ -666,33 +695,40 @@ impl Gpu {
     fn sprite_part(&mut self, id: u32, at: (f32, f32), d: &Draw, tint: Color) {
         let s = *self.sheet.get(id);
         let (pw, ph) = self.page_size[s.page as usize];
-        let k = d.scale;
-        let px = if d.flip { s.w as f32 - s.px } else { s.px };
-        // Corners relative to the pivot, before rotation.
-        let (x0, y0) = (-px * k, -s.py * k);
-        let (x1, y1) = (x0 + s.w as f32 * k, y0 + s.h as f32 * k);
-        let rel = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
-        let corners = if d.angle == 0.0 {
-            let mut c = rel.map(|(x, y)| (at.0 + x, at.1 + y));
-            if k == 1.0 {
-                for p in &mut c {
-                    *p = (p.0.round(), p.1.round());
-                }
-            }
-            c
+        let authored = d.basis.is_some() || d.flip_y;
+        let corners = if authored {
+            scene::render::sprite_corners(&s, at, d)
         } else {
-            let (sin, cos) = d.angle.sin_cos();
-            rel.map(|(x, y)| (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos))
+            let k = d.scale;
+            let px = if d.flip { s.w as f32 - s.px } else { s.px };
+            // Corners relative to the pivot, before rotation.
+            let (x0, y0) = (-px * k, -s.py * k);
+            let (x1, y1) = (x0 + s.w as f32 * k, y0 + s.h as f32 * k);
+            let rel = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+            if d.angle == 0.0 {
+                let mut c = rel.map(|(x, y)| (at.0 + x, at.1 + y));
+                if k == 1.0 {
+                    for p in &mut c {
+                        *p = (p.0.round(), p.1.round());
+                    }
+                }
+                c
+            } else {
+                let (sin, cos) = d.angle.sin_cos();
+                rel.map(|(x, y)| (at.0 + x * cos - y * sin, at.1 + x * sin + y * cos))
+            }
         };
         // Texture v runs bottom-up.
         let (u0, u1) = (s.x as f32 / pw, (s.x + s.w) as f32 / pw);
         let (v0, v1) = (1.0 - s.y as f32 / ph, 1.0 - (s.y + s.h) as f32 / ph);
         let (ul, ur) = if d.flip { (u1, u0) } else { (u0, u1) };
-        let uv = [(ul, v0), (ur, v0), (ur, v1), (ul, v1)];
+        let (vt, vb) = if d.flip_y { (v1, v0) } else { (v0, v1) };
+        let uv = [(ul, vt), (ur, vt), (ur, vb), (ul, vb)];
         let state = State {
             page: Some(s.page),
+            overlay: d.overlay.map(|overlay| u32::from_le_bytes(color(overlay))),
             additive: d.additive,
-            smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0),
+            smooth: d.smooth && (d.scale != 1.0 || d.angle != 0.0 || authored),
         };
         self.quad(state, corners, uv, [tint; 4]);
     }
@@ -706,6 +742,7 @@ impl Gpu {
         ];
         let state = State {
             page: None,
+            overlay: None,
             additive,
             smooth: false,
         };
@@ -749,6 +786,7 @@ impl Renderer for Gpu {
         ];
         let state = State {
             page: Some(s.page),
+            overlay: None,
             additive: false,
             smooth: false,
         };
@@ -801,6 +839,7 @@ impl Renderer for Gpu {
         const N: usize = 16;
         let state = State {
             page: None,
+            overlay: None,
             additive: false,
             smooth: false,
         };
@@ -820,6 +859,7 @@ impl Renderer for Gpu {
         let r1 = radius + thickness / 2.0;
         let state = State {
             page: None,
+            overlay: None,
             additive: false,
             smooth: false,
         };
@@ -863,6 +903,7 @@ impl Renderer for Gpu {
         ];
         let state = State {
             page: Some(page),
+            overlay: None,
             additive: true,
             smooth: false,
         };

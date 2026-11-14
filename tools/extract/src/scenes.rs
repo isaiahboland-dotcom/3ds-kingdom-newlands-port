@@ -276,6 +276,7 @@ pub fn export_file(path: &Path, r: &Resolver) -> Result<Value, String> {
             .collect();
         json!({
             "id": go_id,
+            "transform_id": tf.map(|t| t.id),
             "name": go.body.get("m_Name").cloned().unwrap_or(Value::Null),
             "active": go.body.get("m_IsActive").and_then(Value::as_i64) != Some(0),
             "tag": go.body.get("m_TagString").cloned().unwrap_or(Value::Null),
@@ -383,7 +384,7 @@ GameObject:
 --- !u!4 &11
 Transform:
   m_GameObject: {fileID: 10}
-  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalRotation: {x: 0, y: 0, z: 0.6, w: 0.8}
   m_LocalPosition: {x: 1.5, y: 2, z: 0}
   m_LocalScale: {x: -1, y: 1, z: 1}
   m_Children:
@@ -422,6 +423,7 @@ Transform:
         let root = &v["roots"][0];
         assert_eq!(root["name"], "Root");
         assert_eq!(root["pos"], json!([1.5, 2.0, 0.0]));
+        assert_eq!(root["rot"], json!([0.0, 0.0, 0.6, 0.8]));
         assert_eq!(root["scale"][0], -1.0);
         assert_eq!(root["components"][0]["type"], "SpriteRenderer");
         assert_eq!(

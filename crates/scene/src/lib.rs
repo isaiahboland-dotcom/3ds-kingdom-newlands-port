@@ -3,6 +3,7 @@
 //! backends only supply drawing, input, files and timing.
 
 pub mod adpcm;
+pub mod authored;
 #[cfg(feature = "clipfile")]
 pub mod clipfile;
 pub mod heraldry;
@@ -10,6 +11,7 @@ pub mod render;
 pub mod session;
 pub mod sheet;
 pub mod sound;
+pub mod squid;
 pub mod text;
 pub mod top;
 pub mod touch;
