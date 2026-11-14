@@ -1451,15 +1451,15 @@ fn draw_celestial_glow<R: Renderer>(c: &mut Ctx<R>, i: usize, j: usize) {
     );
 }
 
-/// The night star field, fading with the blended `stars` level. orig:
-/// `Stars` (Heaven layer, camera-fixed); its layout isn't exported, so the
-/// field is procedural: fixed places, gentle per-star twinkle.
+/// orig: `Stars` (Heaven layer, camera-fixed). The authored visibility mask
+/// controls a procedural field with fixed positions and per-star twinkle.
 fn draw_stars<R: Renderer>(c: &mut Ctx<R>) {
-    let level = c.light().floats[float::STARS];
-    if level <= 0.004 {
+    use crate::session::STAR_COUNT;
+    let (visible, level) = c.s.star_field();
+    if visible == 0 {
         return;
     }
-    const STAR_COUNT: usize = 110;
+    let hidden = STAR_COUNT - visible;
     let t = c.s.t;
     let bottom = screen_y(0.0) - 10.0;
     let mut state = 0x9E37_79B9_u32;
@@ -1469,8 +1469,11 @@ fn draw_stars<R: Renderer>(c: &mut Ctx<R>) {
         state ^= state << 5;
         state
     };
-    for _ in 0..STAR_COUNT {
+    for i in 0..STAR_COUNT {
         let (x, y, kind, rate, phase) = (next(), next(), next(), next(), next());
+        if i < hidden {
+            continue;
+        }
         let x = 1.0 + (x >> 8) as f32 / (1 << 24) as f32 * (W - 2.0);
         let y = 3.0 + (y >> 8) as f32 / (1 << 24) as f32 * (bottom - 3.0).max(1.0);
         let big = kind >> 24 < 6; // every sixth star is a brighter 2×2 one

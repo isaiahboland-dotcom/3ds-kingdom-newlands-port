@@ -2141,7 +2141,9 @@ fn light_preset(path: &str, f: &Map<String, Value>) -> LightPreset {
     let mut enabled = 0u32;
     let mut colors = [[0.0f32; 4]; LIGHT_COLORS.len()];
     for (i, name) in LIGHT_COLORS.iter().enumerate() {
-        let field = &f[*name];
+        let Some(field) = f.get(*name) else {
+            continue;
+        };
         if field["enabled"].as_i64() == Some(1) {
             enabled |= 1 << i;
         }
@@ -2150,7 +2152,9 @@ fn light_preset(path: &str, f: &Map<String, Value>) -> LightPreset {
     }
     let mut floats = [0.0f32; LIGHT_FLOATS.len()];
     for (j, name) in LIGHT_FLOATS.iter().enumerate() {
-        let field = &f[*name];
+        let Some(field) = f.get(*name) else {
+            continue;
+        };
         if field["enabled"].as_i64() == Some(1) {
             enabled |= 1 << (LIGHT_COLORS.len() + j);
         }
@@ -2172,6 +2176,63 @@ fn light_preset(path: &str, f: &Map<String, Value>) -> LightPreset {
     }
 }
 
+fn validate_red_moon(
+    main: &Value,
+    lights: &[(&str, &Map<String, Value>)],
+    world: &WorldData,
+) -> Result<(), String> {
+    // Older or alternate exports may omit the scene metadata. Existing
+    // packs still carry the preset, so only verify references that are set.
+    let Some(reference) = find_component(main, "EnemyManager")
+        .and_then(|(_, manager)| manager.get("redMoon"))
+        .filter(|reference| !reference.is_null())
+    else {
+        return Ok(());
+    };
+    let path = asset_path(Some(reference)).ok_or("EnemyManager.redMoon has no asset reference")?;
+    let (index, (_, fields)) = lights
+        .iter()
+        .enumerate()
+        .find(|(_, (candidate, _))| *candidate == path)
+        .ok_or_else(|| format!("EnemyManager.redMoon is not a converted BlenderState: {path}"))?;
+    if world.red_moon_preset().map(usize::from) != Some(index)
+        || fields.get("category").and_then(Value::as_i64) != Some(0)
+        || fields
+            .get("placeholder")
+            .and_then(Value::as_i64)
+            .is_some_and(|v| v != 0)
+    {
+        return Err(format!(
+            "EnemyManager.redMoon is not the unique Red Moon lighting overlay: {path}"
+        ));
+    }
+    // The general lighting converter uses defaults for missing values.
+    // Require the explicitly enabled overlay values to exist in the source.
+    let preset = &world.lights[index];
+    for (i, name) in LIGHT_COLORS.iter().enumerate() {
+        if preset.enabled & (1 << i) != 0
+            && ["r", "g", "b", "a"].iter().any(|channel| {
+                fields
+                    .get(*name)
+                    .and_then(|field| field["value"][*channel].as_f64())
+                    .is_none()
+            })
+        {
+            return Err(format!(
+                "EnemyManager.redMoon.{name} has no RGBA value: {path}"
+            ));
+        }
+    }
+    if fields
+        .get("stars")
+        .and_then(|field| field["value"].as_f64())
+        .is_none()
+    {
+        return Err(format!("EnemyManager.redMoon.stars has no value: {path}"));
+    }
+    Ok(())
+}
+
 /// orig: `BlenderState` and `Day` assets, the `Director` day lists and `Blender.initialStack`.
 fn lighting_and_days(world: &mut WorldData, inp: &Inputs) -> Result<(), String> {
     let lights = assets_of(inp.data, "BlenderState");
@@ -2181,6 +2242,7 @@ fn lighting_and_days(world: &mut WorldData, inp: &Inputs) -> Result<(), String> 
         .map(|(i, (p, _))| (*p, i as u16))
         .collect();
     world.lights = lights.iter().map(|(p, f)| light_preset(p, f)).collect();
+    validate_red_moon(inp.main, &lights, world)?;
 
     let days = assets_of(inp.data, "Day");
     let day_index: HashMap<&str, u16> = days
@@ -2237,4 +2299,139 @@ fn lighting_and_days(world: &mut WorldData, inp: &Inputs) -> Result<(), String> 
             .collect(),
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod red_moon_tests {
+    use super::*;
+    use serde_json::json;
+
+    const MOON: &str = "Resources/blender/Red Moon.asset";
+    const RAIN: &str = "Resources/blender/Night Rain Red Moon.asset";
+
+    fn scene(reference: Value) -> Value {
+        json!({"roots": [{"components": [{"type": "EnemyManager", "fields": {
+            "redMoon": reference,
+        }}]}]})
+    }
+
+    fn overlay() -> Map<String, Value> {
+        let mut fields = Map::new();
+        fields.insert("category".into(), json!(0));
+        for name in [
+            "moonTint",
+            "moonGlowColor",
+            "cloudHighlightColor",
+            "cloudStratusColor",
+        ] {
+            fields.insert(
+                name.into(),
+                json!({"enabled": 1, "value": {"r": 0.5, "g": 0.1, "b": 0.2, "a": 1}}),
+            );
+        }
+        fields.insert("stars".into(), json!({"enabled": 1, "value": 0}));
+        fields
+    }
+
+    fn convert(lights: &[(&str, &Map<String, Value>)]) -> WorldData {
+        WorldData {
+            lights: lights.iter().map(|(p, f)| light_preset(p, f)).collect(),
+            ..WorldData::default()
+        }
+    }
+
+    #[test]
+    fn existing_pack_overlay_must_match_the_authored_reference() {
+        let red = overlay();
+        let mut rain = red.clone();
+        rain.insert("rain".into(), json!({"enabled": 1, "value": 0.631}));
+        let lights = [(RAIN, &rain), (MOON, &red)];
+        let world = convert(&lights);
+        assert_eq!(world.red_moon_preset(), Some(1));
+        assert!(validate_red_moon(&scene(json!({"asset": MOON})), &lights, &world).is_ok());
+        assert!(validate_red_moon(&scene(json!({"asset": RAIN})), &lights, &world).is_err());
+        assert!(
+            validate_red_moon(&scene(json!({"asset": "missing.asset"})), &lights, &world).is_err()
+        );
+        assert!(validate_red_moon(&scene(json!({"local": 123})), &lights, &world).is_err());
+        assert!(validate_red_moon(&scene(Value::Null), &lights, &world).is_ok());
+        assert!(validate_red_moon(&json!({"roots": []}), &lights, &world).is_ok());
+
+        let duplicates = [(MOON, &red), ("duplicate/Red Moon.asset", &red)];
+        let world = convert(&duplicates);
+        assert_eq!(world.red_moon_preset(), None);
+        assert!(validate_red_moon(&scene(json!({"asset": MOON})), &duplicates, &world).is_err());
+    }
+
+    #[test]
+    fn rejects_incomplete_or_invalid_active_channels() {
+        let main = scene(json!({"asset": MOON}));
+        for (field, value) in [
+            ("category", json!(1)),
+            ("placeholder", json!(1)),
+            ("stars", json!({"enabled": 1})),
+            (
+                "moonTint",
+                json!({"enabled": 1, "value": {"r": 0.5, "g": 0.1, "b": 0.2}}),
+            ),
+            (
+                "moonTint",
+                json!({"enabled": 1, "value": {"r": 1.5, "g": 0.1, "b": 0.2, "a": 1}}),
+            ),
+            ("rain", json!({"enabled": 1, "value": 0.631})),
+        ] {
+            let mut fields = overlay();
+            fields.insert(field.into(), value);
+            let lights = [(MOON, &fields)];
+            assert!(
+                validate_red_moon(&main, &lights, &convert(&lights)).is_err(),
+                "accepted {field}"
+            );
+        }
+        let mut incomplete = overlay();
+        incomplete.remove("stars");
+        let lights = [(MOON, &incomplete)];
+        assert!(validate_red_moon(&main, &lights, &convert(&lights)).is_err());
+
+        let red = overlay();
+        let mut world = convert(&[(MOON, &red)]);
+        world.lights[0].floats[5] = f32::NAN;
+        assert_eq!(world.red_moon_preset(), None);
+    }
+
+    #[test]
+    #[ignore = "requires the user's private PC asset export; set KINGDOM_REFERENCE_ASSETS"]
+    fn local_reference_red_moon_preserves_the_scene_link_and_enabled_values() {
+        let assets = Path::new(&std::env::var("KINGDOM_REFERENCE_ASSETS").unwrap()).to_path_buf();
+        let guids = crate::guid_map(&assets);
+        let resolver = crate::scenes::Resolver::new(&guids, &assets);
+        let main = crate::scenes::export_file(&assets.join("main.unity"), &resolver).unwrap();
+        let data = [RAIN, MOON]
+            .into_iter()
+            .map(|path| {
+                let asset = crate::scenes::export_data_asset(&assets.join(path), &resolver)
+                    .unwrap()
+                    .unwrap();
+                (path.into(), asset)
+            })
+            .collect();
+        let lights = assets_of(&data, "BlenderState");
+        let world = convert(&lights);
+        validate_red_moon(&main, &lights, &world).unwrap();
+        let index = world.red_moon_preset().unwrap() as usize;
+        assert_eq!(lights[index].0, MOON);
+        let preset = &world.lights[index];
+        assert_eq!(preset.enabled, 0x0040_6c00);
+        assert_eq!(preset.colors[10], [0.58823526, 0.2292089, 0.14705881, 1.0]);
+        assert_eq!(
+            preset.colors[11],
+            [0.97794116, 0.5033521, 0.5720853, 0.2509804]
+        );
+        assert_eq!(
+            preset.colors[13],
+            [0.38235295, 0.1040225, 0.1040225, 0.5686275]
+        );
+        assert_eq!(preset.colors[14], [0.7647059, 0.35986158, 0.35986158, 1.0]);
+        assert_eq!(preset.floats[5], 0.0);
+    }
 }

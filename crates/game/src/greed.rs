@@ -376,6 +376,10 @@ pub enum GreedEvent {
     CliffsDestroyed,
     /// A retaliation wave came out. orig: `EnemyManager.SpawnRetaliation()`.
     Retaliation,
+    /// EnemyManager admitted a wave with the authored boss flag.
+    BossWaveSpawned {
+        portal: u32,
+    },
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -517,6 +521,27 @@ impl Greed {
         p.interval = (15.0 / enemies.len() as f32).min(1.0);
         p.queue.extend(enemies.into_iter().map(|e| (e, wave, boss)));
         p.close_after = close_after;
+    }
+
+    /// orig: EnemyManager.SpawnWave. Defense waves call the portal directly.
+    fn admit_wave(
+        &mut self,
+        portal: u32,
+        wave: u16,
+        day: u32,
+        ctx: &GreedCtx,
+        events: &mut impl FnMut(GreedEvent),
+    ) -> bool {
+        if !ctx.portals.iter().any(|&(id, _)| id == portal) || !self.portal_can_spawn(portal) {
+            return false;
+        }
+        let enemies = Self::enemies(ctx.world, ctx.level_index, wave, day, ctx.boat);
+        let boss = ctx.world.waves[wave as usize].boss_wave;
+        self.queue_wave(portal, enemies, boss, true);
+        if boss {
+            events(GreedEvent::BossWaveSpawned { portal });
+        }
+        true
     }
 
     /// orig: `Kingdom.ClosestSpawner(side, checkOtherSideIfNoneFound: true)`.
@@ -855,13 +880,7 @@ impl Greed {
             }
             if hours_now >= s.spawn_at {
                 self.scheduled.remove(i);
-                // orig: EnemyManager.SpawnWave → Portal.SpawnEnemies (if canSpawnWave).
-                if self.portal_mut(s.portal).can_spawn() {
-                    let enemies =
-                        Self::enemies(ctx.world, ctx.level_index, s.wave, s.day, ctx.boat);
-                    let boss = ctx.world.waves[s.wave as usize].boss_wave;
-                    self.queue_wave(s.portal, enemies, boss, true);
-                }
+                self.admit_wave(s.portal, s.wave, s.day, ctx, &mut events);
                 continue;
             }
             i += 1;
@@ -1021,18 +1040,10 @@ impl Greed {
                 self.retaliations_queued -= 1;
                 let side = if rng.value() < 0.5 { 1 } else { -1 };
                 if let Some(wave) = ctx.world.levels[ctx.level_index].retaliation_waves[s] {
-                    let portal = self.closest_live_portal(ctx, side);
-                    if let Some(portal) = portal {
-                        let enemies = Self::enemies(
-                            ctx.world,
-                            ctx.level_index,
-                            wave,
-                            self.retaliations_spawned,
-                            ctx.boat,
-                        );
-                        let boss = ctx.world.waves[wave as usize].boss_wave;
-                        self.queue_wave(portal, enemies, boss, true);
-                        events(GreedEvent::Retaliation);
+                    if let Some(portal) = self.closest_live_portal(ctx, side) {
+                        if self.admit_wave(portal, wave, self.retaliations_spawned, ctx, events) {
+                            events(GreedEvent::Retaliation);
+                        }
                     }
                 }
                 self.retaliations_spawned += 1;

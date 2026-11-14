@@ -212,10 +212,9 @@ pub fn on_event(
         },
         GameEvent::Greed(e) => match e {
             GreedEvent::Charge(t) => cue(w.audio.sound("Troll.chargeSound"), troll_x(g, t)),
-            GreedEvent::PortalOpened(id) => cue(
-                w.audio.sound("EnemyManager.enemiesSpawnedSound"),
-                object(g, id).map(|o| o.x),
-            ),
+            GreedEvent::BossWaveSpawned { .. } => {
+                cue(w.audio.sound("EnemyManager.enemiesSpawnedSound"), None);
+            }
             GreedEvent::Hit { by, target, .. } => match target {
                 Target::Object(o) => cue(
                     w.audio.sound("Damageable.hitSound"),

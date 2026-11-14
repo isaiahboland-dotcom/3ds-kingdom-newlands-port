@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Fade in the red moon and play its cue when a portal accepts a flagged
+  boss wave. At dawn, fade back to the current weather lighting.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added

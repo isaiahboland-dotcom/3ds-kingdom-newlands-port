@@ -13,7 +13,7 @@ Temporary stand-ins that will be replaced are marked **(temporary)**.
 - **Forest edges at start.** The original fades out edge decorations over the first ~15 s. We remove them before the first frame. After a chop the delay is kept, but the 1 s fade isn't drawn.
 - **Dead animals.** A dead deer or rabbit stays for 1 s for its death clip, then vanishes; the original pools it at the end of the clip.
 - **Construction stand-ins.** The Castle6 keep builds itself in 10 s without its scaffold animation. The workshop's counters are separate objects at the workshop's sides.
-- **Squids and bosses (simplified).** Squid flight eases toward its altitude instead of flapping under physics. Bosses don't throw stuck boulders back yet, and boss waves don't bring the red-moon lighting yet **(temporary)**.
+- **Squids and bosses (simplified).** Squid flight eases toward its altitude instead of flapping under physics. Bosses don't throw stuck boulders back yet **(temporary)**.
 - **Bear swipes.** The bear attacks every 0.5 s while galloping; the original times it with an animation event in the gallop clip.
 - **Inspired and grabbed citizens.** Inspiration skips the demotion entirely. A grabbed citizen is removed at once rather than carried visibly in the squid's hands **(temporary)**.
 - **The boat (simplified).**
@@ -48,7 +48,7 @@ Temporary stand-ins that will be replaced are marked **(temporary)**.
 - **Lighting (approximated).** `BlenderState` presets blend exactly as in `Blender`, but the shaders that consume them weren't exported. We multiply lit sprites and the fill and haze gradients (`Haze Material`, a lit `Custom/PowerSprite2`) by `ambientColor`, draw the sky gradient (`Custom/Sky`, no lighting inputs) in the presets' colours as they are, add `additiveColor` over the frame (`PostFX`), and draw the sky, fill and haze gradients at their scene depths. The finer shader effects (sparkle, wind sway, waves) aren't reproduced yet.
 - **Moving parts (temporary).** Catapult arms, ballista bodies and the dog's tree don't rotate. The teleporter exit is drawn as placeholder rings. Wall damage doesn't show crumbling debris yet.
 - **Atmosphere (temporary).** Clouds, fog, mist, rain and snow aren't drawn yet. Water is drawn opaque, so a set sun or moon below the horizon stays hidden, as in the original.
-- **Stars (approximated).** The night field sits in the Heaven layer behind the sun and moon and fades with the blended `stars` level, as the original's `Stars` does, but its layout isn't exported: 110 fixed stars are placed procedurally, a sixth of them 2 px, each dipping gently in and out of brightness.
+- **Stars (approximated).** The night field uses the original five-second visibility checks on packs with the authored red-moon preset. Its 110 positions and twinkle are procedural. Packs without a supported preset keep continuous star opacity.
 - **Celestial glows (approximated).** Each `CelestialBody` glow child is drawn with its own sprite, scale and `SpriteRenderer` colour, multiplied by the preset's glow colour, and fades out over the last stretch of its body's arc before it sets, so a set sun's wide halo can't paint the sky above the horizon after dark. The fade band's width (10% of the arc's height) is a guess.
 - **Boat sail.** Before setting sail the sail shows its `Closed` clip with the emblem hidden; the emblem's look while furled is a guess.
 - **Seasonal events.** `LevelConfig.seasonalGroupCounts` (Halloween/Christmas extras tied to the save's start date) are ignored.

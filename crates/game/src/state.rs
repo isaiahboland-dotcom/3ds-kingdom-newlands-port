@@ -1674,6 +1674,7 @@ impl GameState {
             match e {
                 // orig: EnemyManager.HandleOnDayStart (greed retreat), Kingdom.CheckBecomeSafe.
                 DayEvent::Started { .. } => {
+                    self.blender.clear_red_moon(world);
                     self.greed.dawn();
                     self.treasure.dawn();
                     self.safe = !self.greed.is_dangerous(self.borders);
@@ -2109,6 +2110,7 @@ impl GameState {
                         self.dogs.enemies_spawned(x);
                     }
                 }
+                GreedEvent::BossWaveSpawned { .. } => self.blender.start_red_moon(world),
                 GreedEvent::PortalHit { object, damage } => {
                     self.hurt_portal(world, object, damage, events)
                 }
@@ -2715,6 +2717,228 @@ mod tests {
             g.tick(w, &Controls::default(), &mut ev);
         }
         ev
+    }
+
+    fn red_moon_fixture(boss_wave: bool) -> (WorldData, GameState, u32) {
+        use crate::lighting::{color, float};
+        let mut w = fight_world();
+        w.steeds.push(Default::default());
+        w.protos.push(Proto {
+            portal: Some(crate::data::PortalDef {
+                cliff: false,
+                hit_points: 100,
+                by_arrows: true,
+                by_knights: true,
+                hit_box: (-1.0, 1.0, 0.0, 2.0),
+                defense_range: 2.0,
+                defense_delay: (0.0, 0.0),
+                defense_cooldown: 8.0,
+                rebuild_days: 0.0,
+                rift: None,
+            }),
+            ..Default::default()
+        });
+        let mut base = crate::data::LightPreset {
+            name: "Clear Night".into(),
+            category: 1,
+            weather: 1,
+            season: 1,
+            part_of_day: 3,
+            test_only: false,
+            enabled: u32::MAX,
+            colors: [[0.25; 4]; 17],
+            floats: [0.0; 8],
+        };
+        base.colors[color::MOON_TINT] = [1.0; 4];
+        base.floats[float::STARS] = 1.0;
+        let mut red = base.clone();
+        red.name = "Red Moon".into();
+        red.category = 0;
+        red.enabled = 0x0040_6c00;
+        red.colors[color::MOON_TINT] = [0.6, 0.2, 0.1, 1.0];
+        red.floats[float::STARS] = 0.0;
+        w.lights = vec![base, red];
+        w.director.initial_lights = vec![0];
+        // No enemy on this day, so admission must depend on the flag alone.
+        w.waves.push(crate::data::WaveDef {
+            boss_wave,
+            ..Default::default()
+        });
+        w.levels[0].waves[1] = [Some(0); 3];
+        let mut g = GameState::new(&w, 0, 23);
+        g.campfire = 0.0;
+        g.monarch.x = -100.0;
+        g.borders = Borders {
+            left: 0.0,
+            right: 0.0,
+        };
+        // 50 units at the empty wave's default speed of 5 gives one hour
+        // travel time, so the midnight spawn follows the 18:00 opening.
+        let portal = g
+            .level
+            .add(level::instantiate(&w, 1, Layer::Game, 50.0, 1.0, 0.0, 1.0));
+        g.greed.schedule(
+            &w,
+            &g.level,
+            0,
+            WaveKind::Boss,
+            Season::Summer,
+            0,
+            g.campfire,
+            g.borders,
+            &mut g.rng,
+        );
+        (w, g, portal)
+    }
+
+    #[test]
+    fn red_moon_waits_for_a_live_portal_to_accept_the_authored_boss_flag() {
+        for (boss, removed, destroyed) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let (w, mut g, portal) = red_moon_fixture(boss);
+            let mut events = Vec::new();
+            g.clock.time = 19.0;
+            g.update_greed(&w, 0.0, &mut events);
+            assert!(events.contains(&GameEvent::Greed(GreedEvent::PortalOpened(portal))));
+            assert_eq!(
+                g.blender.presets().count(),
+                1,
+                "opening cannot start the overlay"
+            );
+            if removed {
+                g.level.remove_any(portal);
+            }
+            if destroyed {
+                g.greed.portal_destroyed(portal, false, 0.0, &mut |_| {});
+            }
+            events.clear();
+            g.clock.day = 1;
+            g.clock.time = 0.0;
+            g.update_greed(&w, 0.0, &mut events);
+            let admitted = boss && !removed && !destroyed;
+            assert_eq!(
+                events.contains(&GameEvent::Greed(GreedEvent::BossWaveSpawned { portal })),
+                admitted
+            );
+            assert_eq!(g.blender.presets().count(), if admitted { 2 } else { 1 });
+            assert!(g.greed.trolls.is_empty());
+        }
+    }
+
+    #[test]
+    fn red_moon_dawn_fades_during_an_attack_and_load_rebinds_the_exiting_fader() {
+        let (w, mut g, _) = red_moon_fixture(true);
+        g.clock.day = 1;
+        g.clock.time = 0.0;
+        g.update_greed(&w, 0.0, &mut Vec::new());
+        g.blender.update(&w, 4.0);
+        assert_eq!(g.blender.presets().last(), Some((1, 0.4)));
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Boss, 50.0, 1, true, &mut g.rng);
+        g.clock.time = crate::time::DAY_START + 0.01;
+        let mut events = Vec::new();
+        g.tick(&w, &Controls::default(), &mut events);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GameEvent::Day(DayEvent::Started { .. }))));
+        assert!(!g.greed.trolls[0].is_dead());
+        let dawn_weight = g.blender.presets().last().unwrap().1;
+        g.blender.update(&w, 5.0);
+        assert!((g.blender.presets().last().unwrap().1 - dawn_weight * 0.5).abs() < 1e-6);
+
+        #[cfg(feature = "save")]
+        {
+            let bytes = crate::save::save_game(&g, 73);
+            let mut resumed = crate::save::load_game(&bytes, 73, &w).unwrap();
+            assert_eq!(crate::save::save_game(&resumed, 73), bytes);
+            let mut unmodified = resumed.clone();
+            unmodified.blender.update(&w, 5.0);
+            assert_eq!(
+                unmodified.blender.presets().collect::<Vec<_>>(),
+                vec![(0, 1.0)]
+            );
+            // A later boss wave still starts after the rebound fader expires.
+            unmodified.blender.start_red_moon(&w);
+            assert_eq!(unmodified.blender.presets().last(), Some((1, 0.0)));
+            resumed.blender.start_red_moon(&w);
+            resumed.blender.update(&w, 5.0);
+            assert_eq!(
+                resumed.blender.presets().count(),
+                2,
+                "PC reload rebinds the fading fader"
+            );
+            assert!(
+                (resumed.blender.presets().last().unwrap().1 - (0.5 + dawn_weight * 0.25)).abs()
+                    < 1e-6
+            );
+        }
+        g.blender.update(&w, 5.0);
+        assert_eq!(g.blender.presets().collect::<Vec<_>>(), vec![(0, 1.0)]);
+    }
+
+    #[test]
+    fn red_moon_responds_to_flagged_retaliation_and_ignores_portal_defense() {
+        let (mut w, mut g, destroyed) = red_moon_fixture(true);
+        w.waves[0].both_sides = true;
+        w.waves.push(crate::data::WaveDef {
+            trolls: crate::data::Curve {
+                keys: vec![[0.0, 1.0, 0.0, 0.0]],
+            },
+            boss_wave: true,
+            ..Default::default()
+        });
+        w.levels[0].defence_waves = [Some(1); 3];
+        w.levels[0].retaliation_waves = [Some(0); 3];
+        let defender = g.level.add(level::instantiate(
+            &w,
+            1,
+            Layer::Game,
+            -50.0,
+            1.0,
+            0.0,
+            -1.0,
+        ));
+        g.monarch.x = -51.5;
+        // Open both portals for the scheduled wave, but stop before admission.
+        // The nearby monarch provokes the separate portal-defense path.
+        g.greed.schedule(
+            &w,
+            &g.level,
+            0,
+            WaveKind::Boss,
+            Season::Summer,
+            0,
+            g.campfire,
+            g.borders,
+            &mut g.rng,
+        );
+        g.clock.time = 19.0;
+        let mut events = Vec::new();
+        g.update_greed(&w, 1.0, &mut events);
+        assert!(events.contains(&GameEvent::Greed(GreedEvent::PortalOpened(defender))));
+        events.clear();
+        g.update_greed(&w, 1.0, &mut events);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, GameEvent::Greed(GreedEvent::Spawned(_)))));
+        assert!(!g.greed.trolls[0].boss_wave);
+        assert_eq!(g.blender.presets().count(), 1);
+
+        g.hurt_portal(&w, destroyed, 100, &mut events);
+        g.level.remove_any(destroyed);
+        events.clear();
+        g.update_greed(&w, 30.0, &mut events);
+        assert!(events.contains(&GameEvent::Greed(GreedEvent::Retaliation)));
+        assert!(
+            events.contains(&GameEvent::Greed(GreedEvent::BossWaveSpawned {
+                portal: defender
+            }))
+        );
+        assert_eq!(g.blender.presets().last(), Some((1, 0.0)));
     }
 
     #[test]
