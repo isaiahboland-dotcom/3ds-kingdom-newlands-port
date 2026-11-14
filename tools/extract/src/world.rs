@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use game::animation::Pose;
 use game::data::{
     BlockDef, BuildingDef, CampDef, DayDef, DirectorDef, FixedTransform, ForestItemDef, Kind,
     Layer, LayerDef, LevelConfigDef, LightPreset, Part, PayableDef, Placed, Proto, ProtoId,
@@ -13,6 +14,7 @@ use game::data::{
     UpgradeDef, WorldData, LIGHT_COLORS, LIGHT_FLOATS, TILE_SCATTER_FLAGS,
 };
 use game::data::{Curve, PortalDef, WallDef, WaveDef};
+use scene::authored::{PartVisual, PrefabVisual, TransformNode};
 use serde_json::{Map, Value};
 
 /// Components deriving from `Payable` (for overlap regions and half widths).
@@ -81,6 +83,44 @@ fn has_any(node: &Value, types: &[&'static str]) -> Option<&'static str> {
     None
 }
 
+pub fn camera_def(main: &Value) -> Result<Option<scene::camera::CameraDef>, String> {
+    let Some((_, fields)) = find_component(main, "MainCamera") else {
+        return Ok(None);
+    };
+    use game::animation::{Key, Tangent};
+    let keys = |name: &str| -> Result<Vec<Key>, String> {
+        fields
+            .get(name)
+            .and_then(|field| field.get("m_Curve"))
+            .unwrap_or(&Value::Null)
+            .as_array()
+            .ok_or_else(|| format!("camera {name}: no curve"))?
+            .iter()
+            .map(|k| {
+                let f = |field: &str| {
+                    k[field]
+                        .as_f64()
+                        .map(|v| v as f32)
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("camera {name}.{field}: invalid key"))
+                };
+                Ok(Key {
+                    time: f("time")?,
+                    value: f("value")?,
+                    in_tangent: Tangent::Slope(f("inSlope")?),
+                    out_tangent: Tangent::Slope(f("outSlope")?),
+                })
+            })
+            .collect()
+    };
+    Ok(Some(scene::camera::CameraDef {
+        lead: flag(fields, "lead"),
+        max_lead_speed: num(fields, "maxLeadSpeed"),
+        lead_over_time: keys("leadOverTime")?,
+        seek_speed_by_distance: keys("seekSpeedByDistance")?,
+    }))
+}
+
 fn num(f: &Map<String, Value>, k: &str) -> f32 {
     f.get(k).and_then(Value::as_f64).unwrap_or(0.0) as f32
 }
@@ -95,6 +135,104 @@ fn vec3(v: &Value) -> [f32; 3] {
 
 fn asset_path(v: Option<&Value>) -> Option<&str> {
     v?.get("asset")?.as_str()
+}
+
+// Scaffold modules have their own draw path. Layer 29 is seen by the
+// water reflection camera, whose extra pass is outside these visual parts.
+fn skip_part_subtree(node: &Value) -> bool {
+    comp(node, "ScaffoldModule").is_some() || node["layer"].as_i64() == Some(29)
+}
+
+fn active_part_children(node: &Value) -> impl Iterator<Item = &Value> {
+    node["children"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|child| child["active"] == true)
+}
+
+fn local_pose(node: &Value, renderer: Option<&Map<String, Value>>) -> Pose {
+    let mut pose = Pose {
+        position: vec3(&node["pos"]),
+        scale: [0, 1, 2].map(|i| node["scale"][i].as_f64().unwrap_or(1.0) as f32),
+        rotation: [0, 1, 2, 3].map(|i| {
+            node["rot"][i]
+                .as_f64()
+                .unwrap_or(if i == 3 { 1.0 } else { 0.0 }) as f32
+        }),
+        ..Default::default()
+    };
+    if let Some(renderer) = renderer {
+        pose.color = ["r", "g", "b", "a"].map(|channel| {
+            renderer
+                .get("m_Color")
+                .and_then(|color| color[channel].as_f64())
+                .unwrap_or(1.0) as f32
+        });
+        pose.visible = flag(renderer, "m_Enabled");
+    }
+    pose
+}
+
+/// Collect visual metadata independently of the legacy sprite interning and
+/// world fields. The part list follows the same active renderer traversal.
+fn authored_prefab(node: &Value, legacy_parts: usize) -> Result<PrefabVisual, String> {
+    fn collect(
+        node: &Value,
+        path: String,
+        parent: Option<u16>,
+        visual: &mut PrefabVisual,
+    ) -> Result<(), String> {
+        if skip_part_subtree(node) {
+            return Ok(());
+        }
+        let index = u16::try_from(visual.nodes.len())
+            .map_err(|_| format!("too many authored transform nodes at {path}"))?;
+        let renderer = comp(node, "SpriteRenderer");
+        let mut local = local_pose(node, renderer);
+        if parent.is_none() {
+            // Object placement and its facing own the root translation and
+            // X reflection. Keep the authored rotation and scale magnitudes.
+            local.position = [0.0; 3];
+            local.scale[0] = local.scale[0].abs();
+        }
+        let animator = comp(node, "Animator")
+            .filter(|animator| flag(animator, "m_Enabled"))
+            .and_then(|animator| asset_path(animator.get("m_Controller")))
+            .map(str::to_owned);
+        if let Some(renderer) = renderer.filter(|renderer| flag(renderer, "m_Enabled")) {
+            visual.parts.push(PartVisual {
+                node: index,
+                flip_x: flag(renderer, "m_FlipX"),
+                flip_y: flag(renderer, "m_FlipY"),
+            });
+        }
+        visual.nodes.push(TransformNode {
+            path,
+            parent,
+            local,
+            animator,
+        });
+        for child in active_part_children(node) {
+            let path = &visual.nodes[index as usize].path;
+            let name = child["name"].as_str().unwrap_or_default();
+            let child_path = if path.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{path}/{name}")
+            };
+            collect(child, child_path, Some(index), visual)?;
+        }
+        Ok(())
+    }
+
+    let mut visual = PrefabVisual::default();
+    collect(node, String::new(), None, &mut visual)?;
+    if visual.parts.len() != legacy_parts {
+        let name = node["name"].as_str().unwrap_or_default();
+        return Err(format!("authored renderer count differs for {name}"));
+    }
+    Ok(visual)
 }
 
 /// Materials with the `Recolor` toggle on.
@@ -122,6 +260,7 @@ fn recolor_materials(assets: &Path) -> HashSet<String> {
 struct Builder<'a> {
     inp: &'a Inputs<'a>,
     world: WorldData,
+    visuals: Vec<Result<PrefabVisual, String>>,
     sprite_ids: HashMap<String, SpriteId>,
     prefab_protos: HashMap<String, ProtoId>,
     recolor: HashSet<String>,
@@ -159,6 +298,7 @@ impl<'a> Builder<'a> {
     fn reserve(&mut self) -> ProtoId {
         let id = self.world.protos.len() as ProtoId;
         self.world.protos.push(Proto::default());
+        self.visuals.push(Ok(PrefabVisual::default()));
         id
     }
 
@@ -261,13 +401,7 @@ impl<'a> Builder<'a> {
         in_scaffold: bool,
     ) {
         let in_scaffold = in_scaffold || comp(node, "Scaffolding").is_some();
-        // Scaffold modules are exported separately (BuildingDef::scaffold).
-        if comp(node, "ScaffoldModule").is_some() {
-            return;
-        }
-        // Layer 29 is only seen by the water reflection camera (the boat's
-        // `Reflection`); the reflection pass isn't ported.
-        if node["layer"].as_i64() == Some(29) {
+        if skip_part_subtree(node) {
             return;
         }
         let mut me = parent;
@@ -329,10 +463,7 @@ impl<'a> Builder<'a> {
                 });
             }
         }
-        for child in node["children"].as_array().into_iter().flatten() {
-            if child["active"] != true {
-                continue;
-            }
+        for child in active_part_children(node) {
             let p = vec3(&child["pos"]);
             let s = vec3(&child["scale"]);
             let cat = [at[0] + scale.0 * p[0], at[1] + scale.1 * p[1], at[2] + p[2]];
@@ -360,6 +491,7 @@ impl<'a> Builder<'a> {
             &mut parts,
             &mut part_ids,
         );
+        self.visuals[id as usize] = authored_prefab(node, parts.len());
 
         let root_sprite = comp(node, "SpriteRenderer").and_then(|sr| {
             let r = sr.get("m_Sprite");
@@ -1844,11 +1976,12 @@ fn level_config(name: &str, f: &Map<String, Value>, waves: &HashMap<&str, u16>) 
     }
 }
 
-/// The world, and the asset path of each audio clip (`AudioDef::clips`).
-pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
+/// Legacy world data, audio clip source paths, and visual metadata by prototype ID.
+pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>, Vec<PrefabVisual>), String> {
     let mut b = Builder {
         inp,
         world: WorldData::default(),
+        visuals: Vec::new(),
         sprite_ids: HashMap::new(),
         prefab_protos: HashMap::new(),
         recolor: recolor_materials(inp.assets_dir),
@@ -2122,7 +2255,8 @@ pub fn build(inp: &Inputs) -> Result<(WorldData, Vec<String>), String> {
             .collect();
     }
     b.world.audio = found.audio;
-    Ok((b.world, found.clip_paths))
+    let visuals = b.visuals.into_iter().collect::<Result<_, _>>()?;
+    Ok((b.world, found.clip_paths, visuals))
 }
 
 /// Data assets of `ty`, sorted by path, as (path, fields).
@@ -2237,4 +2371,236 @@ fn lighting_and_days(world: &mut WorldData, inp: &Inputs) -> Result<(), String> 
             .collect(),
     };
     Ok(())
+}
+
+#[cfg(test)]
+mod transform_tests {
+    use super::*;
+    use scene::authored::Affine2;
+    use serde_json::json;
+
+    fn extract(node: &Value) -> (Proto, PrefabVisual, Vec<String>) {
+        let empty = json!({});
+        let maps = Map::new();
+        let names = HashMap::from([
+            ("sprite".into(), "panel".into()),
+            ("other-sprite".into(), "trim".into()),
+        ]);
+        let sizes = HashMap::from([("panel".into(), (4, 4, 32.0))]);
+        let inp = Inputs {
+            main: &empty,
+            blocks: &empty,
+            loader: &empty,
+            prefabs: &maps,
+            data: &maps,
+            sprite_names: &names,
+            sprite_sizes: &sizes,
+            assets_dir: Path::new("."),
+        };
+        let mut builder = Builder {
+            inp: &inp,
+            world: WorldData::default(),
+            visuals: Vec::new(),
+            sprite_ids: HashMap::new(),
+            prefab_protos: HashMap::new(),
+            recolor: HashSet::new(),
+        };
+        let index = builder.proto(node) as usize;
+        (
+            builder.world.protos.remove(index),
+            builder.visuals.remove(index).unwrap(),
+            builder.world.sprites,
+        )
+    }
+
+    fn node(
+        name: &str,
+        pos: [f32; 3],
+        scale: [f32; 3],
+        rot: [f32; 4],
+        children: Vec<Value>,
+        sprite: bool,
+    ) -> Value {
+        json!({
+            "name": name, "active": true, "pos": pos, "scale": scale, "rot": rot, "layer": 0,
+            "components": if sprite { vec![json!({"id": 31, "type": "SpriteRenderer", "fields": {
+                "m_Enabled": 1, "m_Sprite": {"asset": "sprite"}, "m_FlipX": 1, "m_FlipY": 1
+            }})] } else { vec![] },
+            "children": children,
+        })
+    }
+
+    const IDENTITY_ROTATION: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    fn plain(name: &str, children: Vec<Value>, sprite: bool) -> Value {
+        node(
+            name,
+            [0.0; 3],
+            [1.0; 3],
+            IDENTITY_ROTATION,
+            children,
+            sprite,
+        )
+    }
+
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-5, "{a} != {b}");
+    }
+
+    fn composed(visual: &PrefabVisual, part: usize) -> Affine2 {
+        visual
+            .sampled_transform(visual.parts[part].node, |_, node| node.local)
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn composed_parts_keep_nonrendered_parent_rotation_scale_and_renderer_flips() {
+        let c = core::f32::consts::FRAC_1_SQRT_2;
+        let panel = node(
+            "Panel",
+            [2.0, 0.0, 0.0],
+            [-1.0, 1.0, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let mut pivot = node(
+            "Pivot",
+            [1.0, 2.0, 0.0],
+            [1.0, 3.0, 1.0],
+            [
+                0.0,
+                0.0,
+                (core::f32::consts::PI / 8.0).sin(),
+                (core::f32::consts::PI / 8.0).cos(),
+            ],
+            vec![panel],
+            false,
+        );
+        pivot["components"] = json!([{"type": "Animator", "fields": {
+            "m_Enabled": 1, "m_Controller": {"asset": "AnimatorController/panel.controller"}
+        }}]);
+        let root = node(
+            "Root",
+            [7.0, 8.0, 0.0],
+            [-2.0, 1.0, 1.0],
+            [0.0, 0.0, c, c],
+            vec![pivot],
+            false,
+        );
+        let (legacy, visual, _) = extract(&root);
+        assert_eq!(
+            visual
+                .nodes
+                .iter()
+                .map(|node| node.path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "Pivot", "Pivot/Panel"]
+        );
+        assert_eq!(visual.nodes[2].parent, Some(1));
+        assert_eq!(
+            visual.nodes[1].animator.as_deref(),
+            Some("AnimatorController/panel.controller")
+        );
+        assert_eq!(visual.parts[0].node, 2);
+        assert!(visual.parts[0].flip_x && visual.parts[0].flip_y);
+        assert_eq!((legacy.parts[0].x, legacy.parts[0].y), (6.0, 2.0));
+        assert!(
+            !legacy.parts[0].flip,
+            "old pack keeps the folded reflection"
+        );
+        let transform = composed(&visual, 0);
+        close(transform.translation[0], -2.0 - 2.0 * c);
+        close(transform.translation[1], 2.0 + 4.0 * c);
+        for (actual, expected) in transform
+            .basis
+            .into_iter()
+            .zip([c, -3.0 * c, -2.0 * c, -6.0 * c])
+        {
+            close(actual, expected);
+        }
+    }
+
+    #[test]
+    fn visual_parts_match_legacy_indices_without_interning_sprites() {
+        let mut inactive = plain("Inactive", vec![plain("Sprite", vec![], true)], false);
+        inactive["active"] = false.into();
+        let mut reflection = plain("Reflection", vec![plain("Sprite", vec![], true)], false);
+        reflection["layer"] = 29.into();
+        let mut scaffold = plain("Scaffold", vec![plain("Sprite", vec![], true)], true);
+        scaffold["components"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type": "ScaffoldModule", "fields": {}}));
+        let mut child = plain("Child", vec![], true);
+        child["components"][0]["fields"]["m_Sprite"]["asset"] = "other-sprite".into();
+        let mut disabled = plain("Disabled", vec![child], true);
+        disabled["components"][0]["fields"]["m_Enabled"] = 0.into();
+        let root = plain(
+            "Root",
+            vec![
+                inactive,
+                reflection,
+                scaffold,
+                disabled,
+                plain("Normal", vec![], true),
+            ],
+            false,
+        );
+        let (legacy, visual, sprite_names) = extract(&root);
+        assert_eq!(sprite_names, ["trim", "panel"]);
+        assert_eq!(
+            legacy
+                .parts
+                .iter()
+                .map(|part| part.sprite)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            visual
+                .parts
+                .iter()
+                .map(|part| visual.nodes[part.node as usize].path.as_str())
+                .collect::<Vec<_>>(),
+            ["Disabled/Child", "Normal"]
+        );
+        assert!(!visual.nodes[1].local.visible);
+    }
+
+    #[test]
+    fn portal_surface_goo_and_catapult_rope_keep_authored_transform_magnitudes() {
+        let surface = node(
+            "Surface",
+            [0.0; 3],
+            [1.0, 1.5, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let goo = node(
+            "Goo Spin",
+            [0.0; 3],
+            [-1.3, 1.1, 1.0],
+            IDENTITY_ROTATION,
+            vec![],
+            true,
+        );
+        let rope = node(
+            "Rope",
+            [0.0; 3],
+            [6.659998, 1.0, 1.0],
+            [0.0, 0.0, 0.36361992, 0.9315474],
+            vec![],
+            true,
+        );
+        let (_, visual, _) = extract(&plain("Root", vec![surface, goo, rope], false));
+        assert_eq!(composed(&visual, 0).basis, [1.0, 0.0, 0.0, 1.5]);
+        assert_eq!(composed(&visual, 1).basis, [-1.3, 0.0, 0.0, 1.1]);
+        let [a, b, c, d] = composed(&visual, 2).basis;
+        close((a * a + c * c).sqrt(), 6.659998);
+        close((b * b + d * d).sqrt(), 1.0);
+        assert!(c > 4.0 && b < -0.6, "rope rotation was discarded");
+    }
 }

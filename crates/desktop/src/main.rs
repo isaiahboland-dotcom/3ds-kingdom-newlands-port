@@ -130,7 +130,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let mut assets = match Assets::load(std::path::Path::new(&dir), &world.sprites).await {
+    let mut assets = match Assets::load(std::path::Path::new(&dir), &world, world_id).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("could not load assets from {dir}/: {e}");
@@ -223,6 +223,14 @@ async fn main() {
     }
     app.storage = storage.map(|s| Box::new(s) as Box<dyn Storage>);
     app.world_id = world_id;
+    match ::scene::camera::CameraDef::read_file(
+        std::path::Path::new(&dir).join(::scene::camera::FILENAME),
+        world_id,
+    ) {
+        Ok(Some(camera)) => app.install_camera(camera),
+        Ok(None) => {}
+        Err(e) => eprintln!("ignoring camera data: {e}"),
+    }
     app.slot = slot;
     if std::env::args().any(|a| a == "--paused") {
         app.set_paused(true);
@@ -513,7 +521,7 @@ async fn main() {
                 }
             }
             if frame == shot_frame && std::env::var_os("KINGDOM_DUMP").is_some() {
-                for (key, item) in draw_list(&app) {
+                for (key, item) in draw_list(&app, &sheet) {
                     if let DrawItem::Part(oi, pi) = item {
                         let o = &app.game.level.objects[oi];
                         let proto = &app.world.protos[o.proto as usize];

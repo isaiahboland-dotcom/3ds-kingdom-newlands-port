@@ -136,7 +136,7 @@ impl<R: Renderer> Ctx<'_, R> {
 
     /// Root sprite of clip `name` at `t`.
     fn frame(&self, name: &str, t: f32) -> Option<u32> {
-        self.clip(name).and_then(|c| c.sprite("", t))
+        self.sheet.frame(name, "", t).flatten()
     }
 
     fn light(&self) -> &Light {
@@ -289,7 +289,7 @@ fn layer_z(world: &game::data::WorldData) -> f32 {
 }
 
 /// Painter's order: Unity sorts by sorting layer, then order, then distance.
-pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
+pub fn draw_list(s: &Session, sheet: &Sheet) -> Vec<((i16, i16, f32), DrawItem)> {
     let world = &s.world;
     let g = &s.game;
     let level = &g.level;
@@ -326,7 +326,7 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
         }
         for (pi, part) in proto.parts.iter().enumerate() {
             // Under construction only the Scaffolding subtree shows, once built only the rest.
-            if !o.parts[pi].visible || part.scaffold != building {
+            if !visible_part(sheet, o, pi, part) || part.scaffold != building {
                 continue;
             }
             let z = layer.z + o.z + part.z;
@@ -343,7 +343,7 @@ pub fn draw_list(s: &Session) -> Vec<((i16, i16, f32), DrawItem)> {
         }
         push_fires(&mut items, s, o, oi, true);
         for (pi, part) in world.protos[o.proto as usize].parts.iter().enumerate() {
-            if !o.parts[pi].visible || part.scaffold {
+            if !visible_part(sheet, o, pi, part) || part.scaffold {
                 continue;
             }
             let mut z = layer.z + o.z + part.z;
@@ -918,13 +918,216 @@ fn draw_free_steed<R: Renderer>(c: &mut Ctx<R>, i: usize) {
     c.sprite_lit(sprite, world_to_screen(s, o.x, 0.0), d);
 }
 
+fn visible_part(
+    sheet: &Sheet,
+    o: &game::level::Object,
+    pi: usize,
+    part: &game::data::Part,
+) -> bool {
+    let state = &o.parts[pi];
+    if state.visible {
+        return true;
+    }
+    // Legacy instances mark a renderer with no rest sprite invisible.
+    // A valid Animator can supply one later, without changing the saved part.
+    if part.sprite.is_some() || part.random.is_some() || state.sprite.is_some() {
+        return false;
+    }
+    let Some(visual) = sheet
+        .authored()
+        .and_then(|a| a.prefabs.get(o.proto as usize))
+    else {
+        return false;
+    };
+    let mut node = Some(visual.parts[pi].node);
+    while let Some(index) = node {
+        let current = &visual.nodes[index as usize];
+        if current.animator.is_some() {
+            return true;
+        }
+        node = current.parent;
+    }
+    false
+}
+
+fn object_animation<'a>(
+    library: &'a game::animation::Library,
+    s: &Session,
+    o: &game::level::Object,
+    controller: &str,
+) -> Option<(&'a game::animation::Clip, f32)> {
+    let key = controller.rsplit('/').next()?.split('.').next()?;
+    // The simulation selects state and owns the clocks. This path samples
+    // their existing values and never dispatches gameplay events.
+    let scene_t = s.game.ticks as f32 * game::state::TICK;
+    let (state, elapsed) = match key {
+        "catapult" => match o.mode {
+            game::siege::mode::FIRING => (
+                library.state(controller, "Fire")?,
+                s.game
+                    .siege
+                    .catapults
+                    .iter()
+                    .find(|c| c.object == o.id)?
+                    .fire_t,
+            ),
+            game::siege::mode::READY => (library.state(controller, "Ready")?, 0.0),
+            _ => return None,
+        },
+        "portal" => {
+            use game::greed::PortalPhase;
+            let (state, t) = match s.game.greed.portal_phase(o.id) {
+                PortalPhase::Open => ("Idle", scene_t),
+                PortalPhase::Closed => ("Close", f32::MAX),
+                PortalPhase::Crumbled { t } => ("Destroy", (10.0 - t).max(0.0)),
+                PortalPhase::Rebuilding { .. } => ("Destroy", f32::MAX),
+            };
+            (library.state(controller, state)?, t)
+        }
+        "boat_sail" => {
+            let sail = s
+                .game
+                .harbor
+                .boat
+                .as_ref()
+                .filter(|b| b.object == o.id && o.mode == game::boat::mode::SAILING);
+            let (state, t) = match sail {
+                None => ("Closed", 0.0),
+                Some(b) if b.sail_t < 0.875 => ("Open", b.sail_t),
+                Some(b) => ("Flapping", b.sail_t - 0.875),
+            };
+            (library.state(controller, state)?, t)
+        }
+        _ => (library.default_state(controller)?, scene_t),
+    };
+    let clip = library.clip(state.clip.as_deref()?)?;
+    let t = if elapsed == f32::MAX {
+        clip.length
+    } else {
+        elapsed * state.speed + state.cycle_offset * clip.length
+    };
+    Some((clip, t))
+}
+
+struct PartPose {
+    transform: crate::authored::Affine2,
+    pose: game::animation::Pose,
+    sprite: Option<Option<u32>>,
+    flip_x: bool,
+    flip_y: bool,
+    mirrored: bool,
+}
+
+fn authored_part(
+    sheet: &Sheet,
+    s: &Session,
+    o: &game::level::Object,
+    pi: usize,
+) -> Option<PartPose> {
+    use crate::authored::animation_path;
+    let authored = sheet.authored()?;
+    let visual = authored.prefabs.get(o.proto as usize)?;
+    let part = visual.parts[pi];
+    let proto = &s.world.protos[o.proto as usize];
+    let legacy = &proto.parts[pi];
+    let st = o.parts[pi];
+    let sample = |target, mut sprite: Option<&mut Option<Option<u32>>>| {
+        let mut controllers = Vec::new();
+        visual.sampled_transform(target, |index, node| {
+            if let Some(animation) = node
+                .animator
+                .as_deref()
+                .and_then(|controller| object_animation(&authored.clips, s, o, controller))
+            {
+                controllers.push((&visual.nodes[index as usize].path, animation));
+            }
+            let mut pose = node.local;
+            if index == part.node {
+                pose.color = st.color.unwrap_or(legacy.color).map(|c| c as f32 / 255.0);
+            }
+            for (root, (clip, time)) in &controllers {
+                let Some(path) = animation_path(&node.path, root) else {
+                    continue;
+                };
+                pose = clip.pose(path, *time, pose);
+                if index == target {
+                    if let (Some(frame), Some(sprite)) =
+                        (clip.sprite_frame(path, *time), sprite.as_deref_mut())
+                    {
+                        *sprite = Some(frame.and_then(|name| sheet.id(name)));
+                    }
+                }
+            }
+            if proto.catapult.is_some()
+                && node.path == "Flippable/Arm"
+                && matches!(
+                    o.mode,
+                    game::siege::mode::MOVING | game::siege::mode::RELOADING
+                )
+            {
+                let angle = if o.mode == game::siege::mode::MOVING {
+                    0.0
+                } else {
+                    o.aim
+                };
+                let half = angle.to_radians() * 0.5;
+                pose.rotation = [0.0, 0.0, half.sin(), half.cos()];
+            }
+            pose
+        })
+    };
+    let mut sprite = None;
+    let (mut transform, pose) = sample(part.node, Some(&mut sprite))?;
+    let path = &visual.nodes[part.node as usize].path;
+    if proto.catapult.is_some() && path == "Flippable/Rope" {
+        if let Some((arm, _)) = visual
+            .nodes
+            .iter()
+            .position(|n| n.path == "Flippable/Arm")
+            .and_then(|index| sample(index as u16, None))
+        {
+            // Catapult.Update ties the rope to Arm.TransformPoint(ArmAttach).
+            let end = arm.point([-0.125, 19.0 / 32.0]);
+            let [x, y] = [
+                end[0] - transform.translation[0],
+                end[1] - transform.translation[1],
+            ];
+            let length = (x * x + y * y).sqrt();
+            if length > 0.0 {
+                transform.basis = [x * 8.0, -y / length, y * 8.0, x / length];
+            }
+        }
+    }
+    let mirrored = o.flip
+        && (proto.catapult.is_none() || path == "Flippable" || path.starts_with("Flippable/"));
+    let flip_x = if legacy.random.is_some() {
+        st.flip
+    } else {
+        st.flip ^ legacy.flip ^ part.flip_x
+    };
+    Some(PartPose {
+        transform,
+        pose,
+        sprite,
+        flip_x,
+        flip_y: part.flip_y,
+        mirrored,
+    })
+}
+
 fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
     let s = c.s;
     let st = o.parts[pi];
-    let Some(world_sprite) = st.sprite else {
+    let authored = authored_part(c.sheet, s, o, pi);
+    if authored.as_ref().is_some_and(|p| !p.pose.visible) {
         return;
-    };
-    let Some(mut sprite) = c.sheet.world(world_sprite) else {
+    }
+    let base_sprite = st.sprite.and_then(|id| c.sheet.world(id));
+    let Some(mut sprite) = authored
+        .as_ref()
+        .and_then(|p| p.sprite)
+        .unwrap_or(base_sprite)
+    else {
         return;
     };
     let proto = &s.world.protos[o.proto as usize];
@@ -957,8 +1160,11 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
     }
     let part = &proto.parts[pi];
     let ratio = s.world.layer(o.layer).ratio;
-    let dir = if o.flip { -1.0 } else { 1.0 };
-    let (mut px, mut py) = (part.x, part.y);
+    let mirrored = authored.as_ref().map_or(o.flip, |p| p.mirrored);
+    let dir = if mirrored { -1.0 } else { 1.0 };
+    let [mut px, mut py] = authored
+        .as_ref()
+        .map_or([part.x, part.y], |p| p.transform.translation);
     // orig: Boat.sail animator: Closed until SailAway, then Open → Flapping;
     // the emblem rides on the cloth.
     if let Some(sail) = proto.boat.as_ref().and_then(|b| b.sail) {
@@ -976,24 +1182,31 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
         };
         let clip_def = c.clip(clip.0);
         if pi == sail as usize {
-            if let Some(id) = clip_def.and_then(|k| k.sprite("", clip.1)) {
-                sprite = id;
+            if authored.as_ref().is_none_or(|p| p.sprite.is_none()) {
+                if let Some(id) = clip_def.and_then(|k| k.sprite("", clip.1)) {
+                    sprite = id;
+                }
             }
         } else if part.parent == Some(sail) {
             if sail_t.is_none() {
                 return;
             }
-            if let Some(k) = clip_def.filter(|k| k.has_offsets("Emblem")) {
+            if let Some(k) = clip_def.filter(|k| authored.is_none() && k.has_offsets("Emblem")) {
                 let (ex, ey) = k.offset("Emblem", clip.1);
                 let sp = &proto.parts[sail as usize];
                 (px, py) = (sp.x + ex, sp.y + ey);
             }
         }
     }
-    let mut tint = Color::bytes(st.color.unwrap_or(part.color));
+    let mut tint = authored.as_ref().map_or_else(
+        || Color::bytes(st.color.unwrap_or(part.color)),
+        |p| Color::rgba(p.pose.color.map(|channel| channel.clamp(0.0, 1.0))),
+    );
     // orig: Banner.AssignColorAndPattern(): the coat of arms' pattern on the
     // cloth, and its emblem in the emblem color.
-    let name = &s.world.sprites[world_sprite as usize];
+    let name = st
+        .sprite
+        .map_or("", |id| s.world.sprites[id as usize].as_str());
     let look = s.game.look;
     let mut cloth = heraldry::is_cloth(name);
     let emblem = if name.starts_with(heraldry::PATTERN) {
@@ -1040,6 +1253,16 @@ fn draw_part<R: Renderer>(c: &mut Ctx<R>, o: &game::level::Object, pi: usize) {
         tint = c.lit(tint);
     }
     let mut d = Draw::tint(tint).flip(o.flip ^ st.flip);
+    if let Some(authored) = authored {
+        d.flip = authored.flip_x;
+        d.flip_y = authored.flip_y;
+        let basis = authored.transform.screen_basis(mirrored);
+        if basis == [-1.0, 0.0, 0.0, 1.0] {
+            d.flip = !d.flip;
+        } else if basis != [1.0, 0.0, 0.0, 1.0] {
+            d.basis = Some(basis);
+        }
+    }
     if part.recolor || cloth {
         // orig: Banner: recolorA = primary, recolorB = secondary (a cloth's
         // SpriteFX is recoloured whatever its material).
@@ -1347,21 +1570,35 @@ fn draw_monarch<R: Renderer>(c: &mut Ctx<R>) {
     let f = m.facing as f32;
     let steed = s.game.steed;
     let sheet = c.sheet;
-    let Some(clip) = sheet.clip(&clip_name(&s.world.steeds[steed as usize].clips, s.anim.0)) else {
+    let name = clip_name(&s.world.steeds[steed as usize].clips, s.anim.0);
+    let Some(clip) = sheet.clip(&name) else {
         return;
     };
+    let authored = sheet.authored().and_then(|a| a.clips.clip(&name));
     let t = s.anim.1;
+    let position = |path: &str, fallback: (f32, f32)| {
+        authored.map_or(fallback, |authored| {
+            let rest = game::animation::Pose {
+                position: [fallback.0, fallback.1, 0.0],
+                ..Default::default()
+            };
+            let [x, y, _] = authored.pose(path, t, rest).position;
+            (x, y)
+        })
+    };
     let child = |path: &str| {
-        let (ox, oy) = clip.offset(path, t);
+        let (ox, oy) = position(path, clip.offset(path, t));
         offset(root, ox * f, oy)
     };
-    if let Some(sp) = clip.sprite("", t) {
+    if let Some(sp) = sheet.frame(&name, "", t).flatten() {
         let (mane, coat) = steed_colors(s, steed, true);
         c.sprite_lit(sp, root, Draw::tint(tint).flip(flip).recolor(mane, coat));
     }
     // Clips that don't animate the rider (idle, eat) leave the prefab defaults.
     let who = heraldry::rider(s.game.look);
-    let rider = clip.sprite(who.track, t).or(sheet.id(who.default));
+    let rider = sheet
+        .frame(&name, who.track, t)
+        .unwrap_or_else(|| sheet.id(who.default));
     let king = child(who.track);
     if let Some(rider) = rider {
         let d = Draw::tint(tint)
@@ -1370,11 +1607,14 @@ fn draw_monarch<R: Renderer>(c: &mut Ctx<R>) {
         c.sprite_lit(rider, king, d);
     }
     // Crown is a child of the rider, so its keys are relative to them.
-    let (cx, cy) = if clip.has_offsets(who.crown_track) {
-        clip.offset(who.crown_track, t)
-    } else {
-        CROWN_DEFAULT_POS
-    };
+    let (cx, cy) = position(
+        who.crown_track,
+        if clip.has_offsets(who.crown_track) {
+            clip.offset(who.crown_track, t)
+        } else {
+            CROWN_DEFAULT_POS
+        },
+    );
     if s.game.has_crown {
         c.named(
             who.crown,
@@ -1539,7 +1779,7 @@ fn draw_world<R: Renderer>(c: &mut Ctx<R>) {
     c.r.rect(Rect::new(0.0, below, W, H - below), sky_bottom);
 
     let game_z = layer_z(&s.world);
-    let items = draw_list(s);
+    let items = draw_list(s, c.sheet);
     c.lights = items
         .iter()
         .filter_map(|(_, item)| fire_item(s, item))
@@ -1822,6 +2062,312 @@ fn draw_overlays<R: Renderer>(c: &mut Ctx<R>) {
 #[cfg(test)]
 mod tests {
     use super::sort_key;
+
+    #[derive(Default)]
+    struct Capture(Vec<(u32, (f32, f32), super::Draw)>);
+
+    impl super::Renderer for Capture {
+        fn clear(&mut self, _: super::Color) {}
+        fn sprite(&mut self, id: u32, at: (f32, f32), draw: super::Draw) {
+            self.0.push((id, at, draw));
+        }
+        fn sliced(&mut self, _: u32, _: super::Rect, _: (f32, f32, f32, f32), _: super::Color) {}
+        fn rect(&mut self, _: super::Rect, _: super::Color) {}
+        fn rect_lines(&mut self, _: super::Rect, _: f32, _: super::Color) {}
+        fn gradient(&mut self, _: super::Rect, _: super::Color, _: super::Color) {}
+        fn add(&mut self, _: super::Rect, _: super::Color) {}
+        fn circle(&mut self, _: f32, _: f32, _: f32, _: super::Color) {}
+        fn circle_lines(&mut self, _: f32, _: f32, _: f32, _: f32, _: super::Color) {}
+    }
+
+    fn animation_world() -> game::data::WorldData {
+        use game::data::{DayDef, DirectorDef, LevelConfigDef, Part, Proto, WorldData};
+        let part = Part {
+            sprite: Some(0),
+            x: 2.0,
+            y: 2.0,
+            z: 0.0,
+            flip: false,
+            color: [255; 4],
+            sort_layer: 0,
+            sort_order: 0,
+            random: None,
+            parent: None,
+            recolor: false,
+            lit: false,
+            scaffold: false,
+        };
+        WorldData {
+            sprites: vec!["panel".into()],
+            protos: vec![Proto {
+                parts: vec![
+                    part.clone(),
+                    Part {
+                        sprite: None,
+                        sort_order: 1,
+                        ..part
+                    },
+                ],
+                ..Default::default()
+            }],
+            days: vec![DayDef {
+                name: "day".into(),
+                seasons: 7,
+                weathers: 1,
+                tracks: vec![],
+            }],
+            director: DirectorDef {
+                regular_days: vec![0],
+                boss_days: vec![0],
+                recovery_days: vec![0],
+                num_regular_days: (3, 4),
+                ..Default::default()
+            },
+            levels: vec![LevelConfigDef {
+                name: "island".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            steeds: vec![Default::default()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn generic_part_draw_uses_animated_hierarchy_pivot_color_and_null_frames() {
+        use crate::authored::{AssetAnimation, PartVisual, PrefabVisual, TransformNode};
+        use crate::render::sprite_corners;
+        use crate::sheet::{Page, PageFormat, Sprite};
+        use game::animation::{
+            AnimatorState, Clip, Controller, Key, Library, Pose, SpriteTrack, Tangent,
+            TransformTrack,
+        };
+        use game::data::Layer;
+
+        let mut session = super::Session::new(animation_world(), 0, 1, Default::default());
+        session.camera_x = 0.0;
+        session.game.monarch.x = 0.0;
+        let object = game::level::instantiate(&session.world, 0, Layer::Game, 0.0, 0.0, 0.0, 1.0);
+        assert!(
+            !object.parts[1].visible,
+            "legacy pack starts with no sprite"
+        );
+        let id = session.game.level.add(object);
+        let index = session.game.level.index_of(id).unwrap();
+
+        let mut sheet = super::Sheet::default();
+        sheet.pages = vec![Page {
+            file: "fixture".into(),
+            w: 16,
+            h: 16,
+            format: PageFormat::Rgba8,
+        }];
+        sheet.names = vec!["panel".into(), "pulse".into()];
+        sheet.sprites = vec![
+            Sprite {
+                page: 0,
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 2,
+                px: 1.0,
+                py: 0.5,
+                masks: [None; 2],
+            };
+            2
+        ];
+        sheet.link(&session.world.sprites);
+        let capture = |session: &super::Session, sheet: &super::Sheet| {
+            let mut capture = Capture::default();
+            super::draw(session, sheet, &mut capture);
+            capture.0
+        };
+
+        session.game.ticks = 30;
+        let legacy = capture(&session, &sheet);
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].1, super::layer_to_screen(&session, 2.0, 2.0, 1.0));
+        assert_eq!(legacy[0].2.basis, None);
+        assert_eq!(legacy[0].2.tint.a, 1.0);
+
+        let key = |time, value| Key {
+            time,
+            value,
+            in_tangent: Tangent::Slope(0.0),
+            out_tangent: Tangent::Slope(0.0),
+        };
+        let mut track = TransformTrack {
+            path: "Panel".into(),
+            ..Default::default()
+        };
+        track.position[0] = vec![key(0.0, 1.0), key(1.0, 3.0)];
+        track.scale[1] = vec![key(0.0, 3.0)];
+        track.color[3] = vec![key(0.0, 0.25)];
+        let visible = TransformTrack {
+            path: "Pulse".into(),
+            visible: vec![
+                Key {
+                    out_tangent: Tangent::Step,
+                    ..key(0.0, 1.0)
+                },
+                key(0.75, 0.0),
+            ],
+            ..Default::default()
+        };
+        let clips = Library {
+            clips: vec![(
+                "motion".into(),
+                Clip {
+                    length: 1.0,
+                    tracks: vec![track, visible],
+                    sprites: vec![
+                        SpriteTrack {
+                            path: "Panel".into(),
+                            keys: vec![(0.0, Some("panel".into())), (1.0, None)],
+                        },
+                        SpriteTrack {
+                            path: "Pulse".into(),
+                            keys: vec![(0.0, None), (0.25, Some("pulse".into())), (1.0, None)],
+                        },
+                    ],
+                    ..Default::default()
+                },
+            )],
+            controllers: vec![Controller {
+                name: "fixture".into(),
+                default_state: Some("Idle".into()),
+            }],
+            states: vec![AnimatorState {
+                controller: "fixture".into(),
+                name: "Idle".into(),
+                clip: Some("motion".into()),
+                speed: 1.0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let q = core::f32::consts::FRAC_1_SQRT_2;
+        let authored = AssetAnimation {
+            prefabs: vec![PrefabVisual {
+                nodes: vec![
+                    TransformNode {
+                        path: "".into(),
+                        parent: None,
+                        local: Pose {
+                            scale: [2.0, 1.0, 1.0],
+                            ..Default::default()
+                        },
+                        animator: Some("AnimatorController/fixture.controller".into()),
+                    },
+                    TransformNode {
+                        path: "Panel".into(),
+                        parent: Some(0),
+                        local: Pose {
+                            position: [1.0, 2.0, 0.0],
+                            rotation: [0.0, 0.0, q, q],
+                            ..Default::default()
+                        },
+                        animator: None,
+                    },
+                    TransformNode {
+                        path: "Pulse".into(),
+                        parent: Some(0),
+                        local: Pose::default(),
+                        animator: None,
+                    },
+                ],
+                parts: vec![
+                    PartVisual {
+                        node: 1,
+                        flip_x: false,
+                        flip_y: true,
+                    },
+                    PartVisual {
+                        node: 2,
+                        flip_x: false,
+                        flip_y: false,
+                    },
+                ],
+            }],
+            clips,
+        };
+        let world_id = 0x1234_5678;
+        let bytes = authored.encode(world_id).unwrap();
+        sheet
+            .install_authored(&bytes, world_id, &session.world)
+            .unwrap();
+
+        session.game.ticks = 0;
+        let start = capture(&session, &sheet);
+        assert_eq!(start.len(), 1);
+        assert_eq!(
+            start[0].0, 0,
+            "the initially null part stays hidden until keyed"
+        );
+
+        session.game.ticks = 30;
+        let active = capture(&session, &sheet);
+        assert_eq!(
+            active.iter().map(|sprite| sprite.0).collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let (_, at, draw) = active[0];
+        assert_eq!(at, super::layer_to_screen(&session, 4.0, 2.0, 1.0));
+        for (actual, expected) in draw.basis.unwrap().into_iter().zip([0.0, 6.0, -1.0, 0.0]) {
+            assert!((actual - expected).abs() < 1e-5);
+        }
+        assert_eq!(draw.tint.a, 0.25);
+        assert!(draw.flip_y);
+        let corners = sprite_corners(sheet.get(0), at, &draw);
+        assert!((corners[0].0 - (at.0 - 9.0)).abs() < 1e-5);
+        assert!((corners[0].1 - (at.1 + 1.0)).abs() < 1e-5);
+
+        session.game.level.objects[index].flip = true;
+        let (_, mirrored_at, mirrored) = capture(&session, &sheet)[0];
+        let root_x = super::world_to_screen(&session, 0.0, 0.0).0;
+        for (a, b) in corners
+            .into_iter()
+            .zip(sprite_corners(sheet.get(0), mirrored_at, &mirrored))
+        {
+            assert!((b.0 - (2.0 * root_x - a.0)).abs() < 1e-5);
+            assert_eq!(a.1, b.1);
+        }
+
+        let before_resume = capture(&session, &sheet);
+        session.paused = true;
+        session.step_ticks(Default::default(), 15);
+        assert_eq!(capture(&session, &sheet), before_resume);
+        session.paused = false;
+        let save = game::save::save_game(&session.game, world_id);
+        let loaded = game::save::load_game(&save, world_id, &session.world).unwrap();
+        session.resume(loaded);
+        assert_eq!(capture(&session, &sheet), before_resume);
+
+        session.game.ticks = 45;
+        let visibility_key = capture(&session, &sheet);
+        assert_eq!(visibility_key.len(), 1);
+        assert_eq!(visibility_key[0].0, 0, "visibility can hide a keyed sprite");
+
+        session.game.ticks = 60;
+        assert!(
+            capture(&session, &sheet).is_empty(),
+            "authored null frames stop drawing"
+        );
+    }
 
     /// The packed key orders exactly as the tuple compare it replaced.
     #[test]
