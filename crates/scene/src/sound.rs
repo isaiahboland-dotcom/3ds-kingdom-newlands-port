@@ -694,6 +694,110 @@ fn forest_weight(g: &GameState, x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_world() -> WorldData {
+        use game::data::{DayDef, DirectorDef, LevelConfigDef};
+        WorldData {
+            days: vec![DayDef {
+                name: "day".into(),
+                seasons: 7,
+                weathers: 1,
+                tracks: vec![],
+            }],
+            director: DirectorDef {
+                regular_days: vec![0],
+                boss_days: vec![0],
+                recovery_days: vec![0],
+                num_regular_days: (3, 4),
+                ..Default::default()
+            },
+            levels: vec![LevelConfigDef {
+                name: "island".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: vec![],
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            steeds: vec![Default::default()],
+            ..Default::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct MixerLog {
+        plays: Vec<(AudioClipId, f32, f32)>,
+        failed: Option<Voice>,
+    }
+    impl Mixer for MixerLog {
+        fn play(&mut self, clip: AudioClipId, gain: f32, pan: f32, _: bool) -> Option<Voice> {
+            self.plays.push((clip, gain, pan));
+            Some(self.plays.len() as Voice)
+        }
+        fn set(&mut self, _: Voice, _: f32, _: f32) {}
+        fn stop(&mut self, _: Voice) {}
+        fn playing(&self, voice: Voice) -> bool {
+            self.failed != Some(voice)
+        }
+        fn pause(&mut self, _: bool) {}
+    }
+
+    #[test]
+    fn terminal_stream_failure_allows_the_next_queued_music_track() {
+        use crate::{
+            adpcm::{Adp, Channel},
+            stream::Source,
+        };
+        use std::io::Cursor;
+        let mut world = test_world();
+        world.audio.sounds = (0..2)
+            .map(|clip| SoundDef {
+                clips: vec![clip],
+                volume: 1.0,
+                max_simultaneous: 1,
+                group: SoundGroup::Music,
+                ..Default::default()
+            })
+            .collect();
+        let mut s = Session::new(world, 0, 1, game::progress::Progress::everything());
+        let mut player = Player::new(&s.world);
+        let mut mixer = MixerLog::default();
+        s.music_cues.push(MusicCue::Play(0));
+        player.update(&mut s, &Sheet::default(), &mut mixer, game::state::TICK);
+        s.music_cues.push(MusicCue::Queue(1));
+        let bytes = Adp {
+            rate: 22050,
+            samples: 14,
+            gain: 1.0,
+            channels: vec![Channel {
+                coefs: [0; 16],
+                data: vec![0; 8],
+            }],
+        }
+        .to_bytes();
+        let mut stream = Source::open(Cursor::new(bytes)).unwrap();
+        let (mut left, mut right) = ([0; 8], [0; 8]);
+        assert!(stream
+            .fill_pair([&mut left, &mut right], 14, |_, _| Err(
+                std::io::Error::other("injected DSP preparation failure")
+            ))
+            .is_err());
+        assert!(!stream.playing(true));
+        mixer.failed = Some(1); // the backend reports the terminal source as stopped
+        player.update(&mut s, &Sheet::default(), &mut mixer, game::state::TICK);
+        assert_eq!(mixer.plays.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 1]);
+    }
+
     #[test]
     fn positioned_worker_strokes_fade_out_at_the_emitters_range() {
         let player = Player::new(&WorldData::default());
