@@ -1235,7 +1235,7 @@ fn draw_troll<R: Renderer>(c: &mut Ctx<R>, i: usize) {
             game::greed::Loot::Coin => c.sheet.id("coin_spin_0"),
             game::greed::Loot::Crown => c.sheet.id("crown"),
             game::greed::Loot::BoatPart(_) => c.sheet.id("boat_skeleton_s052_124"),
-            game::greed::Loot::Tool(k) => s
+            game::greed::Loot::Tool(k) | game::greed::Loot::CarriedTool { kind: k, .. } => s
                 .world
                 .tool_sprites
                 .get(k as usize)
