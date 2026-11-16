@@ -37,7 +37,7 @@ Measured on an Old 3DS XL during the first days of a new game:
 
 To see these numbers yourself, tap **SELECT** during gameplay to open the debug overlay. Its first line shows the current FPS (averaged over 30 frames), the lowest and highest readings, and the longest single frame since you opened it. Close and reopen the overlay to reset them. The overlay times each game system while it's open, so the numbers are slightly lower than normal play.
 
-We may cap the Old 3DS at 30 FPS in a later version. 30 FPS is playable, but the frame rate currently swings between the 50s and about 30 as the island gets busy, and those swings feel worse than a steady 30. A cap would keep frame times even. Nothing is capped yet.
+The pause menu has a **30 FPS** button for the Old 3DS. 30 FPS is playable, but the frame rate can swing between the 50s and about 30 as the island gets busy, and those swings can feel worse than a steady 30. When the button glows gold the game is capped at 30 FPS, which keeps frame times even; when it's white the game runs uncapped. The setting is remembered between sessions. We are still working on performance, so the cap is a choice for players while we optimize for the hardware.
 
 ## Screenshots
 

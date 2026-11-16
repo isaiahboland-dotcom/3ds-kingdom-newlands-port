@@ -38,6 +38,8 @@ const SLOT_GAP: f32 = 48.0;
 pub const RESUME: Rect = Rect::new(110.0, 196.0, 100.0, 28.0);
 /// Opens the banner editor.
 const BANNER: Rect = Rect::new(10.0, 196.0, 92.0, 28.0);
+/// Toggles the 30 FPS cap; gold while it is on.
+const FPS30: Rect = Rect::new(218.0, 196.0, 92.0, 28.0);
 
 /// The banner editor: previews on the left, choices on the right, the
 /// color picker along the bottom.
@@ -253,6 +255,10 @@ pub fn tap(s: &mut Session, sheet: &Sheet, p: (f32, f32)) -> Tap {
             s.editor = Some(Editor::default());
             return Tap::Nothing;
         }
+        if FPS30.contains(p) {
+            s.cap30 = !s.cap30;
+            return Tap::Nothing;
+        }
         for i in 0..game::save::SLOTS {
             if slot_save(i).contains(p) {
                 s.save_to(i);
@@ -390,6 +396,13 @@ fn draw_pause(s: &Session, sheet: &Sheet, r: &mut impl Renderer) {
     }
     button(r, sheet, BANNER, "BANNER", Color::WHITE);
     button(r, sheet, RESUME, "RESUME", GOLD);
+    button(
+        r,
+        sheet,
+        FPS30,
+        "30 FPS",
+        if s.cap30 { GOLD } else { Color::WHITE },
+    );
 }
 
 /// The banner editor: the banner and the monarch as they'll look, king or

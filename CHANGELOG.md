@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Pause menu: a 30 FPS button. When it glows gold the 3DS draws every second
+  screen refresh for an even 30 FPS instead of swinging between the 50s and
+  30. The setting is saved on the SD card. Desktop ignores it.
+
 ### Fixed
 
 - Archers check range using the enemy's actual height and aim at the

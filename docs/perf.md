@@ -169,3 +169,9 @@ integers are sorted unstably: sort 2.2 µs, list 5.0 µs per frame.
   night (high 44.6) and rose steadily toward morning. The night lighting
   (torch and campfire point lights, ground light columns) is the likely
   cost; profile the render with the overlay at night.
+- Frame pacing on the Old 3DS XL (2026-11-15, extended play): FPS ranged
+  from about 26 to 58. Thirty is playable, but the drops from the 50s feel
+  worse than a steady 30, and the longer the session the more it stands out.
+  The pause menu's 30 FPS button now caps it (every second vblank, the
+  simulation tick unchanged); hardware-tested on the Old 3DS XL and a clear
+  improvement in feel. Raising the uncapped frame rate is still open.

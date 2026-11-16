@@ -31,6 +31,8 @@ const ROMFS: &str = "romfs:";
 const MAX_STEREO: f32 = 12.0;
 /// Sound clips, copied onto the card by hand (see `pack3ds`).
 const SD_DIR: &str = "sdmc:/3ds/kingdom-3ds";
+/// The settings file (one byte: 1 when the 30 FPS cap is on).
+const SETTINGS: &str = "settings";
 
 /// Shows an error on the touch screen until START.
 fn fail(gfx: &Gfx, hid: &mut Hid, apt: &Apt, msg: &str) {
@@ -104,6 +106,14 @@ fn main() {
     s.storage = Some(Box::new(files));
     s.slot = slot;
     s.debug_lines = false;
+    s.cap30 = s
+        .storage
+        .as_ref()
+        .and_then(|st| st.read(SETTINGS))
+        .is_some_and(|b| b.first() == Some(&1));
+    let mut cap_saved = s.cap30;
+    // When the last frame began (after the vblank wait), for the 30 FPS cap.
+    let mut begun = std::time::Instant::now();
     s.world_id = world_id;
     if let Some(g) = saved {
         s.resume(g);
@@ -135,6 +145,12 @@ fn main() {
     let mut fps_high = 0.0f32;
     let mut worst_ms = 0.0f32;
     while apt.main_loop() {
+        // 30 FPS cap: the frame begin below waits for one vblank. A frame that
+        // finished early waits for one more, so frames come every second
+        // vblank; one that ran long already missed it and needs no extra wait.
+        if s.cap30 && begun.elapsed() < std::time::Duration::from_millis(15) {
+            gfx.wait_for_vblank();
+        }
         hid.scan_input();
         let down = hid.keys_down();
         let held = hid.keys_held();
@@ -147,6 +163,12 @@ fn main() {
                 touch::Tap::Pause => s.set_paused(!s.paused),
                 touch::Tap::Go => go = true,
                 touch::Tap::Nothing => {}
+            }
+        }
+        if s.cap30 != cap_saved {
+            cap_saved = s.cap30;
+            if let Some(st) = &mut s.storage {
+                st.write(SETTINGS, &[cap_saved as u8]);
             }
         }
         let map_open = s.map_shown();
@@ -222,7 +244,14 @@ fn main() {
         if s.debug && frames > 0 {
             worst_ms = worst_ms.max(frame_s * 1000.0);
         }
-        let ticks = if acc >= 2.0 { (acc as u32).min(4) } else { 1 };
+        let ticks = if s.cap30 {
+            // Frames come every ~2 ticks: round, so jitter doesn't flip 2 and 3.
+            (acc.round() as u32).clamp(1, 4)
+        } else if acc >= 2.0 {
+            (acc as u32).min(4)
+        } else {
+            1
+        };
         acc = (acc - ticks as f32).clamp(-1.0, 4.0);
         // The tick profiler reads the clock at every mark: only while the
         // overlay that shows it is up.
@@ -241,7 +270,8 @@ fn main() {
         }
         gpu.stereo = if stereo_on { slider * MAX_STEREO } else { 0.0 };
         gpu.begin();
-        let t2 = std::time::Instant::now();
+        begun = std::time::Instant::now();
+        let t2 = begun;
         gpu.screen(true);
         top::draw(&s, &sheet, &mut gpu);
         gpu.screen(false);

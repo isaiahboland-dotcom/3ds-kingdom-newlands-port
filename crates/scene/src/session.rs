@@ -46,6 +46,9 @@ pub struct Session {
     /// The debug overlay's game-state lines (the 3DS shows only `note`:
     /// each letter costs a sprite).
     pub debug_lines: bool,
+    /// Cap the frame rate at 30 FPS (the pause menu's 30 FPS button). Only the
+    /// 3DS front end paces frames; others ignore it.
+    pub cap30: bool,
     /// Testing aid kept across runs: a full purse and an unhurt monarch
     /// (`GameState::god`).
     pub god: bool,
@@ -137,6 +140,7 @@ impl Session {
             map: None,
             note: String::new(),
             debug_lines: true,
+            cap30: false,
             warning: String::new(),
             god: false,
             editor: None,
