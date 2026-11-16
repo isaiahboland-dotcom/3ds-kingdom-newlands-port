@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Archers check range using the enemy's actual height and aim at the
+  collider center, so both ground and tower archers can hit airborne enemies.
+
 ## 1.3.0 — 2026-11-08
 
 ### Added

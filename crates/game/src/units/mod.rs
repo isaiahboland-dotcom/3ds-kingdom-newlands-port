@@ -611,6 +611,32 @@ pub enum UnitEvent {
     },
 }
 
+/// A living enemy as citizens see it this tick. The transform position is
+/// separate from the collider bounds: orig: `Archer.TargetInRange` uses the
+/// former, while `Archer.BestShot` aims at `Collider2D.bounds.center`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EnemyTarget {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub hp: i32,
+    pub bounds: Rect,
+}
+
+impl From<&crate::greed::Troll> for EnemyTarget {
+    fn from(troll: &crate::greed::Troll) -> Self {
+        Self {
+            id: troll.id,
+            x: troll.x,
+            y: troll.y,
+            vx: troll.mover.vx,
+            hp: troll.hp,
+            bounds: troll.box_at(),
+        }
+    }
+}
+
 /// Everything the units need to know about the rest of the game this tick.
 pub struct Ctx<'a> {
     pub world: &'a WorldData,
@@ -624,8 +650,7 @@ pub struct Ctx<'a> {
     pub monarch_x: f32,
     pub monarch_running: bool,
     pub forests: &'a [(f32, f32)],
-    /// Living trolls: (id, x, vx, hit points).
-    pub enemies: &'a [(u32, f32, f32, i32)],
+    pub enemies: &'a [EnemyTarget],
     /// x of every wall, to decide between low and high arrow arcs.
     pub walls: &'a [f32],
     pub farmlands: &'a [FarmInfo],
@@ -2566,7 +2591,7 @@ fn farmer_should_flee(u: &Unit, ctx: &Ctx) -> bool {
         && ctx
             .enemies
             .iter()
-            .any(|e| (e.1 - u.x).abs() <= FARMER_FLEE_RANGE)
+            .any(|e| (e.x - u.x).abs() <= FARMER_FLEE_RANGE)
 }
 
 /// The farmer's FSM: Idle → Farm while safe, Shelter when not, Flee from
@@ -2786,8 +2811,8 @@ fn archer_shoot(
         let trolls = ctx
             .enemies
             .iter()
-            .filter(|e| (e.1 - u.x).abs() <= RANGE && target_in_range(e.1 - u.x, -u.y))
-            .map(|e| (Quarry::Troll(e.0), e.3));
+            .filter(|e| (e.x - u.x).abs() <= RANGE && target_in_range(e.x - u.x, e.y - u.y))
+            .map(|e| (Quarry::Troll(e.id), e.hp));
         let portals = ctx
             .portals
             .iter()
@@ -2836,11 +2861,13 @@ fn archer_shoot(
         return;
     };
     let pos = match target {
-        Quarry::Troll(id) => ctx
-            .enemies
-            .iter()
-            .find(|e| e.0 == id)
-            .map(|e| (e.1, e.2, 0.35)),
+        Quarry::Troll(id) => ctx.enemies.iter().find(|e| e.id == id).map(|e| {
+            (
+                e.bounds.x + e.bounds.w * 0.5,
+                e.vx,
+                e.bounds.y + e.bounds.h * 0.5,
+            )
+        }),
         Quarry::Animal(id) => ctx
             .wildlife
             .iter()
@@ -3062,7 +3089,7 @@ fn archer_should_flee(u: &Unit, ctx: &Ctx) -> bool {
         && ctx
             .enemies
             .iter()
-            .map(|e| (e.1 - u.x).abs())
+            .map(|e| (e.x - u.x).abs())
             .min_by(f32::total_cmp)
             .is_some_and(|d| d < ARCHER_FLEE_RANGE)
 }
@@ -3104,6 +3131,210 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn combat_world() -> WorldData {
+        WorldData {
+            levels: alloc::vec![crate::data::LevelConfigDef {
+                name: "archer-fixture".into(),
+                autumn_start: (40, 40),
+                winter_start: (60, 60),
+                days_before_game_over: -1,
+                starting_coins: 0,
+                min_level_width: 0,
+                group_counts: Vec::new(),
+                waves: Default::default(),
+                wave_timed_multiplier: 1.0,
+                wave_multiplier_timeframe: (0, -1),
+                season_change_days: 3.0,
+                income_multiplier: 1.0,
+                free_boat_parts: 0,
+                wave_boat_multiplier: 1.0,
+                force_all_unlocks: false,
+                defence_waves: [None; 3],
+                retaliation_waves: [None; 3],
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn unit_ctx<'a>(world: &'a WorldData, enemies: &'a [EnemyTarget]) -> Ctx<'a> {
+        Ctx {
+            world,
+            borders: Borders {
+                left: -10.0,
+                right: 10.0,
+            },
+            shelter: Borders {
+                left: -10.0,
+                right: 10.0,
+            },
+            campfire: 0.0,
+            daytime: true,
+            safe: true,
+            monarch_x: 0.0,
+            monarch_running: false,
+            forests: &[],
+            enemies,
+            walls: &[],
+            farmlands: &[],
+            slots: &[],
+            archer_statue: false,
+            knight_statue: false,
+            worker_statue: false,
+            portals: &[],
+            knights: KnightCtx::default(),
+            coat: crate::kingdom::CoatOfArms {
+                primary: [1.0; 3],
+                secondary: [0.5; 3],
+                emblem: [0.0; 3],
+            },
+            wildlife: &[],
+            closest_forest: (-20.0, 20.0),
+            boat: None,
+        }
+    }
+
+    #[test]
+    fn archer_range_uses_enemy_root_height_not_ground_or_collider_center() {
+        use crate::greed::EnemyKind;
+        let world = WorldData::default();
+        let mut rng = Rng::new(31);
+        let mut greed = crate::greed::Greed::default();
+        greed.spawn_troll(EnemyKind::Troll, 2.0, 0, false, &mut rng);
+        greed.spawn_troll(EnemyKind::Squid, 1.0, 0, false, &mut rng);
+        // The healthier flying target is unreachable, despite its close x.
+        greed.trolls[1].y = 3.0;
+        let targets: Vec<_> = greed.trolls.iter().map(EnemyTarget::from).collect();
+        let mut archer = Unit::new(10, Role::Archer, 0.0, &mut rng);
+        archer_shoot(
+            &mut archer,
+            1.0 / 60.0,
+            &unit_ctx(&world, &targets),
+            false,
+            &mut rng,
+            &mut |_| {},
+        );
+        assert_eq!(archer.shoot.unwrap().0, Quarry::Troll(greed.trolls[0].id));
+
+        // PC TargetInRange uses the root, even when the bounds centre would
+        // fail its discriminant. BestShot has its own aim point/fallback.
+        greed.trolls[1].y = 2.2;
+        let targets: Vec<_> = greed.trolls.iter().map(EnemyTarget::from).collect();
+        assert!(target_in_range(1.0, 2.2));
+        assert!(!target_in_range(1.0, 2.5));
+        let mut archer = Unit::new(11, Role::Archer, 0.0, &mut rng);
+        archer_shoot(
+            &mut archer,
+            1.0 / 60.0,
+            &unit_ctx(&world, &targets),
+            false,
+            &mut rng,
+            &mut |_| {},
+        );
+        assert_eq!(archer.shoot.unwrap().0, Quarry::Troll(greed.trolls[1].id));
+    }
+
+    #[test]
+    fn ground_and_tower_archers_hit_ground_and_airborne_colliders() {
+        use crate::director::Season;
+        use crate::greed::{EnemyKind, Greed, GreedCtx};
+        // Exercise actual slot placement, acquisition, draw, arrow spawn and
+        // collision. Reset target positions each tick to isolate aim geometry
+        // from accumulated squid motion; a blessed shot removes scatter.
+        for (height, kind, target_x, target_y) in [
+            (0.0, EnemyKind::Troll, 3.5, 0.0),
+            (0.0, EnemyKind::Squid, 2.0, 1.5),
+            (2.0, EnemyKind::Squid, 3.5, 2.2),
+        ] {
+            let world = combat_world();
+            let mut rng = Rng::new(73);
+            let mut greed = Greed::default();
+            greed.spawn_troll(kind, target_x, 0, false, &mut rng);
+            greed.trolls[0].y = target_y;
+            let hp = greed.trolls[0].hp;
+            let target = EnemyTarget::from(&greed.trolls[0]);
+            assert_eq!(target.y, target_y);
+            assert_eq!(target.bounds, greed.trolls[0].box_at());
+            let targets = [target];
+            let slots = [SlotInfo {
+                id: (40, 0),
+                x: 0.0,
+                y: height,
+            }];
+            let mut ctx = unit_ctx(&world, &targets);
+            ctx.archer_statue = true;
+            let mut population = Population::default();
+            population.spawn(Role::Archer, 0.0, &mut rng);
+            if height > 0.0 {
+                population.units[0].slot = Some(slots[0].id);
+                population.units[0].in_slot = true;
+                ctx.slots = &slots;
+            }
+            let mut level = Level::empty(-20.0, 40.0);
+            let mut coins = Coins::default();
+            let mut shot = None;
+            for _ in 0..60 {
+                population.update(
+                    1.0 / 60.0,
+                    &ctx,
+                    &mut level,
+                    &mut coins,
+                    &mut rng,
+                    |event| {
+                        if let UnitEvent::Arrow {
+                            x,
+                            y,
+                            vx,
+                            vy,
+                            missed,
+                            perfect,
+                        } = event
+                        {
+                            shot = Some((x, y, vx, vy, missed, perfect));
+                        }
+                    },
+                );
+                if shot.is_some() {
+                    break;
+                }
+            }
+            let (x, y, vx, vy, missed, perfect) = shot.expect("archer must release its shot");
+            assert!((y - (height + 0.4)).abs() < 1e-5);
+            assert!(perfect && !missed);
+            greed.shoot(x, y, vx, vy, missed, perfect);
+            let greed_ctx = GreedCtx {
+                world: &world,
+                level_index: 0,
+                campfire: 0.0,
+                borders: ctx.borders,
+                monarch_x: 0.0,
+                monarch_has_crown: true,
+                targets: &[],
+                loot: &[],
+                portals: &[],
+                portal_infos: &[],
+                threats: &[],
+                season: Season::Summer,
+                day: 1,
+                boat: false,
+            };
+            let mut hit = false;
+            for _ in 0..120 {
+                greed.trolls[0].x = target_x;
+                greed.trolls[0].y = target_y;
+                greed.trolls[0].mover.vx = 0.0;
+                greed.update(1.0 / 60.0, 12.0, &greed_ctx, &level, &mut rng, |_| {});
+                if greed.trolls[0].hp < hp {
+                    hit = true;
+                    break;
+                }
+            }
+            assert!(
+                hit,
+                "{kind:?} at ({target_x}, {target_y}) missed from height {height}"
+            );
+        }
+    }
 
     #[test]
     fn citizens_lose_friction_and_drag_at_a_held_speed() {

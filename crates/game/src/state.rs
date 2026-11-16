@@ -1330,12 +1330,12 @@ impl GameState {
             events.push(GameEvent::Pay(PayEvent::DropCoin));
         }
 
-        let enemies: Vec<(u32, f32, f32, i32)> = self
+        let enemies: Vec<crate::units::EnemyTarget> = self
             .greed
             .trolls
             .iter()
             .filter(|t| !t.is_dead())
-            .map(|t| (t.id, t.x, t.mover.vx, t.hp))
+            .map(crate::units::EnemyTarget::from)
             .collect();
         let walls: Vec<f32> = self
             .level
