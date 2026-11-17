@@ -40,6 +40,10 @@ jobs:
           path: regress-report.toml
           if-no-files-found: ignore
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Installer (built on its own, outside the workspace)
+        run: |
+          cargo fmt --manifest-path tools/installer/Cargo.toml --check
+          cargo clippy --manifest-path tools/installer/Cargo.toml --locked -- -D warnings
       - name: setup.sh lints
         run: shellcheck build.sh tools/setup.sh tools/cia/build.sh
 

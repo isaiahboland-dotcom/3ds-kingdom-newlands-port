@@ -4,6 +4,12 @@
 
 ### Added
 
+- Installer packages (Windows .zip, Linux .tar.gz) with a point-and-click
+  installer: pick your game folder and SD card, choose .3dsx and/or .cia, and
+  it converts your game and copies the result to the card. The 3DS assets are
+  now packed without devkitPro (a Rust .t3x writer and RomFS packer replace
+  `tex3ds` and `3dsxtool`; checked against them in tests). The release
+  workflow builds the packages on a version tag.
 - Pause menu: a 30 FPS button. When it glows gold the 3DS draws every second
   screen refresh for an even 30 FPS instead of swinging between the 50s and
   30. The setting is saved on the SD card. Desktop ignores it.

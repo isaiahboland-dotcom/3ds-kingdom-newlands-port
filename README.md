@@ -69,6 +69,12 @@ We check movement the same way. A small measurement harness (`tools/orig-harness
 
 ## Installation
 
+### Easiest: the installer package
+
+Download `Kingdom3DS-Installer-<version>-windows.zip` or `-linux.tar.gz` from the [releases page](https://github.com/isaiahboland-dotcom/3ds-kingdom-newlands-port/releases), unpack it, and run `kingdom-installer`. Pick your Kingdom: New Lands folder (the one containing `Kingdom_Data`; the Steam Windows and Linux builds both work) and your SD card, tick `.3dsx` and/or `.cia`, and press **Install**. It converts your game files on your computer, builds the 3DS files, and copies them to the card, keeping your saves. You don't need Rust, devkitPro or WSL. The first run downloads AssetRipper (about 100 MB) and takes a few minutes.
+
+The `.cia` option is experimental, especially on Windows. The packages contain only this project's code; nothing from the game. To build from source instead, read on.
+
 There are two ways to build the game: the **automated install** (`build.sh`) installs every dependency and builds everything in one command, while the **manual install** lets you run each step yourself.
 
 ### Automated install

@@ -136,6 +136,8 @@ impl eframe::App for App {
                 if !cia_ok {
                     cia.on_disabled_hover_text(format!("not in this package: {}", self.cia_missing.join(", ")));
                     self.want_cia = false;
+                } else if cfg!(windows) {
+                    ui.colored_label(egui::Color32::from_rgb(230, 140, 20), "EXPERIMENTAL on Windows: untested, may not install");
                 }
             });
             ui.add_space(8.0);

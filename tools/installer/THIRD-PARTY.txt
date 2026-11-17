@@ -1,0 +1,9 @@
+Programs this package uses besides the project's own:
+
+- AssetRipper 2.0.0 (GPL-3.0), downloaded on first use from
+  https://github.com/AssetRipper/AssetRipper/releases and checked against a
+  pinned SHA-256. It is not included in this package.
+- makerom (Project_CTR, https://github.com/3DSGuy/Project_CTR) and
+  bannertool (https://github.com/diasurgical/bannertool), built from the pinned
+  source revisions named in tools/cia/build.sh, when a .cia is offered.
+  Their licences are in those repositories.

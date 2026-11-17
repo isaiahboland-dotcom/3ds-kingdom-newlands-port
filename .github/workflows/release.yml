@@ -1,0 +1,178 @@
+# Builds the installer packages (Windows .zip, Linux .tar.gz) and, for a v* tag,
+# attaches them to a GitHub release. Nothing here touches the game: the
+# packages hold only this project's code; the player's own game files are
+# converted on their machine by the installer.
+name: Release packages
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The game code with no assets: the base .3dsx (its header already has the
+  # RomFS slot the installer fills) and the .elf the .cia is made from.
+  base:
+    name: Game code (3DS)
+    runs-on: ubuntu-latest
+    container: devkitpro/devkitarm:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends clang libclang-dev
+      - run: |
+          echo "$DEVKITARM/bin" >> "$GITHUB_PATH"
+          echo "$DEVKITPRO/tools/bin" >> "$GITHUB_PATH"
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - run: cargo install --locked cargo-3ds
+      - name: cargo 3ds build (empty romfs)
+        working-directory: crates/n3ds
+        run: |
+          mkdir -p romfs
+          cargo +nightly 3ds build --release
+      - name: Stage
+        run: |
+          out=crates/n3ds/target/armv6k-nintendo-3ds/release
+          mkdir -p stage
+          cp "$out/kingdom.3dsx" stage/kingdom-base.3dsx
+          cp "$out/kingdom.elf" stage/kingdom.elf
+          cp tools/cia/kingdom.rsf stage/kingdom.rsf
+      - uses: actions/upload-artifact@v4
+        with:
+          name: base
+          path: stage/*
+
+  # The installer and its helper programs, per OS.
+  host:
+    name: Installer (${{ matrix.name }})
+    strategy:
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+          - name: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tools/installer
+      - run: cargo build --release --locked -p extract --bins
+      - run: cargo build --release --locked --manifest-path tools/installer/Cargo.toml
+      - name: Stage
+        shell: bash
+        run: |
+          x=""; [ "${{ matrix.name }}" = windows ] && x=".exe"
+          mkdir -p stage/bin
+          for t in extract pack3ds pack3dsx ciaart; do cp "target/release/$t$x" stage/bin/; done
+          cp "tools/installer/target/release/kingdom-installer$x" stage/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: host-${{ matrix.name }}
+          path: stage
+
+  # makerom and bannertool for the .cia, built from the revisions pinned in
+  # tools/cia/build.sh. Windows is best effort: if it fails, the Windows
+  # package is built without them and its installer greys out the .cia box.
+  cia-tools:
+    name: .cia tools (${{ matrix.name }})
+    continue-on-error: ${{ matrix.name == 'windows' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+          - name: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.name == 'windows' && 'msys2 {0}' || 'bash' }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: matrix.name == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: git make mingw-w64-x86_64-toolchain
+      - name: Build makerom and bannertool
+        run: |
+          mrev=$(sed -n 's/^MAKEROM_REV=//p' tools/cia/build.sh)
+          mrepo=$(sed -n 's/^MAKEROM_REPO=//p' tools/cia/build.sh)
+          brev=$(sed -n 's/^BANNERTOOL_REV=//p' tools/cia/build.sh)
+          brepo=$(sed -n 's/^BANNERTOOL_REPO=//p' tools/cia/build.sh)
+          mkdir -p stage/bin
+          git clone --quiet "$mrepo" Project_CTR
+          git -C Project_CTR checkout --quiet "$mrev"
+          make -C Project_CTR/makerom deps
+          make -C Project_CTR/makerom program
+          cp Project_CTR/makerom/bin/makerom* stage/bin/
+          git clone --quiet "$brepo" bannertool
+          git -C bannertool checkout --quiet "$brev"
+          git -C bannertool submodule update --quiet --init --depth 1
+          make -C bannertool
+          cp "$(find bannertool/output -type f -name 'bannertool*' | head -n 1)" stage/bin/
+          ls -l stage/bin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cia-${{ matrix.name }}
+          path: stage
+
+  package:
+    name: Packages
+    needs: [base, host, cia-tools]
+    # The .cia tools may be missing for Windows; the packages still build.
+    if: ${{ !cancelled() && needs.base.result == 'success' && needs.host.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+      - name: Assemble
+        run: |
+          ver="${GITHUB_REF_NAME}"; case "$ver" in v*) ;; *) ver="dev" ;; esac
+          mkdir -p out
+          for os in linux windows; do
+            d="Kingdom3DS-Installer-$ver-$os"
+            mkdir -p "$d/bin" "$d/data"
+            cp -r art/host-$os/. "$d/"
+            [ -d art/cia-$os/bin ] && cp -r art/cia-$os/bin/. "$d/bin/" || echo "no .cia tools for $os"
+            cp art/base/* "$d/data/"
+            cp tools/installer/PACKAGE-README.txt "$d/README.txt"
+            cp tools/installer/THIRD-PARTY.txt LICENSE "$d/"
+            if [ "$os" = linux ]; then
+              chmod +x "$d/kingdom-installer" "$d"/bin/*
+              tar czf "out/$d.tar.gz" "$d"
+            else
+              (cd . && zip -qr "out/$d.zip" "$d")
+            fi
+          done
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: out/*
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="Installer packages for Windows and Linux. You need your own PC copy of Kingdom: New Lands; nothing from the game is included. Unzip, run the installer, pick your game folder and SD card. See README.txt inside."
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "$notes"
+          gh release upload "$GITHUB_REF_NAME" out/* --clobber
