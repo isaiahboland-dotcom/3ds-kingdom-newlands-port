@@ -168,17 +168,26 @@ impl eframe::App for App {
     }
 }
 
+/// Opens the window with OpenGL, or Direct3D/Vulkan when OpenGL isn't there
+/// (a virtual machine without 3D acceleration only has OpenGL 1.1).
 pub fn run() -> Result<(), String> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 560.0])
-            .with_title("Kingdom 3DS installer"),
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Kingdom 3DS installer",
-        options,
-        Box::new(|_| Ok(Box::new(App::new()))),
-    )
-    .map_err(|e| format!("couldn't open the window: {e}"))
+    let mut errors = Vec::new();
+    for renderer in [eframe::Renderer::Glow, eframe::Renderer::Wgpu] {
+        let options = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_inner_size([760.0, 560.0])
+                .with_title("Kingdom 3DS installer"),
+            renderer,
+            ..Default::default()
+        };
+        match eframe::run_native(
+            "Kingdom 3DS installer",
+            options,
+            Box::new(|_| Ok(Box::new(App::new()))),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(e) => errors.push(format!("{renderer:?}: {e}")),
+        }
+    }
+    Err(format!("couldn't open the window ({})", errors.join("; ")))
 }

@@ -3,6 +3,8 @@
 //! `kingdom-installer` opens the window. `kingdom-installer --cli --game DIR
 //! --sd DIR [--cia] [--no-3dsx]` does the same without one.
 
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod assetripper;
 mod gamefind;
 mod gui;
