@@ -126,7 +126,7 @@ jobs:
           git -C bannertool checkout --quiet "$brev"
           git -C bannertool submodule update --quiet --init --depth 1
           make -C bannertool
-          cp "$(find bannertool/output -type f -name 'bannertool*' | head -n 1)" stage/bin/
+          cp "$(find bannertool/output -type f \( -name bannertool -o -name bannertool.exe \) | head -n 1)" stage/bin/
           ls -l stage/bin
       - uses: actions/upload-artifact@v4
         with:
