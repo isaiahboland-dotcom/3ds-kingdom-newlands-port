@@ -109,7 +109,7 @@ jobs:
         with:
           msystem: MINGW64
           update: false
-          install: git make mingw-w64-x86_64-toolchain
+          install: git make zip mingw-w64-x86_64-toolchain
       - name: Build makerom and bannertool
         run: |
           mrev=$(sed -n 's/^MAKEROM_REV=//p' tools/cia/build.sh)
