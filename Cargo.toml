@@ -2,7 +2,8 @@
 resolver = "2"
 members = ["crates/game", "crates/platform", "crates/scene", "crates/desktop", "crates/regress", "tools/extract"]
 # crates/n3ds targets armv6k-nintendo-3ds and is built separately with `cargo 3ds`.
-exclude = ["crates/n3ds"]
+# tools/installer is the GUI installer for the release packages (heavy GUI dependencies, built on its own).
+exclude = ["crates/n3ds", "tools/installer"]
 
 [workspace.package]
 edition = "2021"

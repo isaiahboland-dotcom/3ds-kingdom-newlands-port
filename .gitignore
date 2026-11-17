@@ -12,6 +12,7 @@
 /crates/n3ds/romfs/
 /crates/n3ds/sdcard/
 /crates/n3ds/target/
+/tools/installer/target/
 # SD card layout made by build.sh
 /dist/
 

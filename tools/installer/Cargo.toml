@@ -1,0 +1,20 @@
+[package]
+name = "installer"
+version = "1.3.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+description = "Point-and-click installer: your game files in, Kingdom for 3DS on your SD card out"
+
+[[bin]]
+name = "kingdom-installer"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.33.3"
+lzma-rs = "0.3.0"
+rfd = "0.17.2"
+sha2 = "0.11.1"
+tar = "0.4.46"
+ureq = "3.5.2"
+zip = "9.6.1"
