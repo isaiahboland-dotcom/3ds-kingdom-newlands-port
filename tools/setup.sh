@@ -41,10 +41,11 @@ ar_sha256() {
         win_arm64.zip) echo c2c3a335948aa0ecaf26baf22ac77e36993d1a1695b5db291cb63f66872627f1 ;;
     esac
 }
-# The world.bin the port is developed against (Steam, Linux build). Another
+# The world.bin the port is developed against (Steam, Linux build; the
+# Windows build extracts to the same file). Another
 # build of the game may differ a little; it still works, but saves made
 # with one don't load with the other.
-KNOWN_WORLD_SHA1=4f551dcf938c0e54ab39cb0b21a03db3e93f22cc
+KNOWN_WORLD_SHA1=a09e833277192bb891d1e9445e1d0b9b922303d6
 
 GAME=${KINGDOM_GAME:-}
 DO_3DS=0

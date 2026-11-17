@@ -7,7 +7,7 @@
 //! - The PICA200 has no fragment shaders, so the alpha-keyed recolour can't
 //!   run on the GPU: the keyed pixels of each sprite become two extra mask
 //!   sprites that the renderer tints separately.
-//! - Pages go through `tex3ds` into `.t3x`; the sheet (sprites, clips, font)
+//! - Pages are written as `.t3x` (see `t3x.rs`, no devkitPro needed); the sheet (sprites, clips, font)
 //!   becomes `sheet.bin`; `world.bin` is copied as is.
 //! - The sound clips (`audio/*.adp`, ~100 MB) go on the SD card instead, so
 //!   the `.3dsx` stays small: into `sdcard/3ds/kingdom-3ds/audio` beside the
@@ -16,7 +16,9 @@
 //! `cargo run --release -p extract --bin pack3ds -- assets crates/n3ds/romfs`
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+#[path = "../t3x.rs"]
+mod t3x;
 
 use scene::sheet::{Page, PageFormat, Sheet, Sprite};
 
@@ -48,15 +50,6 @@ fn load_png(path: &Path) -> Result<Img, String> {
         h: info.height,
         px: buf,
     })
-}
-
-fn save_png(path: &Path, img: &Img) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), img.w, img.h);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    let mut w = enc.write_header().map_err(|e| e.to_string())?;
-    w.write_image_data(&img.px).map_err(|e| e.to_string())
 }
 
 /// One sprite image to place, and which sprite it becomes.
@@ -359,11 +352,13 @@ fn run(src: &Path, out: &Path) -> Result<(), String> {
             } else {
                 PageFormat::Rgba5551
             };
-            let png = out.join(format!("gfx/page_{n}.png"));
-            save_png(&png, &img)?;
             let t3x = PathBuf::from(format!("gfx/page_{n}.t3x"));
-            tex3ds(&png, &out.join(&t3x), format)?;
-            std::fs::remove_file(&png).ok();
+            let tf = match format {
+                PageFormat::Rgba8 => t3x::Format::Rgba8,
+                PageFormat::Rgba5551 => t3x::Format::Rgba5551,
+            };
+            std::fs::write(out.join(&t3x), t3x::encode(img.w, img.h, &img.px, tf))
+                .map_err(|e| format!("{}: {e}", t3x.display()))?;
             for (sprite, x, y) in placed {
                 let s = &mut out_sheet.sprites[sprite];
                 s.page = n as u16;
@@ -419,25 +414,4 @@ fn copy_audio(from: &Path, to: &Path) -> Result<usize, String> {
         }
     }
     Ok(n)
-}
-
-/// orig toolchain: devkitPro's `tex3ds` ($DEVKITPRO/tools/bin).
-fn tex3ds(png: &Path, t3x: &Path, format: PageFormat) -> Result<(), String> {
-    let tool = std::env::var("DEVKITPRO")
-        .map(|d| PathBuf::from(d).join("tools/bin/tex3ds"))
-        .unwrap_or_else(|_| PathBuf::from("/opt/devkitpro/tools/bin/tex3ds"));
-    let f = match format {
-        PageFormat::Rgba8 => "rgba8",
-        PageFormat::Rgba5551 => "rgba5551",
-    };
-    let status = Command::new(&tool)
-        .args(["-f", f, "-z", "auto", "-o"])
-        .arg(t3x)
-        .arg(png)
-        .status()
-        .map_err(|e| format!("{}: {e} (is devkitPro installed?)", tool.display()))?;
-    if !status.success() {
-        return Err(format!("tex3ds failed on {}", png.display()));
-    }
-    Ok(())
 }
