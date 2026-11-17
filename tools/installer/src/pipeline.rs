@@ -136,6 +136,13 @@ pub fn install(o: &Options, log: &Log) -> Result<(), String> {
         format!("{} doesn't look like Kingdom: New Lands (no Kingdom_Data folder with globalgamemanagers inside)", o.game.display())
     })?;
     log(&format!("Game: {}", data.display()));
+    let lost = gamefind::missing_files(&data);
+    if !lost.is_empty() {
+        return Err(format!(
+            "the game folder is incomplete, it's missing: {}. Copy the whole Kingdom New Lands folder (about 400 MB), or let Steam download it again.",
+            lost.join(", ")
+        ));
+    }
     if !o.sd.is_dir() {
         return Err(format!(
             "{} isn't a folder (is the SD card inserted?)",

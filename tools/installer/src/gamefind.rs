@@ -81,3 +81,34 @@ pub fn find_game() -> Option<PathBuf> {
     ));
     candidates.into_iter().find(|c| data_dir(c).is_some())
 }
+
+/// Files the rip can't do without, relative to the data folder. (Copying the
+/// game by hand and missing some leaves AssetRipper with a partial game.)
+const REQUIRED: [&str; 17] = [
+    "globalgamemanagers",
+    "globalgamemanagers.assets",
+    "level0",
+    "level1",
+    "level2",
+    "resources.assets",
+    "resources.assets.resS",
+    "resources.resource",
+    "sharedassets0.assets",
+    "sharedassets0.assets.resS",
+    "sharedassets1.assets",
+    "sharedassets2.assets",
+    "sharedassets2.assets.resS",
+    "Managed/Assembly-CSharp.dll",
+    "Managed/Assembly-CSharp-firstpass.dll",
+    "Managed/UnityEngine.dll",
+    "Managed/mscorlib.dll",
+];
+
+/// The required files that aren't in `data`.
+pub fn missing_files(data: &Path) -> Vec<&'static str> {
+    REQUIRED
+        .iter()
+        .copied()
+        .filter(|f| !data.join(f).is_file())
+        .collect()
+}
