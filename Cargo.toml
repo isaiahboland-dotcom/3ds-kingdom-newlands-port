@@ -7,6 +7,6 @@ exclude = ["crates/n3ds", "tools/installer"]
 
 [workspace.package]
 edition = "2021"
-version = "1.3.0"
+version = "1.4.0"
 license = "MIT"
 rust-version = "1.88"

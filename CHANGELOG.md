@@ -1,18 +1,31 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 — 2026-11-17
 
 ### Added
 
-- Installer packages (Windows .zip, Linux .tar.gz) with a point-and-click
-  installer: pick your game folder and SD card, choose .3dsx and/or .cia, and
-  it converts your game and copies the result to the card. The 3DS assets are
-  now packed without devkitPro (a Rust .t3x writer and RomFS packer replace
-  `tex3ds` and `3dsxtool`; checked against them in tests). The release
-  workflow builds the packages on a version tag.
+- Installer packages for Windows (`.zip`) and Linux (`.tar.gz`), built by the
+  new release workflow. Unpack, run `kingdom-installer`, pick your Kingdom:
+  New Lands folder and your SD card, tick `.3dsx` and/or `.cia`, and press
+  Install: it converts your own game files on your computer and copies the
+  result to the card, keeping your saves. No Rust, devkitPro or WSL needed.
+  The packages contain only this project's code. The `.cia` option is
+  experimental, especially on Windows.
+- The Steam Windows build of the game now works as the source, and extracts to
+  the same `world.bin` as the Linux build. The installer checks that the game
+  folder is complete before it starts.
 - Pause menu: a 30 FPS button. When it glows gold the 3DS draws every second
   screen refresh for an even 30 FPS instead of swinging between the 50s and
   30. The setting is saved on the SD card. Desktop ignores it.
+
+### Changed
+
+- The 3DS assets are packed without devkitPro's `tex3ds` and `3dsxtool`: a
+  Rust `.t3x` writer and RomFS packer (`pack3dsx`) replace them, with tests
+  that check them against the originals. A `.3dsx` built either way plays the
+  same; the texture files are a little larger.
+- `tools/setup.sh` pins the current `world.bin` hash, so it no longer warns
+  about a mismatch on a normal Steam copy.
 
 ### Fixed
 
