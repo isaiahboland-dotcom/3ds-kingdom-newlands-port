@@ -5,6 +5,9 @@
 ### Fixed
 
 - Release captured citizens when a squid is killed by any supported attack.
+- Protect unreadable and incompatible saves from automatic replacement or
+  deletion. The pause menu marks protected slots and lets the player retry
+  loading them or choose another slot.
 
 ## 1.4.0 — 2026-11-17
 

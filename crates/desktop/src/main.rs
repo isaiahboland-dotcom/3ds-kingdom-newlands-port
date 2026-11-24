@@ -164,35 +164,20 @@ async fn main() {
     } else {
         storage
             .as_ref()
-            .and_then(|s| s.read(save::UNLOCKS_SLOT))
-            .and_then(|b| save::load_progress(&b).ok())
-            .unwrap_or_default()
+            .map_or_else(Progress::default, |s| Session::saved_progress(s))
     };
     // Input replay for the regression runner; always a fresh run.
     let record: Option<String> = arg("--record");
     let fresh = record.is_some() || std::env::args().any(|a| a == "--new" || a == "--island");
     let slot = storage.as_ref().map_or(0, |s| Session::last_slot(s));
     // --load reads the saved game even in screenshot runs (still never writing).
-    let saved = (!fresh)
-        .then(|| {
-            storage.as_ref().map_or_else(
-                || {
-                    std::env::args()
-                        .any(|a| a == "--load")
-                        .then(storage::Files::new)
-                        .and_then(|s| s.read(&save::game_slot(slot)))
-                },
-                |s| s.read(&save::game_slot(slot)),
-            )
-        })
-        .flatten()
-        .and_then(|b| match save::load_game(&b, world_id, &world) {
-            Ok(g) => Some(g),
-            Err(e) => {
-                eprintln!("ignoring the saved game ({e:?})");
-                None
-            }
-        });
+    let read_only = (storage.is_none() && !fresh && std::env::args().any(|a| a == "--load"))
+        .then(storage::Files::new);
+    let saved = storage
+        .as_ref()
+        .or(read_only.as_ref())
+        .filter(|_| !fresh)
+        .map_or(Ok(None), |s| Session::saved_game(s, slot, world_id, &world));
     let record_progress = progress.clone();
     let mut app = Session::new(world, island, seed, progress);
     app.debug = std::env::args().any(|a| a == "--debug");
@@ -247,8 +232,15 @@ async fn main() {
             ::scene::sound::Player::new(&app.world),
         )
     });
-    if let Some(g) = saved {
-        app.resume(g);
+    match saved {
+        Ok(Some(game)) => app.resume(game),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("saved game protected ({e:?})");
+            if app.storage.is_some() {
+                app.protect_active_slot();
+            }
+        }
     }
     if let Some(coins) = std::env::args()
         .skip_while(|a| a != "--coins")

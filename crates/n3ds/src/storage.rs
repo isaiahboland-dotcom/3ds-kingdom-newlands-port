@@ -16,8 +16,12 @@ impl SdCard {
 }
 
 impl platform::Storage for SdCard {
-    fn read(&self, slot: &str) -> Option<Vec<u8>> {
-        crate::savefile::read(std::path::Path::new(&Self::path(slot))).ok()
+    fn read(&self, slot: &str) -> Result<Option<Vec<u8>>, platform::ReadError> {
+        match crate::savefile::read(std::path::Path::new(&Self::path(slot))) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(platform::ReadError),
+        }
     }
 
     fn write(&mut self, slot: &str, data: &[u8]) -> bool {
