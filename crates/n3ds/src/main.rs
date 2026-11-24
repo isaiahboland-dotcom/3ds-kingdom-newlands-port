@@ -102,7 +102,7 @@ fn main() {
     s.cap30 = s
         .storage
         .as_ref()
-        .and_then(|st| st.read(SETTINGS))
+        .and_then(|st| st.read(SETTINGS).ok().flatten())
         .is_some_and(|b| b.first() == Some(&1));
     let mut cap_saved = s.cap30;
     // When the last frame began (after the vblank wait), for the 30 FPS cap.
