@@ -804,7 +804,9 @@ impl GameState {
             hit = true;
             let mut ge = Vec::new();
             self.greed.hurt(i, def.attack_damage, &mut |e| ge.push(e));
-            events.extend(ge.into_iter().map(GameEvent::Greed));
+            for effect in ge {
+                self.apply_greed_effect(effect, events);
+            }
         }
         let animals: Vec<u32> = self
             .wildlife
@@ -945,7 +947,9 @@ impl GameState {
             if let Some(i) = self.greed.trolls.iter().position(|t| t.id == id) {
                 let mut ge = Vec::new();
                 self.greed.hurt(i, damage, &mut |e| ge.push(e));
-                events.extend(ge.into_iter().map(GameEvent::Greed));
+                for effect in ge {
+                    self.apply_greed_effect(effect, events);
+                }
             }
         }
     }
@@ -1595,7 +1599,9 @@ impl GameState {
                     if let Some(i) = self.greed.trolls.iter().position(|t| t.id == troll) {
                         let mut ge = Vec::new();
                         self.greed.hurt(i, damage, &mut |e| ge.push(e));
-                        events.extend(ge.into_iter().map(GameEvent::Greed));
+                        for effect in ge {
+                            self.apply_greed_effect(effect, events);
+                        }
                     }
                 }
                 UnitEvent::Farmed(id) => {
@@ -1870,6 +1876,18 @@ impl GameState {
         self.queued.push(GameEvent::Won);
     }
 
+    /// orig: Squid.HandleOnDeath → Character.Release.
+    fn apply_greed_effect(&mut self, effect: GreedEvent, events: &mut Vec<GameEvent>) {
+        if let GreedEvent::Released { x, count } = effect {
+            for _ in 0..count {
+                self.population
+                    .spawn(crate::data::Role::Peasant, x, &mut self.rng);
+            }
+            self.payables_dirty = true;
+        }
+        events.push(GameEvent::Greed(effect));
+    }
+
     /// Troll targets, loot and the results of their attacks.
     fn update_greed(&mut self, world: &WorldData, dt: f32, events: &mut Vec<GameEvent>) {
         use crate::coins::{Rect, MONARCH_BOX};
@@ -2095,13 +2113,6 @@ impl GameState {
                     }
                     self.payables_dirty = true;
                 }
-                // orig: Character.Release: the carried peasants drop back down.
-                GreedEvent::Released { x, count } => {
-                    for _ in 0..count {
-                        self.population
-                            .spawn(crate::data::Role::Peasant, x, &mut self.rng);
-                    }
-                }
                 // orig: EnemyManager.OnEnemiesSpawned → the dog barks that way.
                 GreedEvent::PortalOpened(object) => {
                     if let Some(i) = self.level.index_of(object) {
@@ -2133,7 +2144,7 @@ impl GameState {
                 }
                 _ => {}
             }
-            events.push(GameEvent::Greed(e));
+            self.apply_greed_effect(e, events);
         }
         coin_removals.sort_unstable();
         for i in coin_removals.into_iter().rev() {
@@ -3129,6 +3140,8 @@ mod tests {
         let cat = g.siege.catapults[0].object;
         let o = &g.level.objects[g.level.index_of(cat).unwrap()];
         assert_eq!(o.mode, crate::siege::mode::READY, "aim {}", o.aim);
+        let mut recovery = g.clone();
+        let target_x = o.x + 5.0;
         g.greed.spawn_troll(
             crate::greed::EnemyKind::ToughTroll,
             9.0,
@@ -3140,6 +3153,32 @@ mod tests {
         assert!(ev
             .iter()
             .any(|e| matches!(e, GameEvent::Greed(GreedEvent::Killed(_)))));
+
+        // Use the projectile fired by the siege system. Stage its position to
+        // isolate collision and release from the port's current aiming model.
+        recovery.greed.spawn_troll(
+            crate::greed::EnemyKind::Squid,
+            target_x,
+            1,
+            false,
+            &mut recovery.rng,
+        );
+        recovery.greed.trolls[0].hp = 1;
+        recovery.greed.trolls[0].victims = 2;
+        let mut events = Vec::new();
+        // Let the real projectile's ghost period finish before the impact.
+        for _ in 0..42 {
+            recovery.update_siege(&w, TICK, &mut events);
+        }
+        let boulder = recovery.siege.boulders.first_mut().expect("catapult fired");
+        boulder.x = target_x;
+        boulder.y = 0.3;
+        boulder.vx = 0.0;
+        boulder.vy = 0.0;
+        recovery.update_siege(&w, TICK, &mut events);
+        assert_captives_released(&recovery, &events, 2);
+        recovery.update_siege(&w, TICK, &mut events);
+        assert_captives_released(&recovery, &events, 2);
     }
 
     #[test]
@@ -3434,36 +3473,102 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_squid_carries_off_a_peasant_and_drops_it_when_shot() {
-        let w = fight_world();
-        let mut g = GameState::new(&w, 0, 4);
-        g.monarch.x = -20.0;
-        let p = g.population.spawn(Role::Peasant, 4.0, &mut g.rng);
-        g.greed
-            .spawn_troll(crate::greed::EnemyKind::Squid, 6.0, 1, false, &mut g.rng);
-        let ev = run_events(&mut g, &w, 10.0);
-        assert!(ev.iter().any(
-            |e| matches!(e, GameEvent::Greed(GreedEvent::Grabbed { unit, .. }) if *unit == p)
-        ));
-        assert_eq!(g.population.count(Role::Peasant), 0);
-        let i = g
-            .greed
-            .trolls
-            .iter()
-            .position(|t| t.kind == crate::greed::EnemyKind::Squid)
-            .unwrap();
-        let mut ev = Vec::new();
-        g.greed.hurt(i, 30, &mut |e| ev.push(e));
-        let x = g.greed.trolls[i].x;
-        for e in ev {
-            if let GreedEvent::Released { count, .. } = e {
-                for _ in 0..count {
-                    g.population.spawn(Role::Peasant, x, &mut g.rng);
-                }
-            }
+    /// Hit a carrier through the production projectile collision and dispatch.
+    fn shoot_carrier(g: &mut GameState, w: &WorldData, i: usize, bolt: bool) -> Vec<GameEvent> {
+        let b = g.greed.trolls[i].box_at();
+        let (x, y) = (b.x + b.w * 0.5, b.y + b.h * 0.5);
+        if bolt {
+            g.greed.fire_bolt(x, y, 0.0, 0.0, 30, 1);
+        } else {
+            g.greed.shoot(x, y, 0.0, 0.0, false, false);
         }
-        assert_eq!(g.population.count(Role::Peasant), 1);
+        let mut events = Vec::new();
+        g.update_greed(w, TICK, &mut events);
+        events
+    }
+
+    fn assert_captives_released(game: &GameState, events: &[GameEvent], count: u8) {
+        assert_eq!(game.population.count(Role::Peasant), count as usize);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GameEvent::Greed(
+                GreedEvent::Released { count: n, .. }
+            ) if *n == count))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_squid_carries_off_a_peasant_and_releases_it_after_an_arrow_or_bolt() {
+        for bolt in [false, true] {
+            let w = fight_world();
+            let mut g = GameState::new(&w, 0, 4);
+            g.monarch.x = -20.0;
+            let p = g.population.spawn(Role::Peasant, 4.0, &mut g.rng);
+            g.greed
+                .spawn_troll(crate::greed::EnemyKind::Squid, 6.0, 1, false, &mut g.rng);
+            let ev = run_events(&mut g, &w, 10.0);
+            assert!(ev.iter().any(
+                |e| matches!(e, GameEvent::Greed(GreedEvent::Grabbed { unit, .. }) if *unit == p)
+            ));
+            assert_eq!(g.population.count(Role::Peasant), 0);
+            g.greed.trolls[0].hp = 1;
+            let events = shoot_carrier(&mut g, &w, 0, bolt);
+            assert_captives_released(&g, &events, 1);
+            assert!(shoot_carrier(&mut g, &w, 0, bolt)
+                .iter()
+                .all(|e| !matches!(e, GameEvent::Greed(GreedEvent::Released { .. }))));
+            assert_eq!(g.population.count(Role::Peasant), 1);
+        }
+    }
+
+    #[test]
+    fn bear_swipe_releases_captives() {
+        let mut w = fight_world();
+        w.steeds.push(crate::data::SteedDef {
+            attacks_while_running: true,
+            hit_box: (0.0, 0.0, 2.0, 2.0),
+            attack_damage: 30,
+            run_speed: 2.0,
+            forest_speed_multiplier: 1.0,
+            ..Default::default()
+        });
+        let mut g = GameState::new(&w, 0, 44);
+        g.monarch.x = 0.0;
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 0.75, 1, false, &mut g.rng);
+        g.greed.trolls[0].victims = 2;
+        let mut events = Vec::new();
+        g.tick(
+            &w,
+            &Controls {
+                direction: 1,
+                start_sprint: true,
+                ..Default::default()
+            },
+            &mut events,
+        );
+        assert!(g.monarch.is_running());
+        assert_captives_released(&g, &events, 2);
+    }
+
+    #[test]
+    fn knight_slash_releases_captives() {
+        let w = fight_world();
+        let mut g = GameState::new(&w, 0, 45);
+        g.monarch.x = -20.0;
+        g.population.spawn_knight(8.0, &mut g.rng);
+        g.greed
+            .spawn_troll(crate::greed::EnemyKind::Squid, 8.25, 1, false, &mut g.rng);
+        g.greed.trolls[0].hp = 1;
+        g.greed.trolls[0].victims = 2;
+        let events = run_events(&mut g, &w, 0.5);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, GameEvent::Unit(UnitEvent::Strike { .. }))));
+        assert_captives_released(&g, &events, 2);
     }
 
     #[test]

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Release captured citizens when a squid is killed by any supported attack.
+
 ## 1.4.0 — 2026-11-17
 
 ### Added
